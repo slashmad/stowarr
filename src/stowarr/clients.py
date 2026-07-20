@@ -156,8 +156,10 @@ class ArrClient:
 
 class QBittorrentClient:
     def __init__(self, service: Service):
-        self.http = JsonClient(service.url)
-        self.http.request("POST", "/api/v2/auth/login", form={"username": service.username, "password": service.password})
+        headers = {"X-API-Key": service.api_key} if service.api_key else None
+        self.http = JsonClient(service.url, headers)
+        if not service.api_key:
+            self.http.request("POST", "/api/v2/auth/login", form={"username": service.username, "password": service.password})
 
     def torrents(self) -> list[dict]:
         return self.http.request("GET", "/api/v2/torrents/info")

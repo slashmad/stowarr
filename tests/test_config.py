@@ -28,9 +28,10 @@ class ConfigTest(unittest.TestCase):
             }
             path = tmp_path / "config.json"
             path.write_text(json.dumps(raw))
-            with patch.dict(os.environ, {"QBITTORRENT_PASSWORD": "secret"}):
+            with patch.dict(os.environ, {"QBITTORRENT_API_KEY": "preferred", "QBITTORRENT_PASSWORD": "secret"}):
                 config = load_config(path)
             self.assertEqual(config.pool_for_path("/data/p1/download/release/file.mkv").name, "p1")
             self.assertIsNone(config.pool_for_path("/other/file.mkv"))
             self.assertEqual(config.pool_for_category("sonarr-p1")[1], "sonarr")
             self.assertEqual(config.qbittorrent.password, "secret")
+            self.assertEqual(config.qbittorrent.api_key, "preferred")

@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 
-from stowarr.clients import ArrClient
+from stowarr.clients import ArrClient, QBittorrentClient
 from stowarr.config import Service
 
 
@@ -85,3 +86,21 @@ class ArrClientTest(unittest.TestCase):
         client = ArrClient(Service("http://unused", api_key="unused"), "sonarr")
         client.http = SonarrHttp()
         self.assertFalse(client.download_mapping("hash")["mappingComplete"])
+
+
+class QBittorrentClientTest(unittest.TestCase):
+    @patch("stowarr.clients.JsonClient")
+    def test_api_key_is_preferred_and_skips_login(self, json_client):
+        QBittorrentClient(Service("http://qbit", api_key="key", username="user", password="password"))
+
+        json_client.assert_called_once_with("http://qbit", {"X-API-Key": "key"})
+        json_client.return_value.request.assert_not_called()
+
+    @patch("stowarr.clients.JsonClient")
+    def test_username_password_login_is_used_without_api_key(self, json_client):
+        QBittorrentClient(Service("http://qbit", username="user", password="password"))
+
+        json_client.assert_called_once_with("http://qbit", None)
+        json_client.return_value.request.assert_called_once_with(
+            "POST", "/api/v2/auth/login", form={"username": "user", "password": "password"}
+        )

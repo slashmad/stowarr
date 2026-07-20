@@ -102,14 +102,9 @@
       <section id="settings" class="page">
         <div class="page-title"><div><h1>Settings</h1><p>Required service connections and active pool routing</p></div></div>
         <article class="panel connection-panel">
-          <div class="panel-head"><div><h2>Required connections</h2><p>Stowarr requires working connections to all three services</p></div><span id="connections-status" class="badge">Required</span></div>
+          <div class="panel-head"><div><h2>Service connections</h2><p>qBittorrent, Radarr, and Sonarr credentials are managed in the connection setup</p></div><span id="connections-status" class="badge">Required</span></div>
           <div id="connection-error" class="alert inline-alert hidden"></div>
-          <form id="connections-form">
-            <section class="connection-card"><header><h3>qBittorrent</h3><span>Download source of truth</span></header><label>URL<input name="qbittorrent-url" type="url" required></label><label>Username<input name="qbittorrent-username" required></label><label>Password<input name="qbittorrent-password" type="password" placeholder="Leave blank to keep the saved password"></label></section>
-            <section class="connection-card"><header><h3>Radarr</h3><span>Movies</span></header><label>URL<input name="radarr-url" type="url" required></label><label>API key<input name="radarr-api-key" type="password" placeholder="Leave blank to keep the saved API key"></label></section>
-            <section class="connection-card"><header><h3>Sonarr</h3><span>Series and episodes</span></header><label>URL<input name="sonarr-url" type="url" required></label><label>API key<input name="sonarr-api-key" type="password" placeholder="Leave blank to keep the saved API key"></label></section>
-            <div class="connection-action"><p>Credentials are never returned to the browser. Saving tests every connection before replacing the active configuration.</p><button id="save-connections" class="primary" type="submit">Test and save connections</button></div>
-          </form>
+          <div class="connection-summary"><div><strong id="qbit-auth-summary">qBittorrent not configured</strong><span>Radarr and Sonarr API connections are required</span></div><button id="open-connection-setup" class="primary">Open connection setup</button></div>
         </article>
         <article class="panel">
           <div class="panel-head"><div><h2>Discover routing</h2><p>Start with qBittorrent categories and save paths, then match Radarr and Sonarr download clients</p></div><button id="discover-routing" class="primary compact">Discover routes</button></div>
@@ -119,6 +114,16 @@
       </section>
     </main>
   </div>
+  <dialog id="connection-setup" class="connection-setup">
+    <div class="guide-head"><div><h2>Connect Stowarr</h2><p>Configure the three services required by Stowarr</p></div><button id="close-connection-setup" aria-label="Close connection setup">×</button></div>
+    <div id="setup-error" class="alert inline-alert hidden"></div>
+    <form id="connections-form">
+      <section class="connection-card"><header><div><h3>qBittorrent</h3><span>Download source of truth</span></div><span id="qbit-connection-state" class="badge">Required</span></header><label>URL<input name="qbittorrent-url" type="url" required></label><label>API key <small>Preferred · qBittorrent 5.2+</small><input name="qbittorrent-api-key" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved API key"></label><div class="auth-divider"><span>Fallback login for older versions</span></div><label>Username<input name="qbittorrent-username" autocomplete="username"></label><label>Password<input name="qbittorrent-password" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved password"></label></section>
+      <section class="connection-card"><header><div><h3>Radarr</h3><span>Movies</span></div><span id="radarr-connection-state" class="badge">Required</span></header><label>URL<input name="radarr-url" type="url" required></label><label>API key<input name="radarr-api-key" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved API key"></label></section>
+      <section class="connection-card"><header><div><h3>Sonarr</h3><span>Series and episodes</span></div><span id="sonarr-connection-state" class="badge">Required</span></header><label>URL<input name="sonarr-url" type="url" required></label><label>API key<input name="sonarr-api-key" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved API key"></label></section>
+      <div class="connection-action"><p>Secrets are stored by the API and are never returned to the browser. All connections must pass before the configuration is replaced.</p><button id="save-connections" class="primary" type="submit">Test and save connections</button></div>
+    </form>
+  </dialog>
   <dialog id="routing-guide" class="routing-guide">
     <div class="guide-head"><div><h2>Routing diagnostics</h2><p>Detected Radarr, Sonarr, and qBittorrent route configuration</p></div><button id="close-routing-guide" aria-label="Close routing diagnostics">×</button></div>
     <div class="guide-principle"><strong>Radarr or Sonarr sends the selected download client's category to qBittorrent. qBittorrent then uses that category's configured save path to determine where the download is stored.</strong><span>Tags do not set the download path. They restrict which movies or series are allowed to use each download client.</span></div>
