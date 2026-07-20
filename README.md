@@ -56,6 +56,12 @@ in `.env`. Service URLs and credentials can then be entered through Settings in
 the WebUI. `config/config.json` and `.env` are local-only files excluded from
 both Git and Docker build contexts.
 
+For qBittorrent 5.2 or newer, set `QBITTORRENT_API_KEY`. Stowarr sends it as
+`X-API-Key` and does not create a password session. For older qBittorrent
+versions, leave the API key empty and set `QBITTORRENT_USERNAME` and
+`QBITTORRENT_PASSWORD`; Stowarr then uses the official cookie-based WebAPI
+login. When both methods are configured, the API key always takes precedence.
+
 For local image development, run `docker compose build` before `up`.
 
 All applications must use identical absolute media paths. Edit `compose.yaml`

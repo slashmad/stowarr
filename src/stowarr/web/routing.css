@@ -433,11 +433,47 @@
   padding: 12px 15px;
 }
 
-.connection-panel form {
+.connection-setup form {
   display: grid;
   gap: 14px;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   padding: 18px 20px 0;
+}
+
+.connection-setup {
+  background: #242629;
+  border: 1px solid #555a60;
+  color: #e7e7e7;
+  max-height: 92vh;
+  max-width: 1180px;
+  padding: 0;
+  width: calc(100% - 40px);
+}
+
+.connection-setup::backdrop {
+  background: #08090bcc;
+}
+
+.connection-setup > .alert {
+  margin: 16px 20px 0;
+}
+
+.connection-summary {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  padding: 18px 20px;
+}
+
+.connection-summary div {
+  display: grid;
+  gap: 5px;
+}
+
+.connection-summary span,
+.auth-divider {
+  color: #9a9da2;
+  font-size: 12px;
 }
 
 .connection-card {
@@ -447,9 +483,30 @@
 }
 
 .connection-card header {
+  align-items: start;
   border-bottom: 1px solid #35383c;
+  display: flex;
+  justify-content: space-between;
   margin-bottom: 14px;
   padding-bottom: 12px;
+}
+
+.connection-card header > span.badge {
+  color: #ffd3d1;
+}
+
+.auth-divider {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  margin-top: 15px;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  border-top: 1px solid #35383c;
+  content: "";
+  flex: 1;
 }
 
 .connection-card h3 {
@@ -812,7 +869,7 @@
 
   .guide-chain,
   .guide-guards,
-  .connection-panel form,
+  .connection-setup form,
   .discovery-grid {
     grid-template-columns: 1fr;
   }

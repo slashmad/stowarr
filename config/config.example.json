@@ -5,7 +5,7 @@
   "api_token": "",
   "api_only": false,
   "database": "/state/stowarr.sqlite3",
-  "qbittorrent": {"url": ""},
+  "qbittorrent": {"url": "", "api_key": "", "username": "", "password": ""},
   "radarr": {"url": ""},
   "sonarr": {"url": ""},
   "pools": {

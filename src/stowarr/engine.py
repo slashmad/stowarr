@@ -158,8 +158,8 @@ class Stowarr:
         return self.qbit is not None and set(self.arr) == {"radarr", "sonarr"}
 
     def _activate_connections(self, qbittorrent: Service, radarr: Service, sonarr: Service, validate: bool = True) -> dict:
-        if not qbittorrent.url or not qbittorrent.username or not qbittorrent.password:
-            raise ValueError("qBittorrent URL, username, and password are required")
+        if not qbittorrent.url or not (qbittorrent.api_key or (qbittorrent.username and qbittorrent.password)):
+            raise ValueError("qBittorrent URL and either an API key or username and password are required")
         if not radarr.url or not radarr.api_key:
             raise ValueError("Radarr URL and API key are required")
         if not sonarr.url or not sonarr.api_key:
@@ -181,7 +181,12 @@ class Stowarr:
     def _masked_service(service: Service, kind: str) -> dict:
         result = {"url": service.url}
         if kind == "qbittorrent":
-            result.update({"username": service.username, "password_set": bool(service.password)})
+            result.update({
+                "api_key_set": bool(service.api_key),
+                "auth_method": "api_key" if service.api_key else "login",
+                "username": service.username,
+                "password_set": bool(service.password),
+            })
         else:
             result["api_key_set"] = bool(service.api_key)
         return result
@@ -212,11 +217,12 @@ class Stowarr:
             if not url.startswith(("http://", "https://")):
                 raise ValueError(f"{name} URL must start with http:// or https://")
             if name == "qbittorrent":
+                api_key = str(raw.get("api_key") or existing.api_key).strip()
                 username = str(raw.get("username", "")).strip()
                 password = str(raw.get("password") or existing.password)
-                if not username or not password:
-                    raise ValueError("qBittorrent username and password are required")
-                candidates[name] = Service(url=url, username=username, password=password)
+                if not api_key and (not username or not password):
+                    raise ValueError("qBittorrent API key or username and password are required")
+                candidates[name] = Service(url=url, api_key=api_key, username=username, password=password)
             else:
                 api_key = str(raw.get("api_key") or existing.api_key).strip()
                 if not api_key:
