@@ -1,0 +1,33 @@
+{
+  "apply": false,
+  "listen": "0.0.0.0",
+  "port": 8787,
+  "api_token": "",
+  "api_only": false,
+  "database": "/state/stowarr.sqlite3",
+  "qbittorrent": {"url": ""},
+  "radarr": {"url": ""},
+  "sonarr": {"url": ""},
+  "pools": {
+    "p1": {
+      "prefix": "/data/pool1",
+      "download_roots": ["/data/pool1/download"],
+      "radarr_root": "/data/pool1/movies",
+      "sonarr_root": "/data/pool1/series",
+      "radarr_category": "radarr-pool1",
+      "sonarr_category": "sonarr-pool1",
+      "radarr_tag": "radarr-pool1",
+      "sonarr_tag": "sonarr-pool1"
+    },
+    "p3": {
+      "prefix": "/data/pool2",
+      "download_roots": ["/data/pool2/download"],
+      "radarr_root": "/data/pool2/movies",
+      "sonarr_root": "/data/pool2/series",
+      "radarr_category": "radarr-pool3",
+      "sonarr_category": "sonarr-pool3",
+      "radarr_tag": "radarr-pool3",
+      "sonarr_tag": "sonarr-pool3"
+    }
+  }
+}

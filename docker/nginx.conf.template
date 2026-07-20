@@ -1,0 +1,18 @@
+server {
+    listen 8080;
+    server_name _;
+
+    location /api/ {
+        proxy_pass http://stowarr-api:8788;
+        proxy_http_version 1.1;
+        proxy_set_header X-Stowarr-Proxy-Token "${STOWARR_API_TOKEN}";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+        client_max_body_size 1m;
+    }
+
+    location / {
+        root /usr/share/nginx/html;
+        try_files $uri $uri/ /index.html;
+    }
+}

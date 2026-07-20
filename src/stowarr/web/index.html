@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Stowarr</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <link rel="stylesheet" href="/assets/routing.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#sync" aria-label="Stowarr home">
+        <span class="brand-mark"><i></i><i></i><i></i></span>
+        <span>STOW<span>ARR</span></span>
+      </a>
+      <nav aria-label="Main navigation">
+        <button class="nav-item active" data-page="sync"><span class="icon">≋</span>Sync</button>
+        <button class="nav-item" data-page="overview"><span class="icon">⌂</span>Overview</button>
+        <button class="nav-item" data-page="reconcile"><span class="icon">⇄</span>Reconcile</button>
+        <button class="nav-item" data-page="move"><span class="icon">⇢</span>Move</button>
+        <button class="nav-item" data-page="history"><span class="icon">◷</span>History <b id="history-count"></b></button>
+        <div class="nav-heading">System</div>
+        <button class="nav-item" data-page="settings"><span class="icon">⚙</span>Settings</button>
+      </nav>
+      <div class="sidebar-status"><span id="side-dot" class="dot"></span><span><strong id="side-mode">Loading</strong><small>Stowarr service</small></span></div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <button id="menu" class="menu" aria-label="Toggle navigation">☰</button>
+        <div class="search"><span>⌕</span><input id="global-hash" placeholder="Torrent hash"></div>
+        <button class="top-action" id="refresh" title="Refresh">↻</button>
+      </header>
+
+      <section id="overview" class="page active">
+        <div class="page-title"><div><h1>Overview</h1><p>Pool reconciliation status</p></div><span id="mode-pill" class="pill"></span></div>
+        <div class="stats">
+          <article class="stat"><span class="stat-icon blue">⇄</span><div><small>Operations</small><strong id="stat-operations">—</strong></div></article>
+          <article class="stat"><span class="stat-icon green">✓</span><div><small>Completed</small><strong id="stat-complete">—</strong></div></article>
+          <article class="stat"><span class="stat-icon red">!</span><div><small>Blocked</small><strong id="stat-blocked">—</strong></div></article>
+          <article class="stat"><span class="stat-icon amber">◫</span><div><small>Storage pools</small><strong id="stat-pools">—</strong></div></article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><h2>Pool routing</h2><p>qBittorrent save path is authoritative</p></div></div>
+          <div class="table-wrap"><table><thead id="routing-head"></thead><tbody id="pool-rows"></tbody></table></div>
+        </article>
+        <article class="panel recent-panel">
+          <div class="panel-head"><div><h2>Recent activity</h2><p>Latest reconciliation operations</p></div><button class="text-button" data-go="history">View all</button></div>
+          <div id="recent-list" class="activity-list"></div>
+        </article>
+      </section>
+
+      <section id="reconcile" class="page">
+        <div class="page-title"><div><h1>Reconcile</h1><p>Inspect and repair an inconsistency identified by Sync</p></div></div>
+        <article class="panel form-panel">
+          <div class="panel-head"><div><h2>Build plan</h2><p>Select an item in Sync or paste a full qBittorrent info hash</p></div></div>
+          <form id="plan-form"><label for="torrent-hash">Torrent hash</label><div class="input-row"><input id="torrent-hash" autocomplete="off" spellcheck="false" placeholder="40-character info hash"><button class="primary" type="submit">Analyze</button></div></form>
+        </article>
+        <div id="plan-loading" class="loading hidden"><span></span>Analyzing qBittorrent and *Arr…</div>
+        <div id="plan-result"></div>
+      </section>
+
+      <section id="move" class="page">
+        <div class="page-title"><div><h1>Move</h1><p>Relocate qBittorrent data and rebuild its library on another pool</p></div></div>
+        <article class="panel form-panel">
+          <div class="panel-head"><div><h2>*Arr routing and qBittorrent paths</h2><p>Configured download-client categories are shown first; unmatched categories and paths are listed separately</p></div><button id="refresh-qbit" class="primary compact">Refresh torrents</button></div>
+          <div class="move-filter"><input id="move-search" autocomplete="off" spellcheck="false" placeholder="Filter loaded torrents by name, category, path, or info hash"><span id="move-visible-count"></span></div>
+          <div id="move-routing-status"></div>
+          <div id="move-search-loading" class="loading hidden"><span></span>Loading torrents directly from qBittorrent…</div>
+          <div id="move-search-results"></div>
+          <form id="move-form" class="move-selection hidden">
+            <input id="move-hash" type="hidden">
+            <div class="selected-torrent"><small>Selected qBittorrent torrent</small><strong id="move-selected-name"></strong><code id="move-selected-hash" class="path"></code></div>
+            <div class="move-inputs"><label><span>Destination pool</span><select id="move-target"></select></label><button class="primary" type="submit">Build move plan</button></div>
+          </form>
+        </article>
+        <div id="move-loading" class="loading hidden"><span></span>Building qBittorrent and library move plan…</div>
+        <div id="move-result"></div>
+      </section>
+
+      <section id="history" class="page">
+        <div class="page-title"><div><h1>History</h1><p>Recorded plans and reconciliation attempts</p></div></div>
+        <article class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>Operation</th><th>Application</th><th>Torrent</th><th>State</th><th>Updated</th><th></th></tr></thead><tbody id="operation-rows"></tbody></table></div></article>
+      </section>
+
+      <section id="sync" class="page">
+        <div class="page-title"><div><h1>Sync</h1><p>Compare qBittorrent hashes with Radarr and Sonarr</p></div></div>
+        <div class="service-tabs" role="tablist">
+          <button class="service-tab active" data-app="radarr">Radarr</button>
+          <button class="service-tab" data-app="sonarr">Sonarr</button>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><h2 id="sync-title">Radarr hash audit</h2><p>Read-only comparison; no paths or files are changed</p></div><button id="run-sync" class="primary compact">Run audit</button></div>
+          <div id="sync-summary" class="sync-summary"></div>
+          <div id="sync-loading" class="loading hidden"><span></span>Reading qBittorrent and *Arr history…</div>
+          <div class="table-wrap"><table><thead><tr><th>Status</th><th>Torrent / *Arr title</th><th>Hash</th><th>Category</th><th>qBit pool</th><th>*Arr path</th><th></th></tr></thead><tbody id="sync-rows"><tr><td colspan="7" class="empty">Run the Radarr audit to compare hashes</td></tr></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="settings" class="page">
+        <div class="page-title"><div><h1>Settings</h1><p>Required service connections and active pool routing</p></div></div>
+        <article class="panel connection-panel">
+          <div class="panel-head"><div><h2>Required connections</h2><p>Stowarr requires working connections to all three services</p></div><span id="connections-status" class="badge">Required</span></div>
+          <div id="connection-error" class="alert inline-alert hidden"></div>
+          <form id="connections-form">
+            <section class="connection-card"><header><h3>qBittorrent</h3><span>Download source of truth</span></header><label>URL<input name="qbittorrent-url" type="url" required></label><label>Username<input name="qbittorrent-username" required></label><label>Password<input name="qbittorrent-password" type="password" placeholder="Leave blank to keep the saved password"></label></section>
+            <section class="connection-card"><header><h3>Radarr</h3><span>Movies</span></header><label>URL<input name="radarr-url" type="url" required></label><label>API key<input name="radarr-api-key" type="password" placeholder="Leave blank to keep the saved API key"></label></section>
+            <section class="connection-card"><header><h3>Sonarr</h3><span>Series and episodes</span></header><label>URL<input name="sonarr-url" type="url" required></label><label>API key<input name="sonarr-api-key" type="password" placeholder="Leave blank to keep the saved API key"></label></section>
+            <div class="connection-action"><p>Credentials are never returned to the browser. Saving tests every connection before replacing the active configuration.</p><button id="save-connections" class="primary" type="submit">Test and save connections</button></div>
+          </form>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><h2>Discover routing</h2><p>Start with qBittorrent categories and save paths, then match Radarr and Sonarr download clients</p></div><button id="discover-routing" class="primary compact">Discover routes</button></div>
+          <div id="discovery-result" class="empty">Run discovery after all required connections are configured</div>
+        </article>
+        <div id="settings-pools"></div>
+      </section>
+    </main>
+  </div>
+  <dialog id="routing-guide" class="routing-guide">
+    <div class="guide-head"><div><h2>Routing diagnostics</h2><p>Detected Radarr, Sonarr, and qBittorrent route configuration</p></div><button id="close-routing-guide" aria-label="Close routing diagnostics">×</button></div>
+    <div class="guide-principle"><strong>Radarr or Sonarr sends the selected download client's category to qBittorrent. qBittorrent then uses that category's configured save path to determine where the download is stored.</strong><span>Tags do not set the download path. They restrict which movies or series are allowed to use each download client.</span></div>
+    <div id="routing-guide-content"></div>
+  </dialog>
+  <div id="toast" role="status"></div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

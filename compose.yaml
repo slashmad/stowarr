@@ -1,0 +1,49 @@
+services:
+  stowarr-api:
+    image: ghcr.io/slashmad/stowarr-api:latest
+    build: .
+    container_name: stowarr-api
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Stockholm
+      STOWARR_CONFIG: /config/config.json
+      STOWARR_APPLY: "false"
+      STOWARR_API_ONLY: "true"
+      STOWARR_PORT: "8788"
+      STOWARR_API_TOKEN: ${STOWARR_API_TOKEN:-stowarr-local-api}
+      RADARR_API_KEY: ${RADARR_API_KEY:-}
+      SONARR_API_KEY: ${SONARR_API_KEY:-}
+      QBITTORRENT_USERNAME: ${QBITTORRENT_USERNAME:-}
+      QBITTORRENT_PASSWORD: ${QBITTORRENT_PASSWORD:-}
+    volumes:
+      - ./config:/config:ro
+      - stowarr-state:/state
+      - ${POOL1_HOST_PATH:-./data/pool1}:${POOL1_CONTAINER_PATH:-/data/pool1}:ro
+      - ${POOL2_HOST_PATH:-./data/pool2}:${POOL2_CONTAINER_PATH:-/data/pool2}:ro
+    expose:
+      - "8788"
+    ports:
+      - "127.0.0.1:8788:8788"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8788/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  stowarr-web:
+    image: ghcr.io/slashmad/stowarr-web:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: stowarr-web
+    restart: unless-stopped
+    environment:
+      STOWARR_API_TOKEN: ${STOWARR_API_TOKEN:-stowarr-local-api}
+    depends_on:
+      stowarr-api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8787:8080"
+
+volumes:
+  stowarr-state:

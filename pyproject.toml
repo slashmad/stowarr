@@ -1,0 +1,25 @@
+[project]
+name = "stowarr"
+version = "0.1.0"
+description = "Transactional pool reconciliation for qBittorrent and *Arr"
+requires-python = ">=3.12"
+
+[project.scripts]
+stowarr = "stowarr.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+stowarr = ["web/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
