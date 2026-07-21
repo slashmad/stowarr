@@ -4,8 +4,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from stowarr.archive import ArchiveMember, ExtractedFile
 from stowarr.config import Pool
-from stowarr.engine import Plan, Stowarr, is_archive, sha256, title_matches
+from stowarr.engine import MovePlan, Plan, Stowarr, is_archive, sha256, title_matches
 
 
 class EngineTest(unittest.TestCase):
@@ -62,6 +63,51 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(is_archive(Path("movie.7z")))
         self.assertFalse(is_archive(Path("movie.mkv")))
 
+    def test_archive_extraction_publishes_only_exact_managed_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download = root / "download"
+            old_item = root / "old" / "Movie"
+            new_item = root / "new" / "Movie"
+            download.mkdir()
+            old_item.mkdir(parents=True)
+            archive = download / "release.rar"
+            archive.write_bytes(b"archive")
+            old_media = old_item / "Movie.mkv"
+            old_media.write_bytes(b"verified-media")
+
+            class Extractor:
+                def members(self, entry):
+                    return [ArchiveMember("release.mkv", len(b"verified-media"))]
+
+                def extract(self, entry, destination):
+                    destination.mkdir(parents=True)
+                    output = destination / "release.mkv"
+                    output.write_bytes(b"verified-media")
+                    return [ExtractedFile("release.mkv", output, output.stat().st_size)]
+
+            manager = Stowarr.__new__(Stowarr)
+            manager.qbit = SimpleNamespace(
+                torrent=lambda torrent_hash: {"save_path": str(download)},
+                files=lambda torrent_hash: [{"name": "release.rar", "priority": 1, "size": 7}],
+            )
+            manager.archive_extractor = Extractor()
+            managed = {
+                "id": 10, "path": str(old_media), "targetPath": str(new_item / "Movie.mkv"),
+                "size": old_media.stat().st_size,
+            }
+            plan = MovePlan(
+                "a" * 40, "release", "radarr", "p3", "p1", str(download), str(download),
+                "radarr-p1", 1, "Movie", [managed], 7, 1000, "ready",
+                target_item_path=str(new_item), extraction_required=True,
+                extraction_space=old_media.stat().st_size, extraction_files=[managed],
+            )
+
+            published = manager._extract_managed_media("a" * 40, plan)
+
+            self.assertEqual((new_item / "Movie.mkv").read_bytes(), b"verified-media")
+            self.assertTrue(published[0]["created"])
+
     def test_move_preserves_relative_save_path_between_pool_download_roots(self):
         current = Pool(
             "p3", Path("/media/p3"), (Path("/media/p3/download"),),
@@ -75,6 +121,53 @@ class EngineTest(unittest.TestCase):
         )
         result = Stowarr._target_download_path(current, target, Path("/media/p3/download/manual"))
         self.assertEqual(result, Path("/media/p1/download/manual"))
+
+    def test_move_inventory_separates_tracked_and_additional_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_pool = root / "p3"
+            target_pool_path = root / "p1"
+            download = source_pool / "download"
+            release = download / "Release"
+            library = source_pool / "movies" / "Movie (2020)"
+            release.mkdir(parents=True)
+            library.mkdir(parents=True)
+            (release / "Movie.mkv").write_bytes(b"video")
+            (release / "plugin.txt").write_bytes(b"plugin")
+            managed = library / "Movie.mkv"
+            managed.write_bytes(b"video")
+            (library / "poster.jpg").write_bytes(b"poster")
+            target_pool = Pool(
+                "p1", target_pool_path, (target_pool_path / "download",),
+                target_pool_path / "movies", target_pool_path / "series",
+                "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+            )
+            torrent = {"save_path": str(download), "content_path": str(release)}
+            torrent_files = [{"name": "Release/Movie.mkv", "size": 5, "priority": 1}]
+            mapping = {"item": {"path": str(library)}, "files": [{"path": str(managed)}]}
+            manager = Stowarr.__new__(Stowarr)
+
+            tracked, additional = manager._move_inventory(
+                torrent, torrent_files, mapping, target_pool, target_pool.download_roots[0], "radarr"
+            )
+
+            self.assertEqual([item["relative_path"] for item in tracked], ["Release/Movie.mkv"])
+            self.assertEqual({item["scope"] for item in additional}, {"download", "library"})
+            self.assertTrue(all(item["sha256"] for item in additional))
+
+    def test_verified_additional_copy_rejects_changed_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.srt"
+            target = root / "target.srt"
+            source.write_bytes(b"original")
+            expected = sha256(source)
+            source.write_bytes(b"changed")
+
+            with self.assertRaises(RuntimeError):
+                Stowarr._copy_verified(source, target, expected)
+
+            self.assertFalse(target.exists())
 
     def test_qbittorrent_search_does_not_consult_arr(self):
         manager = Stowarr.__new__(Stowarr)

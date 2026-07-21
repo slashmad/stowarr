@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from .config import Service
 from .http import JsonClient
 
@@ -152,6 +154,24 @@ class ArrClient:
             item["path"] = f"{root.rstrip('/')}/{title_folder}"
         endpoint = "movie" if self.kind == "radarr" else "series"
         return self.http.request("PUT", f"/api/v3/{endpoint}/{item['id']}", query={"moveFiles": "false"}, body=item)
+
+    def rescan(self, item_id: int, timeout: int = 1800) -> dict:
+        name = "RescanMovie" if self.kind == "radarr" else "RescanSeries"
+        key = "movieId" if self.kind == "radarr" else "seriesId"
+        command = self.http.request("POST", "/api/v3/command", body={"name": name, key: item_id})
+        command_id = command.get("id")
+        if not command_id:
+            raise RuntimeError(f"{self.kind.capitalize()} did not return a command id for {name}")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            current = self.http.request("GET", f"/api/v3/command/{command_id}")
+            status = str(current.get("status", "")).casefold()
+            if status == "completed":
+                return current
+            if status in {"failed", "aborted", "cancelled"}:
+                raise RuntimeError(f"{self.kind.capitalize()} {name} failed: {current.get('message') or status}")
+            time.sleep(2)
+        raise RuntimeError(f"{self.kind.capitalize()} {name} exceeded {timeout} seconds")
 
 
 class QBittorrentClient:

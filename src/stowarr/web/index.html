@@ -7,8 +7,19 @@
   <title>Stowarr</title>
   <link rel="stylesheet" href="/assets/app.css">
   <link rel="stylesheet" href="/assets/routing.css">
+  <link rel="stylesheet" href="/assets/cohesion.css">
 </head>
 <body>
+  <svg class="icon-library" aria-hidden="true">
+    <symbol id="icon-sync" viewBox="0 0 24 24"><path d="M4 7h12l-3-3m7 13H8l3 3M16 7l-3 3m-5 7 3-3"/></symbol>
+    <symbol id="icon-home" viewBox="0 0 24 24"><path d="m3 11 9-8 9 8M5 10v10h14V10M9 20v-6h6v6"/></symbol>
+    <symbol id="icon-reconcile" viewBox="0 0 24 24"><path d="M7 7h13m0 0-3-3m3 3-3 3M17 17H4m0 0 3 3m-3-3 3-3"/></symbol>
+    <symbol id="icon-move" viewBox="0 0 24 24"><path d="M4 12h15m0 0-5-5m5 5-5 5"/></symbol>
+    <symbol id="icon-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8m0-5v5h5M12 7v5l3 2"/></symbol>
+    <symbol id="icon-settings" viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="m19 13.5 2 1.5-2 3.5-2.4-1a8 8 0 0 1-2.6 1.5L13.7 22h-4l-.3-3a8 8 0 0 1-2.6-1.5l-2.4 1L2.5 15l2-1.5a8 8 0 0 1 0-3l-2-1.5 2-3.5 2.4 1A8 8 0 0 1 9.4 5l.3-3h4l.3 3a8 8 0 0 1 2.6 1.5l2.4-1L21.5 9l-2 1.5a8 8 0 0 1 0 3Z"/></symbol>
+    <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m16 16 5 5"/></symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6M20 4v7h-7"/></symbol>
+  </svg>
   <div class="shell">
     <aside class="sidebar">
       <a class="brand" href="#sync" aria-label="Stowarr home">
@@ -16,22 +27,24 @@
         <span>STOW<span>ARR</span></span>
       </a>
       <nav aria-label="Main navigation">
-        <button class="nav-item active" data-page="sync"><span class="icon">≋</span>Sync</button>
-        <button class="nav-item" data-page="overview"><span class="icon">⌂</span>Overview</button>
-        <button class="nav-item" data-page="reconcile"><span class="icon">⇄</span>Reconcile</button>
-        <button class="nav-item" data-page="move"><span class="icon">⇢</span>Move</button>
-        <button class="nav-item" data-page="history"><span class="icon">◷</span>History <b id="history-count"></b></button>
+        <button class="nav-item active" data-page="sync"><svg class="icon"><use href="#icon-sync"/></svg>Sync</button>
+        <button class="nav-item" data-page="overview"><svg class="icon"><use href="#icon-home"/></svg>Overview</button>
+        <button class="nav-item" data-page="reconcile"><svg class="icon"><use href="#icon-reconcile"/></svg>Reconcile</button>
+        <button class="nav-item" data-page="move"><svg class="icon"><use href="#icon-move"/></svg>Move</button>
+        <button class="nav-item" data-page="history"><svg class="icon"><use href="#icon-history"/></svg>History <b id="history-count"></b></button>
         <div class="nav-heading">System</div>
-        <button class="nav-item" data-page="settings"><span class="icon">⚙</span>Settings</button>
+        <button class="nav-item" data-page="settings"><svg class="icon"><use href="#icon-settings"/></svg>Settings</button>
+        <button class="nav-item" data-page="guide"><svg class="icon"><use href="#icon-history"/></svg>Guide</button>
       </nav>
       <div class="sidebar-status"><span id="side-dot" class="dot"></span><span><strong id="side-mode">Loading</strong><small>Stowarr service</small></span></div>
     </aside>
+    <button id="sidebar-backdrop" class="sidebar-backdrop" aria-label="Close navigation"></button>
 
     <main>
       <header class="topbar">
-        <button id="menu" class="menu" aria-label="Toggle navigation">☰</button>
-        <div class="search"><span>⌕</span><input id="global-hash" placeholder="Torrent hash"></div>
-        <button class="top-action" id="refresh" title="Refresh">↻</button>
+        <button id="menu" class="menu" aria-label="Toggle navigation"><span></span><span></span><span></span></button>
+        <div class="search"><svg class="icon"><use href="#icon-search"/></svg><input id="global-hash" aria-label="Torrent hash" placeholder="Torrent hash"></div>
+        <button class="top-action" id="refresh" title="Refresh" aria-label="Refresh current page"><svg class="icon"><use href="#icon-refresh"/></svg></button>
       </header>
 
       <section id="overview" class="page active">
@@ -66,7 +79,8 @@
         <div class="page-title"><div><h1>Move</h1><p>Relocate qBittorrent data and rebuild its library on another pool</p></div></div>
         <article class="panel form-panel">
           <div class="panel-head"><div><h2>*Arr routing and qBittorrent paths</h2><p>Configured download-client categories are shown first; unmatched categories and paths are listed separately</p></div><button id="refresh-qbit" class="primary compact">Refresh torrents</button></div>
-          <div class="move-filter"><input id="move-search" autocomplete="off" spellcheck="false" placeholder="Filter loaded torrents by name, category, path, or info hash"><span id="move-visible-count"></span></div>
+          <div class="move-filter"><input id="move-search" autocomplete="off" spellcheck="false" placeholder="Filter by words in name, category, path, or info hash"><span id="move-visible-count"></span></div>
+          <div id="move-column-filters" class="move-column-filters" aria-label="Visible torrent columns"></div>
           <div id="move-routing-status"></div>
           <div id="move-search-loading" class="loading hidden"><span></span>Loading torrents directly from qBittorrent…</div>
           <div id="move-search-results"></div>
@@ -106,11 +120,31 @@
           <div id="connection-error" class="alert inline-alert hidden"></div>
           <div class="connection-summary"><div><strong id="qbit-auth-summary">qBittorrent not configured</strong><span>Radarr and Sonarr API connections are required</span></div><button id="open-connection-setup" class="primary">Open connection setup</button></div>
         </article>
+        <article class="panel runtime-panel">
+          <div class="panel-head"><div><h2>Execution mode</h2><p>Runtime safety mode can be changed here; Docker deployment values are shown separately</p></div><span id="runtime-status" class="badge">Loading</span></div>
+          <form id="runtime-form" class="runtime-form">
+            <label class="check-option"><input id="runtime-apply" type="checkbox"><span><strong>Enable confirmed write operations</strong><small>Move and Reconcile remain plan-based and require an explicit confirmation for every operation.</small></span></label>
+            <button class="primary" type="submit">Save execution mode</button>
+          </form>
+          <div id="deployment-settings" class="deployment-settings"></div>
+        </article>
         <article class="panel">
           <div class="panel-head"><div><h2>Discover routing</h2><p>Start with qBittorrent categories and save paths, then match Radarr and Sonarr download clients</p></div><button id="discover-routing" class="primary compact">Discover routes</button></div>
           <div id="discovery-result" class="empty">Run discovery after all required connections are configured</div>
         </article>
         <div id="settings-pools"></div>
+      </section>
+
+      <section id="guide" class="page">
+        <div class="page-title"><div><h1>Guide</h1><p>How Stowarr pages, buttons, and safety boundaries work</p></div></div>
+        <div class="guide-grid">
+          <article class="panel guide-card"><h2>Sync</h2><p>Compares qBittorrent hashes, categories, save paths, and authoritative pools with Radarr or Sonarr history and library roots.</p><dl><dt>Run audit</dt><dd>Refreshes the selected Radarr or Sonarr comparison.</dd><dt>Reconcile</dt><dd>Opens a repair plan for the selected torrent hash.</dd></dl></article>
+          <article class="panel guide-card"><h2>Overview</h2><p>Summarizes operations, completed and blocked work, configured pools, routing, and recent activity.</p><dl><dt>View all</dt><dd>Opens the complete operation history.</dd><dt>Inspect</dt><dd>Builds a current Reconcile plan for that torrent.</dd></dl></article>
+          <article class="panel guide-card"><h2>Reconcile</h2><p>Repairs an inconsistency using qBittorrent as the source of truth. It verifies content before creating hardlinks, updating *Arr, or removing a stale derivative.</p><dl><dt>Analyze</dt><dd>Builds a read-only plan from an info hash.</dd><dt>Verify content hashes</dt><dd>Hashes torrent, old library, new library, and selected sidecars.</dd><dt>Reconcile</dt><dd>Requests confirmation and executes the verified plan.</dd></dl></article>
+          <article class="panel guide-card"><h2>Move</h2><p>Moves a torrent between pools through qBittorrent, rebuilds the Radarr/Sonarr library, processes every additional file, and removes the empty old folder last.</p><dl><dt>Refresh torrents</dt><dd>Reloads qBittorrent and clears the current selection.</dd><dt>Column buttons</dt><dd>Show or hide Radarr, Sonarr, and unmanaged route columns.</dd><dt>Build move plan</dt><dd>Inventories torrent, *Arr, download, and library files without changing them.</dd><dt>Move all / Delete all</dt><dd>Sets the proposed action for every additional file.</dd><dt>Review &amp; move</dt><dd>Shows a final summary, issues a bound confirmation, and starts the transaction.</dd></dl></article>
+          <article class="panel guide-card"><h2>History</h2><p>Lists Move and Reconcile attempts with their final or current transaction state.</p><dl><dt>Inspect</dt><dd>Rebuilds a current plan; it does not replay the historical operation.</dd></dl></article>
+          <article class="panel guide-card"><h2>Settings</h2><p>Manages service credentials and runtime execution mode, discovers routing, and displays pool and Docker deployment configuration.</p><dl><dt>Open connection setup</dt><dd>Tests all qBittorrent, Radarr, and Sonarr credentials before saving.</dd><dt>Save execution mode</dt><dd>Enables or disables confirmed writes after checking mount access.</dd><dt>Discover routes</dt><dd>Reads qBittorrent destinations first, then matches *Arr clients, categories, tags, and roots.</dd></dl></article>
+        </div>
       </section>
     </main>
   </div>

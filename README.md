@@ -32,8 +32,9 @@ unrelated files.
   blocked.
 - Cross-seed group migration is not automatic.
 
-Archive-backed cross-pool execution remains blocked until extraction, *Arr
-import confirmation, and cleanup can complete as one recoverable transaction.
+Archive-backed cross-pool execution uses qBittorrent recheck, archive integrity
+testing, isolated extraction, SHA-256 comparison, and a completed *Arr rescan
+before any old derived media is removed.
 
 ## Quick start with Docker Compose
 
@@ -159,6 +160,38 @@ docker compose up -d --force-recreate stowarr-api
 Write access does not remove the confirmation requirement. The WebUI and API
 still require an explicit plan confirmation for every destructive operation.
 
+The execution mode can also be changed under **Settings → Execution mode**.
+Stowarr validates that every configured pool is writable before enabling apply
+mode and stores the runtime choice in its SQLite state. Docker boundary settings
+such as bind mounts, mount mode, listener ports, and the API proxy token remain
+deployment settings and require a Compose recreate.
+
+## Move transaction
+
+Move uses a complete, confirmation-bound manifest:
+
+1. qBittorrent-owned files are identified from the torrent manifest.
+2. Radarr/Sonarr-managed library files are resolved from download history.
+3. Untracked files below the torrent content directory and additional files in
+   the current library directory are inventoried and hashed.
+4. Every additional file must be assigned either **Move and verify** or
+   **Delete after verification** in the WebUI.
+5. qBittorrent is paused, relocates its tracked data, and completes a recheck.
+6. Archive-derived media is regenerated in isolated staging when required. Each
+   output must uniquely match the current *Arr-managed file by size and SHA-256.
+7. Additional files selected for Move are copied and hash-verified.
+8. Stowarr rebuilds the library, updates Radarr/Sonarr, waits for a successful
+   rescan command, confirms the managed paths, and verifies selected sidecars.
+9. Files selected for Delete and verified old sources are removed.
+10. Empty old content and library directories are removed last. An unexpected
+   remaining file fails the operation instead of being deleted recursively.
+
+The Move confirmation fingerprint includes the destination pool, full plan,
+and every additional-file action. A stale or altered plan cannot reuse an old
+confirmation token.
+
+The WebUI **Guide** page summarizes every page and action button.
+
 ## Service isolation
 
 The stack contains two services:
@@ -220,7 +253,7 @@ torrent manifest.
 | Torrent sidecar | Hardlink from qBittorrent data | Existing targets must be identical |
 | Library or plugin sidecar | Optional verified copy | Source and temporary destination hashes must agree |
 | Packed media already on the authoritative pool | Keep imported media | Validate qBittorrent and *Arr paths |
-| Packed media on another pool | Planned native re-extraction | Archive recheck, integrity test, staged extraction, hash, and import confirmation |
+| Packed media on another pool | Native verified re-extraction | Archive recheck, integrity test, isolated extraction, SHA-256 match, and completed *Arr rescan |
 | Competing sidecars | Block automatic overwrite | Explicit conflict resolution required |
 | Unknown media origin | Block | Manual investigation required |
 | Unknown additional hardlinks | Block | Every link owner must be identified |
@@ -231,8 +264,9 @@ verification chain; it cannot be hardlinked to archive data.
 
 The extraction foundation uses the current Linux 7-Zip command-line tool behind
 a restricted staging interface. It recognizes common RAR/RAR5, multipart RAR,
-ZIP, 7z, TAR, and ISO layouts. Cross-pool archive execution remains disabled
-until the complete transaction is recoverable.
+ZIP, 7z, TAR, and ISO layouts. It discovers independent archive sets, publishes
+only uniquely verified *Arr-managed media, and rolls back newly published files
+if a later transaction step fails.
 
 ## Development
 

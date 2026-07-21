@@ -82,6 +82,8 @@ def handler(manager: Stowarr):
                 })
             elif path == "/api/settings/connections":
                 self.send_json(200, manager.connection_settings())
+            elif path == "/api/settings/runtime":
+                self.send_json(200, manager.runtime_settings())
             elif path == "/api/settings/discovery":
                 try:
                     self.send_json(200, manager.connection_discovery())
@@ -129,6 +131,11 @@ def handler(manager: Stowarr):
                     self.send_json(200, manager.update_connections(self.read_json()))
                 except Exception as error:
                     self.send_json(400, {"error": str(error)})
+            elif path == "/api/settings/runtime":
+                try:
+                    self.send_json(200, manager.update_runtime_settings(self.read_json()))
+                except Exception as error:
+                    self.send_json(400, {"error": str(error)})
             elif not manager.connections_ready:
                 self.send_json(503, {"error": "Configure qBittorrent, Radarr, and Sonarr in Settings first"})
             elif path == "/api/confirmations":
@@ -161,9 +168,13 @@ def handler(manager: Stowarr):
                     target_pool = body.get("targetPool")
                     if not isinstance(target_pool, str) or not target_pool:
                         raise ValueError("targetPool is required")
+                    additional_files = body.get("additionalFiles", {})
+                    if not isinstance(additional_files, dict):
+                        raise ValueError("additionalFiles must be an object of source paths and actions")
                     torrent_hash = path.rsplit("/", 1)[-1]
-                    manager.consume_confirmation(body.get("confirmationToken", ""), "move", torrent_hash, {"targetPool": target_pool})
-                    self.send_json(200, manager.move(torrent_hash, target_pool))
+                    payload = {"targetPool": target_pool, "additionalFiles": additional_files}
+                    manager.consume_confirmation(body.get("confirmationToken", ""), "move", torrent_hash, payload)
+                    self.send_json(200, manager.move(torrent_hash, target_pool, additional_files))
                 except Exception as error:
                     self.send_json(409, {"error": str(error)})
             elif path.startswith("/api/verify/"):

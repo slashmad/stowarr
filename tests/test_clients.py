@@ -21,6 +21,26 @@ class FakeHttp:
 
 
 class ArrClientTest(unittest.TestCase):
+    @patch("stowarr.clients.time.sleep")
+    def test_rescan_waits_for_completed_arr_command(self, sleep):
+        class CommandHttp:
+            def __init__(self):
+                self.statuses = iter(("queued", "completed"))
+
+            def request(self, method, path, **kwargs):
+                if method == "POST":
+                    self.body = kwargs["body"]
+                    return {"id": 19}
+                return {"id": 19, "status": next(self.statuses)}
+
+        client = ArrClient(Service("http://unused", api_key="unused"), "radarr")
+        client.http = CommandHttp()
+        result = client.rescan(42)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(client.http.body, {"name": "RescanMovie", "movieId": 42})
+        sleep.assert_called_once_with(2)
+
     def test_download_id_falls_back_to_uppercase(self):
         client = ArrClient(Service("http://unused", api_key="unused"), "radarr")
         client.http = FakeHttp()
