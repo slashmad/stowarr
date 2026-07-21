@@ -1,92 +1,181 @@
 # Stowarr
 
-Stowarr reconciles Radarr/Sonarr with the pool currently used by
-qBittorrent. qBittorrent's `save_path` is authoritative.
+Stowarr keeps qBittorrent, Radarr, and Sonarr consistent when media is spread
+across multiple storage pools. qBittorrent's torrent `save_path` is the source
+of truth for the authoritative pool.
 
-Stowarr exposes three deliberately separate workflows:
+## Workflows
 
-- **Sync** performs a read-only bulk audit.
-- **Reconcile** repairs library inconsistencies on qBittorrent's current pool and never changes the torrent save path.
-- **Move** relocates torrent-owned data through the qBittorrent API to an explicitly selected pool, verifies it, and then reconciles the library.
+Stowarr deliberately separates discovery, repair, and relocation:
+
+| Workflow | Purpose | Changes qBittorrent save path |
+| --- | --- | --- |
+| **Sync** | Compare qBittorrent hashes with Radarr or Sonarr | No |
+| **Reconcile** | Repair library paths and hardlinks on the pool already selected by qBittorrent | No |
+| **Move** | Relocate torrent data through qBittorrent, verify it, and rebuild the library on another pool | Yes |
 
 Radarr movies are resolved through `downloadId → movieId → movieFile`. Sonarr
 downloads are resolved through `downloadId → seriesId/episodeId → episodeFile`.
-Incomplete Sonarr episode mappings are blocked rather than expanded to every
-file in the series.
+Incomplete or ambiguous mappings are blocked instead of being expanded to
+unrelated files.
 
-The first release intentionally defaults to dry-run. It supports the important
-recovery case where qBittorrent has already moved a torrent between pools:
+## Safety model
 
-1. resolve the torrent hash through *Arr history;
-2. match video files by unique size;
-3. hash source library data and qBittorrent data;
-4. create new library hardlinks on qBittorrent's pool;
-5. update the *Arr root and pool tag;
-6. unlink the old library names;
-7. verify that Radarr/Sonarr reports the new library paths.
+- Fresh installations start in dry-run mode.
+- Every destructive request requires an explicit, single-use confirmation.
+- Confirmation tokens expire after ten minutes and are bound to the exact plan
+  and selected payload.
+- Reconcile never pauses or relocates torrent data.
+- Move owns the pause, qBittorrent relocation, recheck, and resume sequence.
+- Existing files with different content are never overwritten automatically.
+- Unknown hardlinks, ambiguous matches, and paths outside configured pools are
+  blocked.
+- Cross-seed group migration is not automatic.
 
-Reconcile treats qBittorrent data as read-only and does not pause, recheck, or
-relocate the torrent. Move owns the pause → qBittorrent relocation → recheck →
-resume sequence. Archive-backed Move execution remains locked until native
-extraction, import confirmation, and cleanup form one recoverable transaction.
+Archive-backed cross-pool execution remains blocked until extraction, *Arr
+import confirmation, and cleanup can complete as one recoverable transaction.
 
-It refuses ambiguous matches, missing torrent data, paths outside configured
-pools, and source files with additional unknown hardlinks. Cross-seed group
-migration is deliberately not automatic yet.
+## Quick start with Docker Compose
 
-## Setup
+The Compose file uses public multi-architecture images for `linux/amd64` and
+`linux/arm64`:
 
-### GHCR images
-
-The default Compose file references the public multi-architecture images
-`ghcr.io/slashmad/stowarr-api:latest` and
-`ghcr.io/slashmad/stowarr-web:latest`. Clone the repository, create only the
-local files, and start the stack:
+- `ghcr.io/slashmad/stowarr-api:latest`
+- `ghcr.io/slashmad/stowarr-web:latest`
 
 ```bash
 git clone https://github.com/slashmad/stowarr.git
 cd stowarr
 cp config/config.example.json config/config.json
 cp .env.example .env
+```
+
+Before starting, edit `.env`:
+
+```dotenv
+STOWARR_API_TOKEN=replace-with-a-long-random-value
+STOWARR_APPLY=false
+STOWARR_MEDIA_MOUNT_MODE=ro
+
+POOL1_HOST_PATH=/path/on/host/pool1
+POOL1_CONTAINER_PATH=/data/pool1
+POOL2_HOST_PATH=/path/on/host/pool2
+POOL2_CONTAINER_PATH=/data/pool2
+```
+
+The container paths must match the absolute media paths visible to
+qBittorrent, Radarr, and Sonarr. Adjust the pool definitions in
+`config/config.json` to use those same container paths.
+
+Start Stowarr:
+
+```bash
+docker compose pull
 docker compose up -d
 ```
 
-Set a unique `STOWARR_API_TOKEN`, host mount paths, and matching container paths
-in `.env`. Service URLs and credentials can then be entered through Settings in
-the WebUI. `config/config.json` and `.env` are local-only files excluded from
-both Git and Docker build contexts.
+Open `http://127.0.0.1:8787`. On the first start, Stowarr displays a blocking
+connection setup for only the three required services:
 
-For qBittorrent 5.2 or newer, set `QBITTORRENT_API_KEY`. Stowarr sends it as
-`X-API-Key` and does not create a password session. For older qBittorrent
-versions, leave the API key empty and set `QBITTORRENT_USERNAME` and
-`QBITTORRENT_PASSWORD`; Stowarr then uses the official cookie-based WebAPI
-login. When both methods are configured, the API key always takes precedence.
+- qBittorrent URL and API key, or legacy username/password fallback;
+- Radarr URL and API key;
+- Sonarr URL and API key.
 
-For local image development, run `docker compose build` before `up`.
+All three connections are tested before they replace the active configuration.
+Secrets are stored by the API in the local `stowarr-state` volume and are never
+returned to frontend JavaScript. The setup can be opened again from Settings.
 
-All applications must use identical absolute media paths. Edit `compose.yaml`
-if your existing containers use another shared network. The SQLite state is
-kept in the local Docker volume `stowarr-state`, not on an NFS project mount.
+### qBittorrent authentication
 
-## Safe first run
+For qBittorrent 5.2 or newer, use an API key. Stowarr sends it with the
+`X-API-Key` header and does not create a password session. API-key
+authentication always takes precedence when both methods are configured.
 
-Keep `STOWARR_APPLY=false`, then use the torrent hash shown by qBittorrent:
+For older qBittorrent versions, leave the API key empty and supply the WebUI
+username and password. Stowarr then authenticates through
+`/api/v2/auth/login` and uses qBittorrent's session cookie.
 
-Open `http://127.0.0.1:8787` on the Fedora host for the WebUI. It provides an
-*Arr-style overview, the active pool routing schema, plan inspection with
-structured blocking errors, and operation history. The UI does not expose
-service credentials and does not bypass the `STOWARR_APPLY` safety setting.
+Connection credentials may be supplied through the onboarding UI. The matching
+environment variables are also available for initial bootstrap:
 
-The Compose stack contains two isolated services. `stowarr-web` serves static
-assets and proxies `/api`; it has no secrets, state, or media mounts.
-`stowarr-api` owns credentials, SQLite state, and media access. Its direct API
-listener is bound to `127.0.0.1:8788` and requires a bearer token. Set a long,
-random `STOWARR_API_TOKEN` in `.env` before exposing that listener beyond the
-host.
+```dotenv
+QBITTORRENT_API_KEY=
+QBITTORRENT_USERNAME=
+QBITTORRENT_PASSWORD=
+RADARR_API_KEY=
+SONARR_API_KEY=
+```
+
+## Pool routing
+
+Each pool defines:
+
+- one or more qBittorrent download roots;
+- a Radarr library root and category;
+- a Sonarr library root and category;
+- Radarr and Sonarr selection tags.
+
+The routing chain is:
+
+```text
+Radarr/Sonarr tag
+        ↓ selects
+*Arr qBittorrent download client
+        ↓ sends category
+qBittorrent category
+        ↓ selects
+qBittorrent save path and storage pool
+```
+
+Tags restrict which movie or series may use a download client. Tags do not set
+the download path themselves. Stowarr's routing diagnostics compare the *Arr
+download clients, categories, tags, root folders, and qBittorrent category save
+paths.
+
+## Dry run and apply mode
+
+The default configuration is intentionally non-destructive:
+
+```dotenv
+STOWARR_APPLY=false
+STOWARR_MEDIA_MOUNT_MODE=ro
+```
+
+Build and inspect plans in this mode first. A confirmed operation is recorded
+as `DRY_RUN` and cannot modify media.
+
+After validating the paths, permissions, and plans, enable execution by changing
+both settings and recreating the API container:
+
+```dotenv
+STOWARR_APPLY=true
+STOWARR_MEDIA_MOUNT_MODE=rw
+```
+
+```bash
+docker compose up -d --force-recreate stowarr-api
+```
+
+Write access does not remove the confirmation requirement. The WebUI and API
+still require an explicit plan confirmation for every destructive operation.
+
+## Service isolation
+
+The stack contains two services:
+
+- `stowarr-web` serves static assets and proxies `/api`. It has no media or
+  state mounts. Its proxy receives `STOWARR_API_TOKEN` as a container
+  environment variable, but the token is not delivered to frontend code.
+- `stowarr-api` owns service credentials, SQLite state, media access, and all
+  filesystem operations.
+
+The WebUI is bound to `127.0.0.1:8787`. The direct API listener is bound to
+`127.0.0.1:8788` and requires the bearer token. Do not expose either listener
+to another network without adding TLS and appropriate access controls.
 
 ## API
 
-Read-only calls can be made directly with the bearer token:
+Read-only requests use the bearer token:
 
 ```bash
 curl -H "Authorization: Bearer $STOWARR_API_TOKEN" \
@@ -96,8 +185,8 @@ curl -H "Authorization: Bearer $STOWARR_API_TOKEN" \
   http://127.0.0.1:8788/api/operations
 ```
 
-Every destructive operation uses a mandatory two-step protocol. First request
-a short-lived confirmation that is bound to the current plan and exact payload:
+Destructive operations use a mandatory two-step protocol. First issue a
+confirmation bound to the current plan and payload:
 
 ```bash
 curl -X POST \
@@ -107,7 +196,7 @@ curl -X POST \
   http://127.0.0.1:8788/api/confirmations
 ```
 
-Then send the returned token with the identical selection:
+Then submit the returned token with the identical selection:
 
 ```bash
 curl -X POST \
@@ -117,59 +206,55 @@ curl -X POST \
   http://127.0.0.1:8788/api/reconcile/TORRENT_HASH
 ```
 
-Tokens expire after ten minutes, are single-use, and become invalid if the plan
-or payload changes. The same protocol applies to Move with `kind: "move"` and
-`payload: {"targetPool":"p1"}`. With `STOWARR_APPLY=false`, an authorized
-operation is still recorded only as `DRY_RUN`.
+Move uses the same protocol with `kind: "move"` and a payload such as
+`{"targetPool":"p1"}`.
 
-The current reconcile path talks directly to qBittorrent, Radarr and Sonarr.
-Seerr, Prowlarr, Bazarr and Cleanuparr endpoints are recorded in the example
-configuration for planned event and health integrations, but are not called yet.
+## Media strategy
 
-## Safety boundary
+Stowarr does not assume that every imported media file exists directly in the
+torrent manifest.
 
-This version does not silently react to category edits. Reconcile and Move are
-explicit API operations protected by authenticated, single-use confirmations.
-Automatic polling and coordinated cross-seed migration remain disabled.
-
-## Media strategy matrix
-
-Stowarr never assumes that every imported media file exists directly in the
-torrent manifest. Unknown cases are blocked instead of guessed.
-
-| Scenario | Detection | Destination operation | Required verification |
-| --- | --- | --- | --- |
-| Direct torrent media | A qBittorrent video matches the *Arr file by unique size | Hardlink from qBittorrent | Old library SHA-256 equals torrent SHA-256; an existing target must also match |
-| Packed media already on the authoritative pool | The torrent contains archives and the imported library path is already on qBittorrent's pool | No media move | Preserve the imported media and validate paths |
-| Packed media on the wrong pool | The torrent contains archives but no matching video and the library is on another pool | Re-extract into isolated staging on the authoritative pool | qBittorrent recheck and an archive integrity test must succeed; regenerated output must be hashed before import |
-| Torrent sidecar | Non-video file is present in qBittorrent's manifest | Hardlink from qBittorrent | Existing targets must be identical |
-| Library/plugin sidecar | File exists in the old library but not the torrent manifest | Optional verified copy | SHA-256 of source and temporary destination must match |
-| Competing sidecars | Torrent and library files select the same destination name | Block automatic overwrite | Explicit conflict resolution is required |
-| Unknown media origin | No matching torrent video and no archive set | Block | Manual investigation is required |
-| Unknown hardlinks | A cross-pool source has additional hardlinks | Block | All link owners must be identified first |
-| Existing different target | Destination exists with different content | Block | Never overwrite automatically |
+| Scenario | Destination operation | Verification |
+| --- | --- | --- |
+| Direct torrent media | Hardlink from qBittorrent data | Source, torrent, and existing target hashes must agree |
+| Torrent sidecar | Hardlink from qBittorrent data | Existing targets must be identical |
+| Library or plugin sidecar | Optional verified copy | Source and temporary destination hashes must agree |
+| Packed media already on the authoritative pool | Keep imported media | Validate qBittorrent and *Arr paths |
+| Packed media on another pool | Planned native re-extraction | Archive recheck, integrity test, staged extraction, hash, and import confirmation |
+| Competing sidecars | Block automatic overwrite | Explicit conflict resolution required |
+| Unknown media origin | Block | Manual investigation required |
+| Unknown additional hardlinks | Block | Every link owner must be identified |
 
 For packed releases, the torrent infohash and qBittorrent recheck validate the
-archive set. The extracted media is a disposable derived artifact and therefore
-has its own SHA-256 verification chain; it cannot be hardlinked to archive data.
-Cross-pool packed media is never copied from an old library as the authoritative
-source. It must be regenerated from qBittorrent-owned archives by Stowarr's
-extractor. The extractor uses the current Linux 7-Zip command-line tool behind a
-restricted staging interface; Stowarr does not implement archive codecs.
+archive set. Extracted media is a derived artifact and requires its own
+verification chain; it cannot be hardlinked to archive data.
 
-### Native archive recovery design
+The extraction foundation uses the current Linux 7-Zip command-line tool behind
+a restricted staging interface. It recognizes common RAR/RAR5, multipart RAR,
+ZIP, 7z, TAR, and ISO layouts. Cross-pool archive execution remains disabled
+until the complete transaction is recoverable.
 
-Stowarr uses a dedicated staging root on each pool:
+## Development
 
-1. force-recheck the qBittorrent archive set;
-2. create a per-operation staging directory on the authoritative pool;
-3. test the complete archive set with 7-Zip without modifying qBittorrent data;
-4. extract into an empty per-operation staging directory on the authoritative pool;
-5. reject path traversal, links, missing volumes, encrypted input without a configured password, and ambiguous media matches;
-6. inventory and hash every extracted output before allowing *Arr import;
-7. remove stale derived files on the old pool only after the new import is verified;
-8. remove the staging job without deleting qBittorrent-owned archive data.
+Build local images:
 
-RAR is one supported input format, not a universal extraction engine. Stowarr
-uses 7-Zip because it reads RAR/RAR5, multipart RAR, ZIP, 7z, TAR, ISO and the
-other common release formats through one maintained command-line interface.
+```bash
+docker compose build
+```
+
+Run the test suite:
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+Pull requests run the test suite, syntax checks, Compose validation, container
+builds, and Gitleaks. Merges to `main` publish both multi-architecture GHCR
+images with provenance and SBOM attestations.
+
+## Project status
+
+Stowarr is an early release. Keep dry-run enabled until plans have been reviewed
+against your own qBittorrent, Radarr, Sonarr, filesystem, and hardlink layout.
+
+See [SECURITY.md](SECURITY.md) for vulnerability reporting.
