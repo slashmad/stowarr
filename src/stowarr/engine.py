@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from .clients import ArrClient, QBittorrentClient
-from .archive import is_archive_path
+from .archive import ArchiveExtractor, is_archive_path, select_archive_entries
 from .config import Config, Pool, Service
 from .store import Store
 
@@ -105,6 +105,14 @@ class MovePlan:
     reason: str = ""
     content_mode: str = "unknown"
     archive_files: int = 0
+    current_item_path: str | None = None
+    target_item_path: str | None = None
+    tracked_files: list[dict] | None = None
+    additional_files: list[dict] | None = None
+    current_content_root: str | None = None
+    extraction_required: bool = False
+    extraction_space: int = 0
+    extraction_files: list[dict] | None = None
 
     def json(self) -> dict:
         return asdict(self)
@@ -136,6 +144,9 @@ def is_archive(path: Path) -> bool:
 class Stowarr:
     def __init__(self, config: Config):
         self.store = Store(config.database)
+        runtime = self.store.setting("runtime")
+        if runtime and isinstance(runtime.get("apply"), bool):
+            config = replace(config, apply=runtime["apply"])
         saved = self.store.setting("connections")
         if saved:
             config = replace(
@@ -148,6 +159,7 @@ class Stowarr:
         self.qbit = None
         self.arr = {}
         self.connection_error = None
+        self.archive_extractor = ArchiveExtractor()
         try:
             self._activate_connections(config.qbittorrent, config.radarr, config.sonarr, validate=False)
         except Exception as error:
@@ -275,6 +287,53 @@ class Stowarr:
             })
         return {"qbit_categories": qbit_categories, "services": services}
 
+    def runtime_settings(self) -> dict:
+        return {
+            "apply": self.config.apply,
+            "deployment": {
+                "config_path": os.getenv("STOWARR_CONFIG", "/config/config.json"),
+                "listen": self.config.listen,
+                "port": self.config.port,
+                "api_only": self.config.api_only,
+                "api_token_set": bool(self.config.api_token),
+                "media_mount_mode": os.getenv("STOWARR_MEDIA_MOUNT_MODE", "unknown"),
+                "timezone": os.getenv("TZ", "UTC"),
+                "pool_mounts": [
+                    {
+                        "name": pool.name,
+                        "prefix": str(pool.prefix),
+                        "writable": all(
+                            path.exists() and os.access(path, os.W_OK)
+                            for path in (*pool.download_roots, pool.radarr_root, pool.sonarr_root)
+                        ),
+                        "paths": [
+                            {"path": str(path), "writable": path.exists() and os.access(path, os.W_OK)}
+                            for path in (*pool.download_roots, pool.radarr_root, pool.sonarr_root)
+                        ],
+                    }
+                    for pool in self.config.pools
+                ],
+            },
+        }
+
+    def update_runtime_settings(self, payload: dict) -> dict:
+        apply = payload.get("apply")
+        if not isinstance(apply, bool):
+            raise ValueError("apply must be a boolean")
+        if apply:
+            for pool in self.config.pools:
+                for root in (*pool.download_roots, pool.radarr_root, pool.sonarr_root):
+                    probe = root / f".stowarr-write-test-{secrets.token_hex(6)}"
+                    try:
+                        probe.write_bytes(b"")
+                        probe.unlink()
+                    except OSError as error:
+                        probe.unlink(missing_ok=True)
+                        raise PermissionError(f"Required media path is not writable inside the API container: {root}") from error
+        self.store.set_setting("runtime", {"apply": apply})
+        self.config = replace(self.config, apply=apply)
+        return self.runtime_settings()
+
     @staticmethod
     def _operation_fingerprint(kind: str, plan: dict, payload: dict) -> str:
         canonical = json.dumps({"kind": kind, "plan": plan, "payload": payload}, sort_keys=True, separators=(",", ":"))
@@ -291,8 +350,17 @@ class Stowarr:
             target_pool = payload.get("targetPool")
             if not isinstance(target_pool, str) or not target_pool:
                 raise ValueError("targetPool is required")
-            normalized = {"targetPool": target_pool}
             plan = self.move_plan(torrent_hash, target_pool).json()
+            actions = payload.get("additionalFiles", {})
+            expected = {item["source"] for item in plan.get("additional_files", [])}
+            if not isinstance(actions, dict) or set(actions) != expected:
+                raise ValueError("Every additional file must have an explicit move or delete action")
+            if any(action not in {"move", "delete"} for action in actions.values()):
+                raise ValueError("Additional file actions must be move or delete")
+            conflicts = {item["source"] for item in plan.get("additional_files", []) if item["status"] == "target-conflict"}
+            if any(actions[source] == "move" for source in conflicts):
+                raise ValueError("Conflicting additional files must be deleted or resolved manually")
+            normalized = {"targetPool": target_pool, "additionalFiles": dict(sorted(actions.items()))}
         else:
             raise ValueError("kind must be reconcile or move")
         if plan.get("status") != "ready":
@@ -310,7 +378,8 @@ class Stowarr:
             normalized = {"auxiliaryFiles": sorted(set(payload.get("auxiliaryFiles", [])))}
             plan = self.plan(torrent_hash).json()
         else:
-            normalized = {"targetPool": payload.get("targetPool")}
+            actions = payload.get("additionalFiles", {})
+            normalized = {"targetPool": payload.get("targetPool"), "additionalFiles": dict(sorted(actions.items()))}
             plan = self.move_plan(torrent_hash, normalized["targetPool"]).json()
         fingerprint = self._operation_fingerprint(kind, plan, normalized)
         self.store.consume_confirmation(token, kind, torrent_hash, fingerprint)
@@ -367,6 +436,72 @@ class Stowarr:
                 continue
         return target_pool.download_roots[0]
 
+    @staticmethod
+    def _move_file_record(source: Path, target: Path, scope: str, status: str = "available") -> dict:
+        item_size = source.stat().st_size if source.exists() and source.is_file() else 0
+        return {
+            "source": str(source),
+            "target": str(target),
+            "scope": scope,
+            "kind": sidecar_kind(source),
+            "size": item_size,
+            "status": status,
+            "default_action": "move",
+            "sha256": sha256(source) if source.exists() and source.is_file() else None,
+        }
+
+    @staticmethod
+    def _torrent_content_root(torrent: dict, torrent_files: list[dict]) -> Path | None:
+        content_path = str(torrent.get("content_path") or "").strip()
+        if content_path:
+            return Path(content_path)
+        names = [Path(record.get("name", "")) for record in torrent_files if record.get("name")]
+        first_parts = {name.parts[0] for name in names if len(name.parts) > 1}
+        if len(first_parts) == 1:
+            return Path(torrent["save_path"]) / next(iter(first_parts))
+        return None
+
+    def _move_inventory(self, torrent: dict, torrent_files: list[dict], mapping: dict, target_pool: Pool, target_save: Path, app: str) -> tuple[list[dict], list[dict]]:
+        save_path = Path(torrent["save_path"])
+        tracked_paths = {
+            save_path / record["name"]
+            for record in torrent_files
+            if int(record.get("priority", 1)) > 0 and record.get("name")
+        }
+        tracked = [
+            {
+                "path": str(path),
+                "relative_path": str(path.relative_to(save_path)),
+                "size": int(record.get("size", 0)),
+                "kind": "archive" if is_archive(path) else "video" if path.suffix.casefold() in VIDEO_EXTENSIONS else sidecar_kind(path),
+            }
+            for record in torrent_files
+            if int(record.get("priority", 1)) > 0 and record.get("name")
+            for path in [save_path / record["name"]]
+        ]
+        additional: list[dict] = []
+        content_root = self._torrent_content_root(torrent, torrent_files)
+        if content_root and content_root.exists() and content_root.is_dir():
+            for source in content_root.rglob("*"):
+                if source.is_file() and source not in tracked_paths and not source.name.startswith(".!qB"):
+                    target = target_save / source.relative_to(save_path)
+                    status = "target-conflict" if target.exists() and sha256(source) != sha256(target) else "available"
+                    additional.append(self._move_file_record(source, target, "download", status))
+        item = mapping.get("item")
+        if item:
+            current_item = Path(item["path"])
+            target_item = self._target_item_path(item, target_pool, app)
+            managed = {Path(record["path"]) for record in mapping.get("files", [])}
+            if current_item.exists() and current_item != target_item:
+                for source in current_item.rglob("*"):
+                    if not source.is_file() or source in managed:
+                        continue
+                    target = target_item / source.relative_to(current_item)
+                    status = "target-conflict" if target.exists() and sha256(source) != sha256(target) else "available"
+                    additional.append(self._move_file_record(source, target, "library", status))
+        additional.sort(key=lambda item: (item["scope"], item["source"].casefold()))
+        return tracked, additional
+
     def move_plan(self, torrent_hash: str, target_pool_name: str) -> MovePlan:
         torrent = self.qbit.torrent(torrent_hash)
         target_pool = next((pool for pool in self.config.pools if pool.name == target_pool_name), None)
@@ -396,20 +531,42 @@ class Stowarr:
             status, reason = "blocked", "No unique Radarr/Sonarr mapping was found for this torrent"
         elif app == "sonarr" and not mapping.get("mappingComplete"):
             status, reason = "blocked", "Sonarr episode-to-file mapping is incomplete"
-        elif content_mode != "direct":
-            status, reason = "blocked", "Archive-backed move execution remains locked until the extraction and *Arr import transaction is complete"
+        elif content_mode == "unknown":
+            status, reason = "blocked", "Torrent contains no supported video or archive content"
+        elif archive_count and not self.archive_extractor.available():
+            status, reason = "blocked", "Archive extraction requires the 7z executable"
         elif float(torrent.get("progress", 0)) < 1:
             status, reason = "blocked", "Torrent download is incomplete"
         elif str(torrent.get("state", "")).casefold() == "moving" or str(torrent.get("state", "")).casefold().startswith("checking"):
             status, reason = "blocked", "qBittorrent is already moving or checking this torrent"
-        elif free_space is not None and size > free_space:
+        extraction_files = []
+        if mapping and archive_count:
+            save_path = Path(torrent["save_path"])
+            direct_records = [
+                (save_path / record["name"], int(record.get("size", 0)))
+                for record in torrent_files
+                if int(record.get("priority", 1)) > 0 and Path(record.get("name", "")).suffix.casefold() in VIDEO_EXTENSIONS
+            ]
+            for record in mapping.get("files", []):
+                source = Path(record["path"])
+                candidates = [path for path, candidate_size in direct_records if candidate_size == int(record.get("size", 0))]
+                direct_match = source.exists() and any(path.exists() and sha256(path) == sha256(source) for path in candidates)
+                if not direct_match:
+                    extraction_files.append(record)
+        extraction_space = sum(int(record.get("size", 0)) for record in extraction_files)
+        required_space = size + extraction_space
+        if status == "ready" and free_space is not None and required_space > free_space:
             status, reason = "blocked", "Target pool does not have enough free space"
         item = mapping.get("item") if mapping else None
         managed_files = []
+        tracked_files = []
+        additional_files = []
+        target_item = None
         if item and mapping:
             target_item = self._target_item_path(item, target_pool, app)
             for record in mapping.get("files", []):
                 managed_files.append({**record, "targetPath": str(target_item / record["relativePath"])})
+            tracked_files, additional_files = self._move_inventory(torrent, torrent_files, mapping, target_pool, target_save, app)
         return MovePlan(
             torrent_hash=torrent_hash,
             torrent_name=torrent.get("name", ""),
@@ -428,6 +585,14 @@ class Stowarr:
             reason=reason,
             content_mode=content_mode,
             archive_files=archive_count,
+            current_item_path=item.get("path") if item else None,
+            target_item_path=str(target_item) if target_item else None,
+            tracked_files=tracked_files,
+            additional_files=additional_files,
+            current_content_root=str(self._torrent_content_root(torrent, torrent_files) or "") or None,
+            extraction_required=bool(extraction_files),
+            extraction_space=extraction_space,
+            extraction_files=extraction_files,
         )
 
     def _wait_for_torrent(self, torrent_hash: str, predicate, timeout: int = 1800) -> dict:
@@ -441,16 +606,140 @@ class Stowarr:
             time.sleep(2)
         raise RuntimeError(f"qBittorrent operation exceeded {timeout} seconds")
 
-    def move(self, torrent_hash: str, target_pool_name: str) -> dict:
+    @staticmethod
+    def _remove_empty_tree(root: Path | None) -> None:
+        if not root or not root.exists() or not root.is_dir():
+            return
+        for directory in sorted((path for path in root.rglob("*") if path.is_dir()), key=lambda path: len(path.parts), reverse=True):
+            if not any(directory.iterdir()):
+                directory.rmdir()
+        if root.exists() and not any(root.iterdir()):
+            root.rmdir()
+
+    @staticmethod
+    def _copy_verified(source: Path, target: Path, expected_hash: str) -> None:
+        if not source.exists() or sha256(source) != expected_hash:
+            raise RuntimeError(f"Additional source changed or disappeared: {source}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if sha256(target) != expected_hash:
+                raise RuntimeError(f"Additional file target conflict: {target}")
+            return
+        temporary = target.with_name(f".{target.name}.stowarr-copy")
+        temporary.unlink(missing_ok=True)
+        shutil.copy2(source, temporary)
+        if sha256(temporary) != expected_hash:
+            temporary.unlink(missing_ok=True)
+            raise RuntimeError(f"Additional file copy verification failed: {source}")
+        os.replace(temporary, target)
+
+    def _extract_managed_media(self, torrent_hash: str, plan: MovePlan) -> list[dict]:
+        """Regenerate archive-derived *Arr files on the destination pool."""
+        torrent = self.qbit.torrent(torrent_hash)
+        if not torrent:
+            raise RuntimeError("Torrent disappeared before archive extraction")
+        records = self.qbit.files(torrent_hash)
+        save_path = Path(torrent["save_path"])
+        paths = [
+            save_path / record["name"] for record in records
+            if int(record.get("priority", 1)) > 0 and is_archive(Path(record["name"]))
+        ]
+        entries = select_archive_entries(paths)
+        target_item = Path(plan.target_item_path or "")
+        if not target_item.is_absolute():
+            raise RuntimeError("Archive extraction has no valid destination library folder")
+        staging = target_item.parent / f".stowarr-extract-{torrent_hash.casefold()}-{secrets.token_hex(4)}"
+        extracted: list[Path] = []
+        published: list[dict] = []
+        try:
+            declared_members = []
+            for entry in entries:
+                declared_members.extend(self.archive_extractor.members(entry))
+            if len(declared_members) > 100_000:
+                raise RuntimeError("Archive extraction is blocked because the manifest contains more than 100,000 files")
+            declared_size = sum(member.size for member in declared_members)
+            free_budget = max(0, int(plan.free_space or 0) - int(plan.torrent_size)) if plan.free_space is not None else None
+            expected_budget = max(int(plan.extraction_space) * 4, int(plan.extraction_space) + 2 * 1024**3)
+            if declared_size > expected_budget or (free_budget is not None and declared_size > free_budget):
+                raise RuntimeError(
+                    f"Archive extraction is blocked because its declared size ({declared_size} bytes) exceeds the safe budget"
+                )
+            for index, entry in enumerate(entries):
+                output = staging / f"archive-{index:04d}"
+                extracted.extend(item.path for item in self.archive_extractor.extract(entry, output))
+            videos = [path for path in extracted if path.suffix.casefold() in VIDEO_EXTENSIONS]
+            if not videos:
+                raise RuntimeError("Archive extraction produced no supported media files")
+            used: set[Path] = set()
+            extraction_ids = {record.get("id") for record in (plan.extraction_files or [])}
+            for record in plan.managed_files:
+                if record.get("id") not in extraction_ids:
+                    continue
+                source = Path(record["path"])
+                target = Path(record["targetPath"])
+                expected_size = int(record.get("size", 0))
+                if not source.exists():
+                    raise RuntimeError(f"Cannot verify regenerated media because the current *Arr file is missing: {source}")
+                expected_hash = sha256(source)
+                candidates = []
+                for candidate in videos:
+                    if candidate in used or candidate.stat().st_size != expected_size:
+                        continue
+                    if sha256(candidate) == expected_hash:
+                        candidates.append(candidate)
+                if len(candidates) != 1:
+                    raise RuntimeError(
+                        f"Archive extraction did not produce exactly one verified match for {source}; found {len(candidates)}"
+                    )
+                candidate = candidates[0]
+                used.add(candidate)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                existed_before = target.exists()
+                if existed_before:
+                    if sha256(target) != expected_hash:
+                        raise RuntimeError(f"Existing archive-derived target differs from verified media: {target}")
+                else:
+                    temporary = target.with_name(f".{target.name}.stowarr-extract")
+                    temporary.unlink(missing_ok=True)
+                    shutil.copy2(candidate, temporary)
+                    if sha256(temporary) != expected_hash:
+                        temporary.unlink(missing_ok=True)
+                        raise RuntimeError(f"Published archive-derived media failed verification: {target}")
+                    os.replace(temporary, target)
+                published.append({
+                    "source": str(source), "target": str(target), "sha256": expected_hash,
+                    "created": not existed_before,
+                })
+            return published
+        except Exception:
+            for item in published:
+                if item.get("created"):
+                    target = Path(item["target"])
+                    if target.exists() and sha256(target) == item["sha256"]:
+                        target.unlink()
+            raise
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def move(self, torrent_hash: str, target_pool_name: str, additional_actions: dict[str, str] | None = None) -> dict:
         if self.store.active(torrent_hash, kind="move"):
             raise RuntimeError("Another Move operation is already active for this torrent")
         plan = self.move_plan(torrent_hash, target_pool_name)
-        operation_id = self.store.record(torrent_hash, plan.app, "MOVE_PLANNED", plan.json(), kind="move")
+        actions = additional_actions or {}
+        expected_actions = {item["source"] for item in (plan.additional_files or [])}
+        if set(actions) != expected_actions or any(action not in {"move", "delete"} for action in actions.values()):
+            raise ValueError("Every additional file must have an explicit move or delete action")
+        conflicts = {item["source"] for item in (plan.additional_files or []) if item["status"] == "target-conflict"}
+        if any(actions[source] == "move" for source in conflicts):
+            raise ValueError("Conflicting additional files must be deleted or resolved manually")
+        detail = {**plan.json(), "additional_actions": dict(sorted(actions.items()))}
+        operation_id = self.store.record(torrent_hash, plan.app, "MOVE_PLANNED", detail, kind="move")
         if plan.status != "ready" or not self.config.apply:
             state = "BLOCKED" if plan.status != "ready" else "DRY_RUN"
-            self.store.update(operation_id, state, plan.json())
+            self.store.update(operation_id, state, detail)
             return {"operation_id": operation_id, "state": state, "plan": plan.json()}
 
+        extracted: list[dict] = []
         self.qbit.pause(torrent_hash)
         self.store.update(operation_id, "MOVE_PAUSED", plan.json())
         try:
@@ -470,13 +759,55 @@ class Stowarr:
                 and float(torrent.get("progress", 0)) >= 1,
             )
             self.store.update(operation_id, "MOVE_QBIT_COMPLETE", plan.json())
-            result = self.reconcile(torrent_hash)
+            if plan.extraction_required:
+                self.store.update(operation_id, "MOVE_EXTRACTING", detail)
+                extracted = self._extract_managed_media(torrent_hash, plan)
+                self.store.update(operation_id, "MOVE_EXTRACTED", {**detail, "extracted_files": extracted})
+            download_records = [item for item in (plan.additional_files or []) if item["scope"] == "download"]
+            for item in download_records:
+                source, target = Path(item["source"]), Path(item["target"])
+                expected_hash = item.get("sha256") or ""
+                if actions[item["source"]] == "move":
+                    if source.exists():
+                        self._copy_verified(source, target, expected_hash)
+                    elif not target.exists() or sha256(target) != expected_hash:
+                        raise RuntimeError(f"Additional download file was not preserved by qBittorrent: {source}")
+            self.store.update(operation_id, "MOVE_ADDITIONAL_VERIFIED", detail)
+            post_plan = self.plan(torrent_hash)
+            selected_auxiliary = {
+                item.source
+                for item in (post_plan.auxiliary_files or [])
+                if item.origin == "qbittorrent" or actions.get(item.source) == "move"
+            }
+            result = self.reconcile(torrent_hash, selected_auxiliary)
             if result["state"] != "COMPLETE":
                 raise RuntimeError(f'Reconciliation did not complete after qBittorrent move: {result["state"]}')
+            for item in plan.additional_files or []:
+                source, target = Path(item["source"]), Path(item["target"])
+                if actions[item["source"]] == "delete":
+                    source.unlink(missing_ok=True)
+                    if item["scope"] == "download":
+                        target.unlink(missing_ok=True)
+                elif item["scope"] == "download" and source.exists():
+                    if not target.exists() or sha256(source) != sha256(target):
+                        raise RuntimeError(f"Final additional file verification failed: {source}")
+                    source.unlink()
+            self._remove_empty_tree(Path(plan.current_item_path) if plan.current_item_path else None)
+            content_root = Path(plan.current_content_root) if plan.current_content_root else None
+            if content_root and content_root != Path(plan.current_save_path):
+                self._remove_empty_tree(content_root)
+            old_item = Path(plan.current_item_path) if plan.current_item_path else None
+            if old_item and old_item.exists():
+                raise RuntimeError(f"Old library folder still contains unclassified files: {old_item}")
             self.qbit.resume(torrent_hash)
-            self.store.update(operation_id, "COMPLETE", {**plan.json(), "reconcile_operation_id": result["operation_id"]})
+            self.store.update(operation_id, "COMPLETE", {**detail, "extracted_files": extracted, "reconcile_operation_id": result["operation_id"]})
             return {"operation_id": operation_id, "state": "COMPLETE", "plan": plan.json(), "reconcile": result}
         except Exception as error:
+            for item in extracted:
+                if item.get("created"):
+                    target = Path(item["target"])
+                    if target.exists() and sha256(target) == item["sha256"]:
+                        target.unlink()
             self.store.update(operation_id, "FAILED", {**plan.json(), "error": str(error)})
             raise
 
@@ -565,6 +896,8 @@ class Stowarr:
             if not candidates and has_archives:
                 if source == target and source.exists():
                     state = "already-on-target"
+                elif source.exists() and target.exists() and source.stat().st_size == target.stat().st_size and sha256(source) == sha256(target):
+                    state = "verified-derived"
                 elif not source.exists():
                     state = "missing-derived-media"
                 else:
@@ -943,7 +1276,7 @@ class Stowarr:
             for pair in plan.pairs:
                 source = Path(pair.source_library)
                 target = Path(pair.target_library)
-                if pair.status in {"linked", "already-on-target"}:
+                if pair.status in {"linked", "already-on-target", "verified-derived"}:
                     continue
                 if pair.strategy == "verified-copy":
                     if not source.exists() or source.stat().st_size != pair.size:
@@ -1028,6 +1361,16 @@ class Stowarr:
             ]
             self.arr[plan.app].sync_pool(item, str(root), tag, pool_tags)
             self.store.update(operation_id, "ARR_UPDATED", plan.json())
+            self.arr[plan.app].rescan(int(item["id"]))
+            self.store.update(operation_id, "ARR_RESCANNED", plan.json())
+            refreshed = self.arr[plan.app].download_mapping(torrent_hash)
+            refreshed_files = {record.get("id"): Path(record.get("path", "")) for record in (refreshed or {}).get("files", [])}
+            for record in plan.managed_files or []:
+                expected = Path(plan.target_item_path or "") / record["relativePath"]
+                if refreshed_files.get(record.get("id")) != expected:
+                    raise RuntimeError(
+                        f"{plan.app.capitalize()} did not confirm the managed file on its new path: {expected}"
+                    )
             for pair in plan.pairs:
                 source, target = Path(pair.source_library), Path(pair.target_library)
                 if source != target and source.exists():

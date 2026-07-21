@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 
 ARCHIVE_SUFFIXES = {".rar", ".zip", ".7z", ".tar", ".tgz", ".gz", ".bz2", ".tbz2", ".iso"}
 VOLUME_SUFFIX = re.compile(r"(?:\.r\d{2,3}|\.\d{3})$", re.IGNORECASE)
+RAR_PART = re.compile(r"\.part(\d+)\.rar$", re.IGNORECASE)
 
 
 def is_archive_path(path: Path) -> bool:
@@ -27,6 +28,23 @@ def select_archive_entry(paths: list[Path]) -> Path:
     return preferred[0]
 
 
+def select_archive_entries(paths: list[Path]) -> list[Path]:
+    """Return one extractor entry for every independent archive set."""
+    entries: list[Path] = []
+    for path in sorted(paths, key=lambda item: item.as_posix().casefold()):
+        suffix = path.suffix.casefold()
+        part = RAR_PART.search(path.name)
+        if suffix == ".rar" and (not part or int(part.group(1)) == 1):
+            entries.append(path)
+        elif suffix in {".zip", ".7z", ".tar", ".tgz", ".gz", ".bz2", ".tbz2", ".iso"}:
+            entries.append(path)
+        elif suffix == ".001":
+            entries.append(path)
+    if not entries:
+        raise ValueError("No supported archive entry file was found")
+    return entries
+
+
 def safe_member_path(value: str) -> PurePosixPath:
     normalized = value.replace("\\", "/")
     path = PurePosixPath(normalized)
@@ -39,6 +57,12 @@ def safe_member_path(value: str) -> PurePosixPath:
 class ExtractedFile:
     relative_path: str
     path: Path
+    size: int
+
+
+@dataclass(frozen=True)
+class ArchiveMember:
+    relative_path: str
     size: int
 
 
@@ -72,6 +96,27 @@ class ArchiveExtractor:
 
     def test(self, entry: Path) -> None:
         self._run(["t", "-bso0", "-bsp0", "-bse1", "--", str(entry)])
+
+    def members(self, entry: Path) -> list[ArchiveMember]:
+        result = self._run(["l", "-slt", "-ba", "-bsp0", "-bse1", "--", str(entry)])
+        members: list[ArchiveMember] = []
+        current: dict[str, str] = {}
+        for line in (*result.stdout.splitlines(), ""):
+            if not line.strip():
+                path = current.get("Path")
+                size = current.get("Size")
+                attributes = current.get("Attributes", "")
+                if path and size is not None and not attributes.startswith("D"):
+                    safe_member_path(path)
+                    members.append(ArchiveMember(path.replace("\\", "/"), int(size)))
+                current = {}
+                continue
+            if " = " in line:
+                key, value = line.split(" = ", 1)
+                current[key] = value
+        if not members:
+            raise RuntimeError("Archive manifest contains no regular files")
+        return members
 
     def extract(self, entry: Path, destination: Path) -> list[ExtractedFile]:
         if destination.exists() and any(destination.iterdir()):

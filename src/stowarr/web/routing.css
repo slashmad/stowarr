@@ -48,7 +48,7 @@
   align-items: end;
   display: grid;
   gap: 14px;
-  grid-template-columns: minmax(320px, 2fr) minmax(170px, 1fr) auto;
+  grid-template-columns: minmax(320px, 2fr) minmax(220px, 1fr);
 }
 
 .move-selection {
@@ -107,20 +107,27 @@
 }
 
 .pool-board {
+  align-items: stretch;
   background: #1a1c1f;
   display: grid;
   gap: 12px;
   grid-auto-columns: minmax(310px, 1fr);
   grid-auto-flow: column;
-  max-height: 65vh;
-  overflow: auto;
+  height: min(68vh, 760px);
+  min-height: 420px;
+  overflow-x: auto;
+  overflow-y: hidden;
   padding: 14px;
 }
 
 .pool-column {
   background: #202225;
   border: 1px solid #3b3e43;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
   min-width: 310px;
+  overflow: hidden;
 }
 
 .pool-column > header {
@@ -130,8 +137,8 @@
   display: flex;
   justify-content: space-between;
   padding: 12px 14px;
-  position: sticky;
-  top: 0;
+  flex: 0 0 auto;
+  position: relative;
   z-index: 2;
 }
 
@@ -148,7 +155,12 @@
 }
 
 .pool-column-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 8px;
+  scrollbar-gutter: stable;
 }
 
 .path-group {
@@ -616,6 +628,10 @@
   display: block;
 }
 
+.move-inputs label {
+  margin: 0;
+}
+
 .move-inputs label span {
   color: #bbb;
   font-size: 13px;
@@ -640,13 +656,83 @@
 }
 
 .move-inputs .primary {
+  align-self: end;
+  height: 42px;
   min-height: 42px;
+  margin: 0;
 }
 
 .sync-summary {
   display: flex;
   gap: 24px;
   padding: 0 20px;
+}
+
+.move-manifest > summary {
+  align-items: center;
+  background: #202225;
+  border-bottom: 1px solid #3b3e43;
+  color: #e7e7e7;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  padding: 14px 20px;
+}
+
+.move-manifest > summary span,
+.managed-section p,
+.move-extras-head p,
+.move-no-extras {
+  color: #9a9da2;
+  font-size: 12px;
+}
+
+.managed-section {
+  border-bottom: 1px solid #3b3e43;
+  border-top: 1px solid #3b3e43;
+  padding: 14px 20px;
+}
+
+.managed-section h3,
+.move-extras-head h3 {
+  font-size: 15px;
+  font-weight: 500;
+  margin: 0 0 4px;
+}
+
+.managed-section p,
+.move-extras-head p {
+  margin: 0;
+}
+
+.move-extras {
+  border-top: 1px solid #3b3e43;
+}
+
+.move-extras-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  padding: 14px 20px;
+}
+
+.move-extras-head > div:last-child {
+  display: flex;
+  gap: 8px;
+}
+
+.move-extra-action {
+  background: #1b1d1f;
+  border: 1px solid #555a60;
+  border-radius: 3px;
+  color: #fff;
+  min-width: 180px;
+  padding: 8px 10px;
+}
+
+.move-no-extras {
+  border-top: 1px solid #3b3e43;
+  padding: 14px 20px;
 }
 
 .sync-summary:not(:empty) {
