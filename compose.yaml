@@ -7,7 +7,7 @@ services:
     environment:
       TZ: Europe/Stockholm
       STOWARR_CONFIG: /config/config.json
-      STOWARR_APPLY: "false"
+      STOWARR_APPLY: ${STOWARR_APPLY:-false}
       STOWARR_API_ONLY: "true"
       STOWARR_PORT: "8788"
       STOWARR_API_TOKEN: ${STOWARR_API_TOKEN:-stowarr-local-api}
@@ -19,8 +19,8 @@ services:
     volumes:
       - ./config:/config:ro
       - stowarr-state:/state
-      - ${POOL1_HOST_PATH:-./data/pool1}:${POOL1_CONTAINER_PATH:-/data/pool1}:ro
-      - ${POOL2_HOST_PATH:-./data/pool2}:${POOL2_CONTAINER_PATH:-/data/pool2}:ro
+      - ${POOL1_HOST_PATH:-./data/pool1}:${POOL1_CONTAINER_PATH:-/data/pool1}:${STOWARR_MEDIA_MOUNT_MODE:-ro}
+      - ${POOL2_HOST_PATH:-./data/pool2}:${POOL2_CONTAINER_PATH:-/data/pool2}:${STOWARR_MEDIA_MOUNT_MODE:-ro}
     expose:
       - "8788"
     ports:
