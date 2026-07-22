@@ -1112,6 +1112,10 @@ class Stowarr:
             raise RuntimeError(
                 f"The verified {plan.app.capitalize()} mapping changed before the Move transaction started"
             )
+        tracked_paths = {record["path"] for record in (plan.tracked_files or [])}
+        relocated_library_sources = {
+            record["path"] for record in plan.managed_files if record["path"] in tracked_paths
+        }
 
         extracted: list[dict] = []
         temporary_category = f"{plan.app}-stowarr-moving-{torrent_hash[:12].casefold()}"
@@ -1202,7 +1206,8 @@ class Stowarr:
             }
             result = self.reconcile(torrent_hash, selected_auxiliary, operation_id=operation_id,
                                     verified_derived_paths=verified_derived, progress_callback=report,
-                                    mapping_hint=mapping_hint, app_hint=plan.app)
+                                    mapping_hint=mapping_hint, app_hint=plan.app,
+                                    relocated_library_sources=relocated_library_sources)
             if result["state"] != "COMPLETE":
                 raise RuntimeError(f'Reconciliation did not complete after qBittorrent move: {result["state"]}')
             report("MOVE_DERIVATIVE_CLEANUP", 0, message="Checking for verified Unpackerr derivatives")
@@ -1753,6 +1758,7 @@ class Stowarr:
         progress_callback=None,
         mapping_hint: dict | None = None,
         app_hint: str | None = None,
+        relocated_library_sources: set[str] | None = None,
     ) -> dict:
         plan = self.plan(
             torrent_hash,
@@ -1816,12 +1822,17 @@ class Stowarr:
                 if pair.strategy == "archive-reextract":
                     raise RuntimeError("Packed media must complete Stowarr's verified extraction workflow first")
                 torrent_file = Path(pair.torrent_file)
-                if not source.exists() or source.stat().st_size != torrent_file.stat().st_size:
+                if not torrent_file.exists() or torrent_file.stat().st_size != pair.size:
+                    raise RuntimeError(f"Relocated qBittorrent media changed or missing: {torrent_file}")
+                if source.exists():
+                    if source.stat().st_size != torrent_file.stat().st_size:
+                        raise RuntimeError(f"Source changed size: {source}")
+                    if sha256(source, progress=lambda done, total: pair_progress(done, total, "current library media")) != sha256(
+                        torrent_file, progress=lambda done, total: pair_progress(done, total, "qBittorrent media")
+                    ):
+                        raise RuntimeError(f"Hash mismatch: {source} != {torrent_file}")
+                elif str(source) not in (relocated_library_sources or set()):
                     raise RuntimeError(f"Source changed or missing: {source}")
-                if sha256(source, progress=lambda done, total: pair_progress(done, total, "current library media")) != sha256(
-                    torrent_file, progress=lambda done, total: pair_progress(done, total, "qBittorrent media")
-                ):
-                    raise RuntimeError(f"Hash mismatch: {source} != {torrent_file}")
                 if target.exists():
                     target_stat, torrent_stat = target.stat(), torrent_file.stat()
                     same_file = (target_stat.st_dev, target_stat.st_ino) == (torrent_stat.st_dev, torrent_stat.st_ino)
