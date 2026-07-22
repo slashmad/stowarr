@@ -269,6 +269,37 @@ class EngineTest(unittest.TestCase):
             self.assertEqual({item["scope"] for item in additional}, {"download", "library"})
             self.assertTrue(all(item["sha256"] for item in additional))
 
+    def test_library_seeded_inventory_does_not_duplicate_download_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_pool = root / "p3"
+            target_pool_path = root / "p1"
+            movie = source_pool / "movies" / "Movie (2020)"
+            movie.mkdir(parents=True)
+            managed = movie / "Movie.mkv"
+            subtitle = movie / "Movie.sv.srt"
+            managed.write_bytes(b"video")
+            subtitle.write_bytes(b"subtitle")
+            target_pool = Pool(
+                "p1", target_pool_path, (target_pool_path / "download",),
+                target_pool_path / "movies", target_pool_path / "series",
+                "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+            )
+            torrent = {"save_path": str(source_pool / "movies"), "content_path": str(movie)}
+            torrent_files = [{"name": "Movie (2020)/Movie.mkv", "size": 5, "priority": 1}]
+            mapping = {"item": {"path": str(movie)}, "files": [{"path": str(managed)}]}
+            manager = Stowarr.__new__(Stowarr)
+
+            tracked, additional = manager._move_inventory(
+                torrent, torrent_files, mapping, target_pool, target_pool.download_roots[0], "radarr"
+            )
+
+            self.assertEqual([item["path"] for item in tracked], [str(managed)])
+            self.assertEqual(len(additional), 1)
+            self.assertEqual(additional[0]["source"], str(subtitle))
+            self.assertEqual(additional[0]["scope"], "library")
+            self.assertEqual(additional[0]["target"], str(target_pool.radarr_root / movie.name / subtitle.name))
+
     def test_verified_additional_copy_rejects_changed_source(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

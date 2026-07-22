@@ -516,19 +516,24 @@ class Stowarr:
         ]
         additional: list[dict] = []
         content_root = self._torrent_content_root(torrent, torrent_files)
-        if content_root and content_root.exists() and content_root.is_dir():
+        item = mapping.get("item")
+        current_item = Path(item["path"]) if item else None
+        content_is_library = bool(
+            content_root and current_item
+            and (content_root == current_item or content_root.is_relative_to(current_item))
+        )
+        if content_root and not content_is_library and content_root.exists() and content_root.is_dir():
             for source in content_root.rglob("*"):
                 if source.is_file() and source not in tracked_paths and not source.name.startswith(".!qB"):
                     target = target_save / source.relative_to(save_path)
                     status = "target-conflict" if target.exists() and sha256(source) != sha256(target) else "available"
                     additional.append(self._move_file_record(source, target, "download", status))
-        item = mapping.get("item")
         if item:
-            current_item = Path(item["path"])
             target_item = self._target_item_path(item, target_pool, app)
             managed = {Path(record["path"]) for record in mapping.get("files", [])}
             if current_item.exists() and current_item != target_item:
-                for source in current_item.rglob("*"):
+                scan_root = content_root if content_is_library else current_item
+                for source in scan_root.rglob("*"):
                     if not source.is_file() or source in managed:
                         continue
                     target = target_item / source.relative_to(current_item)
