@@ -107,6 +107,54 @@ class ArrClientTest(unittest.TestCase):
         client.http = SonarrHttp()
         self.assertFalse(client.download_mapping("hash")["mappingComplete"])
 
+    def test_radarr_library_mapping_requires_an_exact_managed_file_path(self):
+        class RadarrHttp:
+            def request(self, method, path, **kwargs):
+                if path == "/api/v3/movie":
+                    return [
+                        {
+                            "id": 42,
+                            "title": "Movie",
+                            "path": "/movies/Movie (2020)",
+                            "movieFile": {
+                                "id": 420,
+                                "path": "/movies/Movie (2020)/Movie.mkv",
+                                "size": 100,
+                            },
+                        }
+                    ]
+                raise AssertionError(path)
+
+        client = ArrClient(Service("http://unused", api_key="unused"), "radarr")
+        client.http = RadarrHttp()
+
+        mapping = client.library_mapping(["/movies/Movie (2020)/Movie.mkv"])
+        self.assertEqual(mapping["item"]["id"], 42)
+        self.assertEqual(mapping["mappingSource"], "exact-library-path")
+        self.assertIsNone(client.library_mapping(["/movies/Movie (2020)/Other.mkv"]))
+
+    def test_sonarr_library_mapping_requires_every_selected_video_path(self):
+        class SonarrHttp:
+            def request(self, method, path, **kwargs):
+                if path == "/api/v3/series":
+                    return [{"id": 7, "title": "Series", "path": "/series/Series"}]
+                if path == "/api/v3/episodefile":
+                    return [{"id": 700, "path": "/series/Series/Season 01/S01E01.mkv", "size": 100}]
+                if path == "/api/v3/episode":
+                    return [{"id": 70, "episodeFileId": 700}]
+                raise AssertionError(path)
+
+        client = ArrClient(Service("http://unused", api_key="unused"), "sonarr")
+        client.http = SonarrHttp()
+
+        mapping = client.library_mapping(["/series/Series/Season 01/S01E01.mkv"])
+        self.assertTrue(mapping["mappingComplete"])
+        self.assertEqual(mapping["files"][0]["episodeIds"], [70])
+        self.assertIsNone(client.library_mapping([
+            "/series/Series/Season 01/S01E01.mkv",
+            "/series/Series/Season 01/S01E02.mkv",
+        ]))
+
 
 class QBittorrentClientTest(unittest.TestCase):
     @patch("stowarr.clients.JsonClient")

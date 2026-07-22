@@ -683,8 +683,18 @@ class Stowarr:
         app = category_match[1] if category_match else library_app or (
             "sonarr" if "sonarr" in torrent.get("category", "").casefold() else "radarr"
         )
-        mapping = self.arr[app].download_mapping(torrent_hash)
         torrent_files = self.qbit.files(torrent_hash)
+        mapping = self.arr[app].download_mapping(torrent_hash)
+        selected_media_paths = [
+            str(Path(str(torrent.get("save_path") or "")) / str(record.get("name") or ""))
+            for record in torrent_files
+            if int(record.get("priority", 1)) > 0
+            and Path(str(record.get("name") or "")).suffix.casefold() in VIDEO_EXTENSIONS
+        ]
+        if not mapping and library_app:
+            resolver = getattr(self.arr[app], "library_mapping", None)
+            if resolver:
+                mapping = resolver(selected_media_paths)
         archive_count = sum(is_archive(Path(record.get("name", ""))) for record in torrent_files if int(record.get("priority", 1)) > 0)
         video_count = sum(Path(record.get("name", "")).suffix.casefold() in VIDEO_EXTENSIONS for record in torrent_files if int(record.get("priority", 1)) > 0)
         content_mode = "mixed" if archive_count and video_count else "archive" if archive_count else "direct" if video_count else "unknown"
@@ -704,18 +714,20 @@ class Stowarr:
         elif not mapping:
             if library_app:
                 status, reason = "blocked", (
-                    f"This torrent is seeded directly from the {library_app.capitalize()} library, "
-                    "but its info hash has no unique *Arr history association"
+                    f"{library_app.capitalize()} does not identify any current managed media file "
+                    "at this torrent's exact qBittorrent content path"
                 )
                 error_code = "LIBRARY_SEEDED_MAPPING_REQUIRED"
                 error_details = {
                     "torrent_hash": torrent_hash,
                     "torrent_name": torrent.get("name", ""),
                     "save_path": torrent.get("save_path", ""),
+                    "media_paths": selected_media_paths,
+                    "application": library_app,
                     "action": (
-                        f"Keep the torrent in place or manually import/associate its media in "
-                        f"{library_app.capitalize()}. Then recheck the Move plan. Stowarr will not "
-                        "infer ownership from a similar title or folder name."
+                        f"Open the title in {library_app.capitalize()} and verify that its current media "
+                        "file is one of the qBittorrent paths shown here. If it is not, import the intended "
+                        f"torrent file in {library_app.capitalize()}. Then rebuild this Move plan."
                     ),
                 }
             else:
