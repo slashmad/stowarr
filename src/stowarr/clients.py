@@ -109,6 +109,76 @@ class ArrClient:
             "mappingComplete": bool(episode_ids and selected_episodes and episode_file_ids and files),
         }
 
+    def library_mapping(self, media_paths: list[str]) -> dict | None:
+        """Resolve torrents seeded from an *Arr library by exact managed file paths."""
+        wanted = {str(path).rstrip("/") for path in media_paths if path}
+        if not wanted:
+            return None
+        if self.kind == "radarr":
+            matches = []
+            for item in self.all_items():
+                movie_file = item.get("movieFile") or {}
+                path = movie_file.get("path") or (
+                    f'{item.get("path", "").rstrip("/")}/{movie_file.get("relativePath", "")}'
+                    if movie_file.get("relativePath") else ""
+                )
+                if path.rstrip("/") not in wanted:
+                    continue
+                matches.append({
+                    "app": self.kind,
+                    "item": item,
+                    "history": [],
+                    "episodes": [],
+                    "files": [{
+                        "id": movie_file.get("id"),
+                        "path": path,
+                        "relativePath": movie_file.get("relativePath") or path.rsplit("/", 1)[-1],
+                        "size": int(movie_file.get("size", 0)),
+                        "episodeIds": [],
+                    }],
+                    "mappingSource": "exact-library-path",
+                })
+            return matches[0] if len(matches) == 1 else None
+
+        series_matches = [
+            item for item in self.all_items()
+            if any(path == str(item.get("path", "")).rstrip("/") or path.startswith(str(item.get("path", "")).rstrip("/") + "/") for path in wanted)
+        ]
+        if len(series_matches) != 1:
+            return None
+        item = series_matches[0]
+        episode_files = self.http.request("GET", "/api/v3/episodefile", query={"seriesId": item["id"]})
+        selected_files = [record for record in episode_files if str(record.get("path", "")).rstrip("/") in wanted]
+        selected_paths = {str(record.get("path", "")).rstrip("/") for record in selected_files}
+        if not selected_files or selected_paths != wanted:
+            return None
+        episodes = self.http.request("GET", "/api/v3/episode", query={"seriesId": item["id"]})
+        file_episode_ids: dict[int, list[int]] = {}
+        selected_file_ids = {int(record["id"]) for record in selected_files if record.get("id")}
+        selected_episodes = []
+        for episode in episodes:
+            file_id = int(episode.get("episodeFileId") or 0)
+            if file_id not in selected_file_ids:
+                continue
+            selected_episodes.append(episode)
+            file_episode_ids.setdefault(file_id, []).append(int(episode["id"]))
+        files = [{
+            "id": record.get("id"),
+            "path": record.get("path"),
+            "relativePath": record.get("relativePath") or str(record.get("path", "")).removeprefix(item["path"].rstrip("/") + "/"),
+            "size": int(record.get("size", 0)),
+            "episodeIds": file_episode_ids.get(int(record.get("id", 0)), []),
+        } for record in selected_files]
+        return {
+            "app": self.kind,
+            "item": item,
+            "history": [],
+            "episodes": selected_episodes,
+            "files": files,
+            "mappingComplete": bool(files and selected_episodes and all(record["episodeIds"] for record in files)),
+            "mappingSource": "exact-library-path",
+        }
+
     def all_items(self) -> list[dict]:
         endpoint = "movie" if self.kind == "radarr" else "series"
         return self.http.request("GET", f"/api/v3/{endpoint}")
