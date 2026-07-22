@@ -4,6 +4,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends 7zip gosu \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml ./
+COPY README.md LICENSE NOTICE ./
 COPY src ./src
 RUN pip install --no-cache-dir .
 COPY docker/entrypoint.sh /usr/local/bin/stowarr-entrypoint

@@ -389,3 +389,11 @@ Stowarr is an early release. Keep dry-run enabled until plans have been reviewed
 against your own qBittorrent, Radarr, Sonarr, filesystem, and hardlink layout.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
+
+## License and attribution
+
+Copyright 2026 [slashmad](https://github.com/slashmad).
+
+Stowarr is licensed under the [Apache License 2.0](LICENSE). Redistributions
+must preserve the license, copyright, and attribution notices required by that
+license, including the attribution in [NOTICE](NOTICE).

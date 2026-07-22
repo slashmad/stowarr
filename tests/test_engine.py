@@ -11,6 +11,46 @@ from stowarr.engine import AuxiliaryFile, FilePair, MovePlan, Plan, Stowarr, is_
 
 
 class EngineTest(unittest.TestCase):
+    def test_move_plan_stops_before_file_discovery_when_torrent_is_already_on_target(self):
+        pool = Pool(
+            name="p1",
+            prefix=Path("/mnt/p1/media"),
+            download_roots=(Path("/mnt/p1/media/download"),),
+            radarr_root=Path("/mnt/p1/media/movies"),
+            sonarr_root=Path("/mnt/p1/media/series"),
+            radarr_category="radarr-pool1",
+            sonarr_category="sonarr-pool1",
+            radarr_tag="radarr-pool1",
+            sonarr_tag="sonarr-pool1",
+        )
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(
+            pools=(pool,),
+            pool_for_path=lambda path: pool,
+            pool_for_category=lambda category: None,
+        )
+
+        def unexpected_file_discovery(_torrent_hash):
+            raise AssertionError("same-pool recovery must not inspect or hash torrent files")
+
+        manager.qbit = SimpleNamespace(
+            torrent=lambda torrent_hash: {
+                "hash": torrent_hash,
+                "name": "Large.Release",
+                "category": "",
+                "save_path": "/mnt/p1/media/download",
+                "total_size": 64 * 1024**3,
+            },
+            files=unexpected_file_discovery,
+        )
+        manager.arr = {}
+
+        plan = manager.move_plan("hash", "p1")
+
+        self.assertEqual(plan.status, "blocked")
+        self.assertEqual(plan.error_code, "QBITTORRENT_ALREADY_ON_TARGET")
+        self.assertIn("Reconcile", plan.error_details["action"])
+
     def test_recheck_must_be_observed_before_completion(self):
         states = iter([
             {"state": "pausedUP", "progress": 1},

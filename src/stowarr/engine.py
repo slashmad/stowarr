@@ -688,6 +688,35 @@ class Stowarr:
         app = category_match[1] if category_match else library_app or (
             "sonarr" if "sonarr" in torrent.get("category", "").casefold() else "radarr"
         )
+        target_category = target_pool.radarr_category if app == "radarr" else target_pool.sonarr_category
+        if current_pool and current_pool.name == target_pool.name:
+            return MovePlan(
+                torrent_hash=torrent_hash,
+                torrent_name=torrent.get("name", ""),
+                app=app,
+                current_pool=current_pool.name,
+                target_pool=target_pool.name,
+                current_save_path=torrent.get("save_path", ""),
+                target_save_path=torrent.get("save_path", ""),
+                target_category=target_category,
+                item_id=None,
+                item_title=None,
+                managed_files=[],
+                torrent_size=int(torrent.get("total_size", 0)),
+                free_space=None,
+                status="blocked",
+                reason="qBittorrent data is already on the selected destination pool",
+                error_code="QBITTORRENT_ALREADY_ON_TARGET",
+                error_details={
+                    "torrent_hash": torrent_hash,
+                    "torrent_name": torrent.get("name", ""),
+                    "application": app,
+                    "action": (
+                        "Open Reconcile for this torrent. Stowarr can rebuild the Radarr/Sonarr library "
+                        "from the relocated qBittorrent data and verify the final route."
+                    ),
+                },
+            )
         torrent_files = self.qbit.files(torrent_hash)
         mapping = self.arr[app].download_mapping(torrent_hash)
         selected_media_paths = [
@@ -704,7 +733,6 @@ class Stowarr:
         video_count = sum(Path(record.get("name", "")).suffix.casefold() in VIDEO_EXTENSIONS for record in torrent_files if int(record.get("priority", 1)) > 0)
         content_mode = "mixed" if archive_count and video_count else "archive" if archive_count else "direct" if video_count else "unknown"
         release_identity = self._release_identity(torrent, torrent_files, mapping)
-        target_category = target_pool.radarr_category if app == "radarr" else target_pool.sonarr_category
         if not current_pool:
             return MovePlan(torrent_hash, torrent["name"], app, None, target_pool.name, torrent.get("save_path", ""), None, target_category, None, None, [], int(torrent.get("total_size", 0)), None, "blocked", "Current qBittorrent save path is outside configured pools")
         target_save = self._target_download_path(current_pool, target_pool, Path(torrent["save_path"]))
@@ -714,9 +742,7 @@ class Stowarr:
         status = "ready"
         error_code = None
         error_details = None
-        if current_pool.name == target_pool.name:
-            status, reason = "blocked", "Torrent is already on the selected pool"
-        elif not mapping:
+        if not mapping:
             if library_app:
                 status, reason = "blocked", (
                     f"{library_app.capitalize()} does not identify any current managed media file "
