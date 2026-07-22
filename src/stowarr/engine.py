@@ -1207,7 +1207,8 @@ class Stowarr:
             result = self.reconcile(torrent_hash, selected_auxiliary, operation_id=operation_id,
                                     verified_derived_paths=verified_derived, progress_callback=report,
                                     mapping_hint=mapping_hint, app_hint=plan.app,
-                                    relocated_library_sources=relocated_library_sources)
+                                    relocated_library_sources=relocated_library_sources,
+                                    prepared_plan=post_plan)
             if result["state"] != "COMPLETE":
                 raise RuntimeError(f'Reconciliation did not complete after qBittorrent move: {result["state"]}')
             report("MOVE_DERIVATIVE_CLEANUP", 0, message="Checking for verified Unpackerr derivatives")
@@ -1759,13 +1760,16 @@ class Stowarr:
         mapping_hint: dict | None = None,
         app_hint: str | None = None,
         relocated_library_sources: set[str] | None = None,
+        prepared_plan: Plan | None = None,
     ) -> dict:
-        plan = self.plan(
+        plan = prepared_plan or self.plan(
             torrent_hash,
             verified_derived_paths=verified_derived_paths,
             mapping_hint=mapping_hint,
             app_hint=app_hint,
         )
+        if plan.torrent_hash.casefold() != torrent_hash.casefold():
+            raise ValueError("Prepared reconciliation plan does not match the requested torrent")
         selected_auxiliary = auxiliary_sources or set()
         blocked_sidecars = {"target-conflict", "torrent-name-conflict"}
         allowed_auxiliary = {

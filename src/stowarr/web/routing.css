@@ -525,6 +525,16 @@
   max-width: 680px;
   padding: 0;
   width: calc(100% - 40px);
+  overflow-x: hidden;
+}
+
+.confirm-dialog .guide-head > div {
+  min-width: 0;
+}
+
+.confirm-dialog .guide-head h2,
+.confirm-dialog .guide-head p {
+  overflow-wrap: anywhere;
 }
 
 .confirm-dialog::backdrop {
@@ -691,6 +701,23 @@
   display: block;
   height: 100%;
   transition: width .25s ease;
+}
+
+.operation-steps li.indeterminate .operation-progress i {
+  animation: operation-progress-stripes .8s linear infinite;
+  background-color: #3b8edb;
+  background-image: repeating-linear-gradient(
+    125deg,
+    rgba(255, 255, 255, .24) 0,
+    rgba(255, 255, 255, .24) 10px,
+    transparent 10px,
+    transparent 20px
+  );
+}
+
+@keyframes operation-progress-stripes {
+  from { background-position: 0 0; }
+  to { background-position: 28px 0; }
 }
 
 .operation-steps li.complete .operation-progress i {
