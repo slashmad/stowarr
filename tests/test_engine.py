@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from stowarr.archive import ArchiveMember, ExtractedFile
 from stowarr.config import Pool
-from stowarr.engine import FilePair, MovePlan, Plan, Stowarr, is_archive, sha256, title_matches
+from stowarr.engine import AuxiliaryFile, FilePair, MovePlan, Plan, Stowarr, is_archive, sha256, title_matches
 
 
 class EngineTest(unittest.TestCase):
@@ -364,6 +364,9 @@ class EngineTest(unittest.TestCase):
             relocated.write_bytes(b"qBittorrent rechecked media")
             old_source = old_item / "Movie.mkv"
             target = target_item / "Movie.mkv"
+            old_sidecar = old_item / "Movie.sv.srt"
+            target_sidecar = target_item / "Movie.sv.srt"
+            old_sidecar.write_bytes(b"verified subtitle")
             record = {
                 "id": 7, "path": str(old_source), "relativePath": "Movie.mkv",
                 "size": relocated.stat().st_size, "episodeIds": [],
@@ -378,7 +381,12 @@ class EngineTest(unittest.TestCase):
                 "abc", "Movie.2020", "radarr", "p1", 42, "Movie",
                 str(old_item), str(target_item),
                 [FilePair(str(old_source), str(target), str(relocated), relocated.stat().st_size, "repairable")],
-                "ready", managed_files=[record],
+                "ready",
+                auxiliary_files=[AuxiliaryFile(
+                    str(old_sidecar), str(target_sidecar), old_sidecar.stat().st_size,
+                    "missing-target", "library", "copy", "subtitle",
+                )],
+                managed_files=[record],
             )
             pool = Pool(
                 "p1", root / "p1", (root / "p1" / "download",),
@@ -392,20 +400,22 @@ class EngineTest(unittest.TestCase):
                 rescan=lambda item_id: None,
             )
             manager = Stowarr.__new__(Stowarr)
-            manager.plan = lambda *args, **kwargs: plan
+            manager.plan = lambda *args, **kwargs: self.fail("The prepared Move plan must not be rebuilt")
             manager.arr = {"radarr": client}
             manager.config = SimpleNamespace(apply=True, pools=(pool,))
             manager.store = SimpleNamespace(update=lambda *args, **kwargs: None)
 
             result = manager.reconcile(
-                "abc", operation_id=9, mapping_hint=mapping, app_hint="radarr",
-                relocated_library_sources={str(old_source)},
+                "abc", {str(old_sidecar)}, operation_id=9, mapping_hint=mapping, app_hint="radarr",
+                relocated_library_sources={str(old_source)}, prepared_plan=plan,
             )
 
             self.assertEqual(result["state"], "COMPLETE")
             self.assertTrue(target.exists())
             self.assertEqual((target.stat().st_dev, target.stat().st_ino),
                              (relocated.stat().st_dev, relocated.stat().st_ino))
+            self.assertEqual(target_sidecar.read_bytes(), b"verified subtitle")
+            self.assertFalse(old_sidecar.exists())
 
     def test_verified_additional_copy_rejects_changed_source(self):
         with tempfile.TemporaryDirectory() as directory:
