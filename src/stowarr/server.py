@@ -138,6 +138,12 @@ def handler(manager: Stowarr):
                     self.send_json(409, {"error": str(error)})
             elif path == "/api/operations":
                 self.send_json(200, manager.store.recent())
+            elif path.startswith("/api/operations/") and path.endswith("/events"):
+                try:
+                    operation_id = int(path.split("/")[3])
+                    self.send_json(200, {"events": manager.store.operation_events(operation_id)})
+                except (KeyError, ValueError) as error:
+                    self.send_json(404, {"error": str(error)})
             elif not manager.connections_ready and path.startswith(("/api/plan/", "/api/move/", "/api/qbittorrent/", "/api/routing/", "/api/sync/")):
                 self.send_json(503, {"error": "Configure qBittorrent, Radarr, and Sonarr in Settings first"})
             elif path.startswith("/api/plan/"):
@@ -270,6 +276,37 @@ def handler(manager: Stowarr):
                     self.send_json(409, {"error": str(error)})
             else:
                 self.send_json(404, {"error": "not found"})
+
+        def do_DELETE(self):
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if not self.authorized():
+                manager.store.security_event("request-denied", "", self.client_identity(), {"method": "DELETE", "path": path})
+                self.send_json(401, {"error": "Authentication required"})
+                return
+            if not self.csrf_valid():
+                self.send_json(403, {"error": "Valid CSRF header required"})
+                return
+            if path != "/api/operations":
+                self.send_json(404, {"error": "not found"})
+                return
+            try:
+                body = self.read_json()
+                clear_all = body.get("all") is True
+                operation_ids = body.get("operationIds", [])
+                if not clear_all and (
+                    not isinstance(operation_ids, list)
+                    or not all(isinstance(value, int) and not isinstance(value, bool) for value in operation_ids)
+                ):
+                    raise ValueError("operationIds must be a list of integer operation IDs")
+                deleted = manager.store.delete_operations(None if clear_all else operation_ids)
+                manager.store.security_event(
+                    "history-deleted", "admin", self.client_identity(),
+                    {"all": clear_all, "operation_ids": operation_ids if not clear_all else [], "deleted": deleted},
+                )
+                self.send_json(200, {"deleted": deleted})
+            except ValueError as error:
+                self.send_json(409, {"error": str(error)})
 
         def log_message(self, fmt, *args):
             request = str(args[0]) if args else ""
