@@ -10,6 +10,13 @@ from stowarr.engine import MovePlan, Plan, Stowarr, is_archive, sha256, title_ma
 
 
 class EngineTest(unittest.TestCase):
+    def test_move_requires_a_completed_upload_state_before_success(self):
+        self.assertTrue(Stowarr._is_seeding_state({"state": "stalledUP", "progress": 1}))
+        self.assertTrue(Stowarr._is_seeding_state({"state": "uploading", "progress": 1}))
+        self.assertFalse(Stowarr._is_seeding_state({"state": "pausedUP", "progress": 1}))
+        self.assertFalse(Stowarr._is_seeding_state({"state": "stoppedUP", "progress": 1}))
+        self.assertFalse(Stowarr._is_seeding_state({"state": "stalledUP", "progress": 0.9}))
+
     def test_title_match_rejects_unrelated_release(self):
         self.assertTrue(title_matches("The Shawshank Redemption", "The.Shawshank.Redemption.1994.1080p"))
         self.assertFalse(title_matches("The Final Cut", "The.Shawshank.Redemption.1994.1080p"))

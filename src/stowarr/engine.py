@@ -631,6 +631,35 @@ class Stowarr:
         raise RuntimeError(f"qBittorrent operation exceeded {timeout} seconds")
 
     @staticmethod
+    def _is_seeding_state(torrent: dict) -> bool:
+        state = str(torrent.get("state", "")).casefold()
+        return float(torrent.get("progress", 0)) >= 1 and (
+            state == "uploading" or state.endswith("up")
+        ) and not state.startswith(("paused", "stopped", "checking", "moving", "error"))
+
+    def _wait_for_visible_torrent_files(self, torrent_hash: str, timeout: int = 60) -> None:
+        deadline = time.monotonic() + timeout
+        missing: list[Path] = []
+        while time.monotonic() < deadline:
+            torrent = self.qbit.torrent(torrent_hash)
+            if not torrent:
+                raise RuntimeError("Torrent disappeared from qBittorrent after recheck")
+            missing = [
+                Path(torrent["save_path"]) / record["name"]
+                for record in self.qbit.files(torrent_hash)
+                if int(record.get("priority", 1)) > 0
+                and ".pad" not in Path(record.get("name", "")).parts
+                and not (Path(torrent["save_path"]) / record["name"]).is_file()
+            ]
+            if not missing:
+                return
+            time.sleep(2)
+        sample = ", ".join(str(path) for path in missing[:3])
+        raise RuntimeError(
+            f"qBittorrent completed recheck but {len(missing)} tracked file(s) are not visible inside Stowarr: {sample}"
+        )
+
+    @staticmethod
     def _remove_empty_tree(root: Path | None) -> None:
         if not root or not root.exists() or not root.is_dir():
             return
@@ -764,25 +793,29 @@ class Stowarr:
             return {"operation_id": operation_id, "state": state, "plan": plan.json()}
 
         extracted: list[dict] = []
+        temporary_category = f"{plan.app}-stowarr-moving-{torrent_hash[:12].casefold()}"
         self.qbit.pause(torrent_hash)
-        self.store.update(operation_id, "MOVE_PAUSED", plan.json())
+        self.store.update(operation_id, "MOVE_PAUSED", {**detail, "temporary_category": temporary_category})
         try:
+            self.qbit.ensure_category(temporary_category, plan.target_save_path or "")
+            self.qbit.set_category(torrent_hash, temporary_category)
+            self.store.update(operation_id, "MOVE_ISOLATED", {**detail, "temporary_category": temporary_category})
             self.qbit.set_location(torrent_hash, plan.target_save_path or "")
-            self.store.update(operation_id, "MOVE_RELOCATING", plan.json())
+            self.store.update(operation_id, "MOVE_RELOCATING", {**detail, "temporary_category": temporary_category})
             self._wait_for_torrent(
                 torrent_hash,
                 lambda torrent: Path(torrent.get("save_path", "")) == Path(plan.target_save_path or "")
                 and torrent.get("state") != "moving",
             )
-            self.qbit.set_category(torrent_hash, plan.target_category or "")
             self.qbit.recheck(torrent_hash)
-            self.store.update(operation_id, "MOVE_RECHECKING", plan.json())
+            self.store.update(operation_id, "MOVE_RECHECKING", {**detail, "temporary_category": temporary_category})
             self._wait_for_torrent(
                 torrent_hash,
                 lambda torrent: not str(torrent.get("state", "")).casefold().startswith("checking")
                 and float(torrent.get("progress", 0)) >= 1,
             )
-            self.store.update(operation_id, "MOVE_QBIT_COMPLETE", plan.json())
+            self._wait_for_visible_torrent_files(torrent_hash)
+            self.store.update(operation_id, "MOVE_QBIT_COMPLETE", {**detail, "temporary_category": temporary_category})
             if plan.extraction_required:
                 self.store.update(operation_id, "MOVE_EXTRACTING", detail)
                 extracted = self._extract_managed_media(torrent_hash, plan)
@@ -803,7 +836,7 @@ class Stowarr:
                 for item in (post_plan.auxiliary_files or [])
                 if item.origin == "qbittorrent" or actions.get(item.source) == "move"
             }
-            result = self.reconcile(torrent_hash, selected_auxiliary)
+            result = self.reconcile(torrent_hash, selected_auxiliary, operation_id=operation_id)
             if result["state"] != "COMPLETE":
                 raise RuntimeError(f'Reconciliation did not complete after qBittorrent move: {result["state"]}')
             for item in plan.additional_files or []:
@@ -823,7 +856,13 @@ class Stowarr:
             old_item = Path(plan.current_item_path) if plan.current_item_path else None
             if old_item and old_item.exists():
                 raise RuntimeError(f"Old library folder still contains unclassified files: {old_item}")
+            self.qbit.set_category(torrent_hash, plan.target_category or "")
+            self.store.update(operation_id, "MOVE_ROUTE_COMMITTED", detail)
             self.qbit.resume(torrent_hash)
+            self.store.update(operation_id, "MOVE_RESUMING", detail)
+            resumed = self._wait_for_torrent(torrent_hash, self._is_seeding_state, timeout=120)
+            self.store.update(operation_id, "MOVE_SEEDING", {**detail, "qbittorrent_state": resumed.get("state", "")})
+            self.qbit.delete_category(temporary_category)
             self.store.update(operation_id, "COMPLETE", {**detail, "extracted_files": extracted, "reconcile_operation_id": result["operation_id"]})
             return {"operation_id": operation_id, "state": "COMPLETE", "plan": plan.json(), "reconcile": result}
         except Exception as error:
@@ -832,7 +871,14 @@ class Stowarr:
                     target = Path(item["target"])
                     if target.exists() and sha256(target) == item["sha256"]:
                         target.unlink()
-            self.store.update(operation_id, "FAILED", {**plan.json(), "error": str(error)})
+            previous = next((item for item in self.store.recent() if item["id"] == operation_id), None)
+            self.store.update(operation_id, "FAILED", {
+                **detail,
+                "error": str(error),
+                "failed_after": previous["state"] if previous else "MOVE_PLANNED",
+                "temporary_category": temporary_category,
+                "recovery": "Torrent is intentionally left paused and isolated in qBittorrent for manual recovery.",
+            })
             raise
 
     def plan(self, torrent_hash: str) -> Plan:
@@ -1278,7 +1324,12 @@ class Stowarr:
             "mismatches": mismatches,
         }
 
-    def reconcile(self, torrent_hash: str, auxiliary_sources: set[str] | None = None) -> dict:
+    def reconcile(
+        self,
+        torrent_hash: str,
+        auxiliary_sources: set[str] | None = None,
+        operation_id: int | None = None,
+    ) -> dict:
         plan = self.plan(torrent_hash)
         selected_auxiliary = auxiliary_sources or set()
         blocked_sidecars = {"target-conflict", "torrent-name-conflict"}
@@ -1288,9 +1339,14 @@ class Stowarr:
         invalid_auxiliary = selected_auxiliary - allowed_auxiliary
         if invalid_auxiliary:
             raise ValueError("One or more selected sidecar paths are not eligible in the current plan")
-        operation_id = self.store.record(torrent_hash, plan.app, "PLANNED", plan.json())
+        nested_move = operation_id is not None
+        if operation_id is None:
+            operation_id = self.store.record(torrent_hash, plan.app, "PLANNED", plan.json())
+        state_name = lambda standalone, move: move if nested_move else standalone
         if plan.status != "ready" or not self.config.apply:
             state = "BLOCKED" if plan.status != "ready" else "DRY_RUN"
+            if nested_move:
+                raise RuntimeError(f"Move library reconciliation is blocked: {plan.reason or state}")
             self.store.update(operation_id, state, plan.json())
             return {"operation_id": operation_id, "state": state, "plan": plan.json()}
 
@@ -1338,7 +1394,7 @@ class Stowarr:
                     target.unlink()
                 os.replace(temporary, target)
                 created.append(target)
-            self.store.update(operation_id, "LINKED", plan.json())
+            self.store.update(operation_id, state_name("LINKED", "MOVE_LIBRARY_LINKED"), plan.json())
             if selected_auxiliary:
                 for item in plan.auxiliary_files or []:
                     source, target = Path(item.source), Path(item.target)
@@ -1371,7 +1427,7 @@ class Stowarr:
                         raise RuntimeError(f"Auxiliary file verification failed: {source}")
                     os.replace(temporary, target)
                     copied_auxiliary.append((source, target))
-                self.store.update(operation_id, "AUXILIARY_COPIED", plan.json())
+                self.store.update(operation_id, state_name("AUXILIARY_COPIED", "MOVE_LIBRARY_AUXILIARY"), plan.json())
             pool = next(pool for pool in self.config.pools if pool.name == plan.target_pool)
             mapping = self.arr[plan.app].download_mapping(torrent_hash)
             if not mapping:
@@ -1384,9 +1440,9 @@ class Stowarr:
                 for candidate in self.config.pools
             ]
             self.arr[plan.app].sync_pool(item, str(root), tag, pool_tags)
-            self.store.update(operation_id, "ARR_UPDATED", plan.json())
+            self.store.update(operation_id, state_name("ARR_UPDATED", "MOVE_ARR_UPDATED"), plan.json())
             self.arr[plan.app].rescan(int(item["id"]))
-            self.store.update(operation_id, "ARR_RESCANNED", plan.json())
+            self.store.update(operation_id, state_name("ARR_RESCANNED", "MOVE_ARR_RESCANNED"), plan.json())
             refreshed = self.arr[plan.app].download_mapping(torrent_hash)
             refreshed_files = {record.get("id"): Path(record.get("path", "")) for record in (refreshed or {}).get("files", [])}
             for record in plan.managed_files or []:
@@ -1408,9 +1464,11 @@ class Stowarr:
                 for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
                     directory.rmdir() if not any(directory.iterdir()) else None
                 old_root.rmdir() if not any(old_root.iterdir()) else None
-            self.store.update(operation_id, "SOURCE_UNLINKED", plan.json())
-            self.store.update(operation_id, "COMPLETE", plan.json())
+            self.store.update(operation_id, state_name("SOURCE_UNLINKED", "MOVE_OLD_LIBRARY_REMOVED"), plan.json())
+            if not nested_move:
+                self.store.update(operation_id, "COMPLETE", plan.json())
             return {"operation_id": operation_id, "state": "COMPLETE", "plan": plan.json()}
         except Exception as error:
-            self.store.update(operation_id, "FAILED", {**plan.json(), "error": str(error)})
+            if not nested_move:
+                self.store.update(operation_id, "FAILED", {**plan.json(), "error": str(error)})
             raise

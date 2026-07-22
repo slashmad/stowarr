@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import traceback
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
@@ -133,6 +134,7 @@ def handler(manager: Stowarr):
                 try:
                     self.send_json(200, manager.connection_discovery())
                 except Exception as error:
+                    self.log_operation_error("reconcile", error)
                     self.send_json(409, {"error": str(error)})
             elif path == "/api/operations":
                 self.send_json(200, manager.store.recent())
@@ -243,6 +245,7 @@ def handler(manager: Stowarr):
                     manager.consume_confirmation(body.get("confirmationToken", ""), "reconcile", torrent_hash, {"auxiliaryFiles": raw_sources})
                     self.send_json(200, manager.reconcile(torrent_hash, set(raw_sources)))
                 except Exception as error:
+                    self.log_operation_error("reconcile", error)
                     self.send_json(409, {"error": str(error)})
             elif path.startswith("/api/move/apply/"):
                 try:
@@ -258,6 +261,7 @@ def handler(manager: Stowarr):
                     manager.consume_confirmation(body.get("confirmationToken", ""), "move", torrent_hash, payload)
                     self.send_json(200, manager.move(torrent_hash, target_pool, additional_files))
                 except Exception as error:
+                    self.log_operation_error("move", error)
                     self.send_json(409, {"error": str(error)})
             elif path.startswith("/api/verify/"):
                 try:
@@ -268,7 +272,11 @@ def handler(manager: Stowarr):
                 self.send_json(404, {"error": "not found"})
 
         def log_message(self, fmt, *args):
-            print(f"stowarr: {fmt % args}")
+            print(f"stowarr request: {fmt % args}", flush=True)
+
+        def log_operation_error(self, operation: str, error: Exception) -> None:
+            print(f"stowarr {operation} failed: {type(error).__name__}: {error}", flush=True)
+            traceback.print_exc()
 
     return Handler
 
@@ -292,5 +300,5 @@ def print_startup_credentials(manager: Stowarr) -> None:
 def serve(manager: Stowarr) -> None:
     server = ThreadingHTTPServer((manager.config.listen, manager.config.port), handler(manager))
     print_startup_credentials(manager)
-    print(f"stowarr listening on {manager.config.listen}:{manager.config.port}; apply={manager.config.apply}")
+    print(f"stowarr listening on {manager.config.listen}:{manager.config.port}; apply={manager.config.apply}", flush=True)
     server.serve_forever()

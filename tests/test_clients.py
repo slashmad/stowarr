@@ -124,3 +124,19 @@ class QBittorrentClientTest(unittest.TestCase):
         json_client.return_value.request.assert_called_once_with(
             "POST", "/api/v2/auth/login", form={"username": "user", "password": "password"}
         )
+
+    @patch("stowarr.clients.JsonClient")
+    def test_temporary_category_is_created_with_destination_path(self, json_client):
+        json_client.return_value.request.side_effect = [{}, None]
+        client = QBittorrentClient(Service("http://qbit", api_key="key"))
+
+        client.ensure_category("radarr-stowarr-moving-hash", "/p1/download")
+
+        self.assertEqual(
+            json_client.return_value.request.call_args_list[-1].args,
+            ("POST", "/api/v2/torrents/createCategory"),
+        )
+        self.assertEqual(
+            json_client.return_value.request.call_args_list[-1].kwargs["form"],
+            {"category": "radarr-stowarr-moving-hash", "savePath": "/p1/download"},
+        )
