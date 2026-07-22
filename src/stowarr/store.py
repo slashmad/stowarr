@@ -98,7 +98,15 @@ class Store:
             (state, json.dumps(detail), int(time.time()), operation_id),
         )
         self.db.commit()
-        print(f"stowarr operation id={operation_id} state={state}", flush=True)
+        progress = detail.get("progress") or {}
+        suffix = ""
+        if progress:
+            suffix = f' progress={progress.get("percent", 0)}%'
+            if progress.get("current"):
+                suffix += f' current={progress["current"]!r}'
+            if progress.get("message"):
+                suffix += f' message={progress["message"]!r}'
+        print(f"stowarr operation id={operation_id} state={state}{suffix}", flush=True)
 
     def recent(self, limit: int = 100) -> list[dict]:
         rows = self.db.execute("SELECT * FROM operations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()

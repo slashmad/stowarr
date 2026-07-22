@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import re
+import selectors
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -118,12 +120,42 @@ class ArchiveExtractor:
             raise RuntimeError("Archive manifest contains no regular files")
         return members
 
-    def extract(self, entry: Path, destination: Path) -> list[ExtractedFile]:
+    def extract(self, entry: Path, destination: Path, progress=None) -> list[ExtractedFile]:
         if destination.exists() and any(destination.iterdir()):
             raise RuntimeError(f"Archive staging directory is not empty: {destination}")
         destination.mkdir(parents=True, exist_ok=True, mode=0o750)
         self.test(entry)
-        self._run(["x", "-y", "-snl-", "-snh-", "-bso0", "-bsp0", "-bse1", f"-o{destination}", "--", str(entry)])
+        command = [self.executable, "x", "-y", "-snl-", "-snh-", "-bso0", "-bsp1", "-bse1", f"-o{destination}", "--", str(entry)]
+        try:
+            process = subprocess.Popen(
+                command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                env={"PATH": os.environ.get("PATH", "")},
+            )
+        except FileNotFoundError as error:
+            raise RuntimeError(f"Archive extractor is unavailable: {self.executable}") from error
+        started = time.monotonic()
+        output = b""
+        assert process.stderr is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stderr, selectors.EVENT_READ)
+        while process.poll() is None:
+            if time.monotonic() - started > self.timeout:
+                process.kill()
+                raise RuntimeError(f"Archive operation exceeded {self.timeout} seconds")
+            events = selector.select(timeout=0.25)
+            if events:
+                chunk = os.read(process.stderr.fileno(), 4096)
+                output = (output + chunk)[-2000:]
+                matches = re.findall(rb"(\d{1,3})%", chunk)
+                if matches and progress:
+                    progress(min(100, int(matches[-1])))
+        selector.close()
+        output = (output + process.stderr.read())[-2000:]
+        if process.returncode:
+            detail = output.decode(errors="replace").strip() or "unknown extractor error"
+            raise RuntimeError(f"Archive operation failed: {detail}")
+        if progress:
+            progress(100)
 
         files: list[ExtractedFile] = []
         for path in destination.rglob("*"):
