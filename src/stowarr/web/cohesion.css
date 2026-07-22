@@ -522,7 +522,8 @@ tbody tr:hover td {
 }
 
 .routing-guide,
-.connection-setup {
+.connection-setup,
+.confirm-dialog {
   border: 0;
   border-radius: 4px;
   box-shadow: 0 16px 55px #000c;
@@ -661,7 +662,8 @@ tbody tr:hover td {
   }
 
   .routing-guide,
-  .connection-setup {
+  .connection-setup,
+  .confirm-dialog {
     width: 100%;
     max-height: 100vh;
     min-height: 100vh;

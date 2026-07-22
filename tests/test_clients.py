@@ -113,7 +113,7 @@ class QBittorrentClientTest(unittest.TestCase):
     def test_api_key_is_preferred_and_skips_login(self, json_client):
         QBittorrentClient(Service("http://qbit", api_key="key", username="user", password="password"))
 
-        json_client.assert_called_once_with("http://qbit", {"X-API-Key": "key"})
+        json_client.assert_called_once_with("http://qbit", {"Authorization": "Bearer key"})
         json_client.return_value.request.assert_not_called()
 
     @patch("stowarr.clients.JsonClient")

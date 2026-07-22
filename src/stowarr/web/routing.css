@@ -466,6 +466,53 @@
   background: #08090bcc;
 }
 
+.confirm-dialog {
+  background: #242629;
+  border: 1px solid #555a60;
+  color: #e7e7e7;
+  max-width: 680px;
+  padding: 0;
+  width: calc(100% - 40px);
+}
+
+.confirm-dialog::backdrop {
+  background: #08090bcc;
+}
+
+.confirm-details {
+  display: grid;
+  grid-template-columns: minmax(150px, .45fr) minmax(0, 1fr);
+  margin: 0;
+  padding: 18px 20px;
+}
+
+.confirm-details:empty {
+  display: none;
+}
+
+.confirm-details dt,
+.confirm-details dd {
+  border-bottom: 1px solid #35383c;
+  margin: 0;
+  padding: 10px 8px;
+}
+
+.confirm-details dt {
+  color: #9a9da2;
+}
+
+.confirm-details dd {
+  overflow-wrap: anywhere;
+}
+
+.confirm-actions {
+  border-top: 1px solid #3b3e43;
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  padding: 16px 20px;
+}
+
 .connection-setup > .alert {
   margin: 16px 20px 0;
 }

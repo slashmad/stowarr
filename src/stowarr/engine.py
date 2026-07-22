@@ -181,20 +181,25 @@ class Stowarr:
         return self.qbit is not None and set(self.arr) == {"radarr", "sonarr"}
 
     def _activate_connections(self, qbittorrent: Service, radarr: Service, sonarr: Service, validate: bool = True) -> dict:
-        if not qbittorrent.url or not (qbittorrent.api_key or (qbittorrent.username and qbittorrent.password)):
-            raise ValueError("qBittorrent URL and either an API key or username and password are required")
-        if not radarr.url or not radarr.api_key:
-            raise ValueError("Radarr URL and API key are required")
-        if not sonarr.url or not sonarr.api_key:
-            raise ValueError("Sonarr URL and API key are required")
-        qbit = QBittorrentClient(qbittorrent)
-        arr = {"radarr": ArrClient(radarr, "radarr"), "sonarr": ArrClient(sonarr, "sonarr")}
+        qbit = QBittorrentClient(qbittorrent) if qbittorrent.url and (qbittorrent.api_key or (qbittorrent.username and qbittorrent.password)) else None
+        arr = {
+            name: ArrClient(service, name)
+            for name, service in (("radarr", radarr), ("sonarr", sonarr))
+            if service.url and service.api_key
+        }
         versions = {}
         if validate:
-            qbit.categories()
-            versions["qbittorrent"] = "connected"
+            if qbit:
+                try:
+                    qbit.categories()
+                except Exception as error:
+                    raise ConnectionError(f"qBittorrent connection failed: {error}") from error
+                versions["qbittorrent"] = "connected"
             for name, client in arr.items():
-                versions[name] = client.status().get("version", "connected")
+                try:
+                    versions[name] = client.status().get("version", "connected")
+                except Exception as error:
+                    raise ConnectionError(f"{name.capitalize()} connection failed: {error}") from error
         self.qbit = qbit
         self.arr = arr
         self.connection_error = None
@@ -215,9 +220,15 @@ class Stowarr:
         return result
 
     def connection_settings(self) -> dict:
+        configured = {
+            "qbittorrent": self.qbit is not None,
+            "radarr": "radarr" in self.arr,
+            "sonarr": "sonarr" in self.arr,
+        }
         return {
-            "required": True,
-            "status": "ready" if self.connections_ready else "incomplete",
+            "required": False,
+            "status": "ready" if self.connections_ready else "partial" if any(configured.values()) else "unconfigured",
+            "configured": configured,
             "error": self.connection_error,
             "services": {
                 "qbittorrent": self._masked_service(self.config.qbittorrent, "qbittorrent"),
@@ -233,39 +244,33 @@ class Stowarr:
         current = {"qbittorrent": self.config.qbittorrent, "radarr": self.config.radarr, "sonarr": self.config.sonarr}
         candidates = {}
         for name, existing in current.items():
-            raw = services.get(name)
+            raw = services.get(name, {})
             if not isinstance(raw, dict):
-                raise ValueError(f"{name} configuration is required")
+                raise ValueError(f"{name} configuration must be an object")
             url = str(raw.get("url", "")).strip().rstrip("/")
-            if not url.startswith(("http://", "https://")):
+            if url and not url.startswith(("http://", "https://")):
                 raise ValueError(f"{name} URL must start with http:// or https://")
             if name == "qbittorrent":
                 api_key = str(raw.get("api_key") or existing.api_key).strip()
                 username = str(raw.get("username", "")).strip()
                 password = str(raw.get("password") or existing.password)
-                if not api_key and (not username or not password):
+                if url and not api_key and (not username or not password):
                     raise ValueError("qBittorrent API key or username and password are required")
-                candidates[name] = Service(url=url, api_key=api_key, username=username, password=password)
+                candidates[name] = Service(url=url, api_key=api_key if url else "", username=username if url else "", password=password if url else "")
             else:
                 api_key = str(raw.get("api_key") or existing.api_key).strip()
-                if not api_key:
+                if url and not api_key:
                     raise ValueError(f"{name.capitalize()} API key is required")
-                candidates[name] = Service(url=url, api_key=api_key)
+                candidates[name] = Service(url=url, api_key=api_key if url else "")
 
-        qbit = QBittorrentClient(candidates["qbittorrent"])
-        qbit.categories()
-        versions = {"qbittorrent": "connected"}
-        arr = {}
-        for name in ("radarr", "sonarr"):
-            arr[name] = ArrClient(candidates[name], name)
-            versions[name] = arr[name].status().get("version", "connected")
+        versions = self._activate_connections(
+            candidates["qbittorrent"], candidates["radarr"], candidates["sonarr"], validate=True
+        )
 
         self.store.set_setting("connections", {name: asdict(service) for name, service in candidates.items()})
         self.config = replace(self.config, **candidates)
-        self.qbit = qbit
-        self.arr = arr
         self.connection_error = None
-        return {"status": "ready", "versions": versions, **self.connection_settings()}
+        return {"versions": versions, **self.connection_settings()}
 
     def connection_discovery(self) -> dict:
         if not self.connections_ready:
