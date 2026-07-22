@@ -98,8 +98,11 @@
       </section>
 
       <section id="history" class="page">
-        <div class="page-title"><div><h1>History</h1><p>Recorded plans and reconciliation attempts</p></div></div>
-        <article class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>Operation</th><th>Application</th><th>Torrent</th><th>State</th><th>Updated</th><th></th></tr></thead><tbody id="operation-rows"></tbody></table></div></article>
+        <div class="page-title"><div><h1>History</h1><p>Recorded plans, transaction events, and reconciliation attempts</p></div></div>
+        <article class="panel">
+          <div class="history-actions"><span id="history-selection">0 selected</span><button id="delete-history-selected" class="secondary compact" type="button" disabled>Delete selected</button><button id="clear-history" class="danger compact" type="button">Clear history</button></div>
+          <div class="table-wrap"><table><thead><tr><th><input id="select-all-history" type="checkbox" aria-label="Select all terminal History entries"></th><th>ID</th><th>Operation</th><th>Application</th><th>Torrent</th><th>State</th><th>Updated</th><th></th></tr></thead><tbody id="operation-rows"></tbody></table></div>
+        </article>
       </section>
 
       <section id="sync" class="page">
@@ -200,6 +203,7 @@
     <div class="guide-head"><div><h2 id="operation-title">Move in progress</h2><p id="operation-summary">Waiting for the operation to start</p></div><button id="operation-close" aria-label="Close operation details" disabled>×</button></div>
     <div id="operation-steps" class="operation-steps"></div>
     <div id="operation-error" class="alert inline-alert hidden"></div>
+    <details id="operation-log-panel" class="operation-log-panel hidden" open><summary>Execution log <span id="operation-log-count"></span></summary><ol id="operation-log"></ol></details>
     <div class="confirm-actions"><button id="operation-done" class="primary" type="button" disabled>Close</button></div>
   </dialog>
   <div id="toast" role="status"></div>

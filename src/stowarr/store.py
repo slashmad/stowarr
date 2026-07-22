@@ -34,7 +34,44 @@ class Store:
             id INTEGER PRIMARY KEY, event TEXT NOT NULL, username TEXT, client TEXT,
             detail TEXT NOT NULL, created_at INTEGER NOT NULL)"""
         )
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS operation_events (
+            id INTEGER PRIMARY KEY, operation_id INTEGER NOT NULL, state TEXT NOT NULL,
+            detail TEXT NOT NULL, created_at INTEGER NOT NULL,
+            FOREIGN KEY(operation_id) REFERENCES operations(id) ON DELETE CASCADE)"""
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS operation_events_operation_id "
+            "ON operation_events(operation_id, id)"
+        )
         self.db.commit()
+
+    @staticmethod
+    def _event_detail(detail: dict) -> dict:
+        progress = detail.get("progress") or {}
+        event = {
+            key: progress[key]
+            for key in ("percent", "message", "current", "completed_bytes", "total_bytes", "qbit_state")
+            if progress.get(key) not in (None, "")
+        }
+        for key in ("error", "recovery", "failed_after"):
+            if detail.get(key) not in (None, ""):
+                event[key] = detail[key]
+        return event
+
+    def _record_event(self, operation_id: int, state: str, detail: dict, created_at: int | None = None) -> None:
+        event = self._event_detail(detail)
+        encoded = json.dumps(event, sort_keys=True)
+        previous = self.db.execute(
+            "SELECT state, detail FROM operation_events WHERE operation_id=? ORDER BY id DESC LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        if previous and previous["state"] == state and previous["detail"] == encoded:
+            return
+        self.db.execute(
+            "INSERT INTO operation_events(operation_id,state,detail,created_at) VALUES(?,?,?,?)",
+            (operation_id, state, encoded, created_at or int(time.time())),
+        )
 
     def setting(self, key: str) -> dict | None:
         row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -87,8 +124,9 @@ class Store:
             "INSERT INTO operations(torrent_hash,app,kind,state,detail,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
             (torrent_hash, app, kind, state, json.dumps(detail), now, now),
         )
-        self.db.commit()
         operation_id = int(cursor.lastrowid)
+        self._record_event(operation_id, state, detail, now)
+        self.db.commit()
         print(f"stowarr operation id={operation_id} kind={kind} state={state}", flush=True)
         return operation_id
 
@@ -97,6 +135,7 @@ class Store:
             "UPDATE operations SET state=?, detail=?, updated_at=? WHERE id=?",
             (state, json.dumps(detail), int(time.time()), operation_id),
         )
+        self._record_event(operation_id, state, detail)
         self.db.commit()
         progress = detail.get("progress") or {}
         suffix = ""
@@ -111,6 +150,55 @@ class Store:
     def recent(self, limit: int = 100) -> list[dict]:
         rows = self.db.execute("SELECT * FROM operations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [{**dict(row), "detail": json.loads(row["detail"])} for row in rows]
+
+    def operation_events(self, operation_id: int) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT id, operation_id, state, detail, created_at FROM operation_events "
+            "WHERE operation_id=? ORDER BY id",
+            (operation_id,),
+        ).fetchall()
+        if rows:
+            return [{**dict(row), "detail": json.loads(row["detail"])} for row in rows]
+        operation = self.db.execute("SELECT * FROM operations WHERE id=?", (operation_id,)).fetchone()
+        if not operation:
+            raise KeyError(f"Operation {operation_id} was not found")
+        return [{
+            "id": None,
+            "operation_id": operation_id,
+            "state": operation["state"],
+            "detail": {
+                "message": "Detailed event logging was not available when this operation ran",
+                **self._event_detail(json.loads(operation["detail"])),
+            },
+            "created_at": operation["updated_at"],
+        }]
+
+    def delete_operations(self, operation_ids: list[int] | None = None) -> int:
+        terminal = ("COMPLETE", "FAILED", "BLOCKED", "DRY_RUN")
+        if operation_ids is None:
+            rows = self.db.execute(
+                "SELECT id FROM operations WHERE state IN (?,?,?,?)", terminal
+            ).fetchall()
+            selected = [int(row["id"]) for row in rows]
+        else:
+            selected = sorted({int(value) for value in operation_ids if int(value) > 0})
+            if not selected:
+                return 0
+            placeholders = ",".join("?" for _ in selected)
+            rows = self.db.execute(
+                f"SELECT id, state FROM operations WHERE id IN ({placeholders})", selected
+            ).fetchall()
+            nonterminal = [row["id"] for row in rows if row["state"] not in terminal]
+            if nonterminal:
+                raise ValueError("Active operations cannot be removed from History")
+            selected = [int(row["id"]) for row in rows]
+        if not selected:
+            return 0
+        placeholders = ",".join("?" for _ in selected)
+        self.db.execute(f"DELETE FROM operation_events WHERE operation_id IN ({placeholders})", selected)
+        cursor = self.db.execute(f"DELETE FROM operations WHERE id IN ({placeholders})", selected)
+        self.db.commit()
+        return int(cursor.rowcount)
 
     def active(self, torrent_hash: str, kind: str | None = None) -> list[dict]:
         terminal = ("COMPLETE", "FAILED", "BLOCKED", "DRY_RUN")
