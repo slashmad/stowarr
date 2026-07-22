@@ -311,6 +311,12 @@ class Stowarr:
                 "api_token_set": bool(self.config.api_token),
                 "media_mount_mode": os.getenv("STOWARR_MEDIA_MOUNT_MODE", "unknown"),
                 "timezone": os.getenv("TZ", "UTC"),
+                "configured_puid": os.getenv("PUID", "not set"),
+                "configured_pgid": os.getenv("PGID", "not set"),
+                "process_uid": os.getuid(),
+                "process_gid": os.getgid(),
+                "umask": os.getenv("UMASK", "not set"),
+                "running_as_root": os.getuid() == 0,
                 "pool_mounts": [
                     {
                         "name": pool.name,

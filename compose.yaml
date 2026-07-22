@@ -6,6 +6,9 @@ services:
     restart: unless-stopped
     environment:
       TZ: Europe/Stockholm
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      UMASK: ${UMASK:-002}
       STOWARR_CONFIG: /config/config.json
       STOWARR_APPLY: ${STOWARR_APPLY:-false}
       STOWARR_API_ONLY: "true"

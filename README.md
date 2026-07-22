@@ -54,6 +54,12 @@ cp .env.example .env
 Before starting, edit `.env`:
 
 ```dotenv
+# Runtime ownership for a typical Docker host. Match these IDs to the owner or
+# shared media group on the host.
+PUID=1000
+PGID=1000
+UMASK=002
+
 # Optional bootstrap override. Leave blank to generate an API key in the API log.
 STOWARR_API_TOKEN=
 STOWARR_ADMIN_PASSWORD=
@@ -71,6 +77,25 @@ POOL2_CONTAINER_PATH=/data/pool2
 The container paths must match the absolute media paths visible to
 qBittorrent, Radarr, and Sonarr. Adjust the pool definitions in
 `config/config.json` to use those same container paths.
+
+Stowarr starts as root only long enough to make `/state` writable, then drops
+to the numeric `PUID:PGID` before starting the API. It never recursively changes
+ownership or permissions below the media mounts. `UMASK=002` provides the
+group-writable files normally needed when qBittorrent, Radarr, Sonarr, and
+Stowarr share a media group.
+
+TrueNAS Apps normally run qBittorrent, Radarr, and Sonarr as `apps` (`568:568`).
+For that deployment, use:
+
+```dotenv
+PUID=568
+PGID=568
+UMASK=002
+```
+
+Verify the configured identity against the actual user and group selected for
+the installed TrueNAS apps instead of assuming that every installation uses
+the defaults.
 
 Start Stowarr:
 
@@ -200,8 +225,10 @@ still require an explicit plan confirmation for every destructive operation.
 The execution mode can also be changed under **Settings → Execution mode**.
 Stowarr validates that every configured pool is writable before enabling apply
 mode and stores the runtime choice in its SQLite state. Docker boundary settings
-such as bind mounts, mount mode, listener ports, and an environment-provided
-API key remain deployment settings and require a Compose recreate.
+such as `PUID`, `PGID`, `UMASK`, bind mounts, mount mode, listener ports, and an
+environment-provided API key remain deployment settings and require a Compose
+recreate. Settings displays both the configured and effective process identity
+so a platform-level user override is visible.
 
 ## Move transaction
 
