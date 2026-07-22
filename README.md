@@ -137,21 +137,22 @@ If the password is lost, replace it from inside the API container. Omitting
 docker compose exec stowarr-api stowarr reset-password
 ```
 
-Open `http://127.0.0.1:8787` and sign in. On the first start, Stowarr displays a blocking
-connection setup for only the three required services:
+Open `http://127.0.0.1:8787` and sign in. Service connections can be configured
+together or one at a time from Settings:
 
 - qBittorrent URL and API key, or legacy username/password fallback;
 - Radarr URL and API key;
 - Sonarr URL and API key.
 
-All three connections are tested before they replace the active configuration.
-Secrets are stored by the API in the local `stowarr-state` volume and are never
-returned to frontend JavaScript. The setup can be opened again from Settings.
+Only services with a URL are tested and saved. The dialog can always be closed;
+full Sync, Move, Reconcile, and routing workflows become available after all three
+services are connected. Secrets are stored by the API in the local `stowarr-state`
+volume and are never returned to frontend JavaScript.
 
 ### qBittorrent authentication
 
 For qBittorrent 5.2 or newer, use an API key. Stowarr sends it with the
-`X-API-Key` header and does not create a password session. API-key
+`Authorization: Bearer` header and does not create a password session. API-key
 authentication always takes precedence when both methods are configured.
 
 For older qBittorrent versions, leave the API key empty and supply the WebUI
