@@ -3,6 +3,16 @@ name = "stowarr"
 version = "0.1.0"
 description = "Transactional pool reconciliation for qBittorrent and *Arr"
 requires-python = ">=3.12"
+authors = [
+    { name = "slashmad" },
+]
+readme = "README.md"
+license = "Apache-2.0"
+
+[project.urls]
+Homepage = "https://github.com/slashmad/stowarr"
+Repository = "https://github.com/slashmad/stowarr"
+Issues = "https://github.com/slashmad/stowarr/issues"
 
 [project.scripts]
 stowarr = "stowarr.cli:main"
