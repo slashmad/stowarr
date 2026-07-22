@@ -1,5 +1,6 @@
 {
   "apply": false,
+  "auth_method": "forms",
   "listen": "0.0.0.0",
   "port": 8787,
   "api_token": "",

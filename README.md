@@ -54,7 +54,11 @@ cp .env.example .env
 Before starting, edit `.env`:
 
 ```dotenv
-STOWARR_API_TOKEN=replace-with-a-long-random-value
+# Optional bootstrap override. Leave blank to generate an API key in the API log.
+STOWARR_API_TOKEN=
+STOWARR_ADMIN_PASSWORD=
+STOWARR_AUTH_METHOD=forms
+STOWARR_EXTERNAL_USER_HEADER=X-Forwarded-User
 STOWARR_APPLY=false
 STOWARR_MEDIA_MOUNT_MODE=ro
 
@@ -75,7 +79,40 @@ docker compose pull
 docker compose up -d
 ```
 
-Open `http://127.0.0.1:8787`. On the first start, Stowarr displays a blocking
+On first startup, Stowarr creates the `admin` WebUI account. It also creates a
+separate API key when `STOWARR_API_TOKEN` is empty. Retrieve any generated
+credentials from the API container log:
+
+```bash
+docker compose logs stowarr-api
+```
+
+Only a scrypt password hash is persisted in the state database. The generated
+cleartext password is written to the startup log and is not returned by any
+API. It can be replaced from Settings after signing in.
+
+If `STOWARR_API_TOKEN` is empty, the generated API key is persisted in the
+state volume and printed only when it is first created. An explicit environment
+value overrides the persisted key. The built-in default is never a shared or
+predictable credential.
+
+API examples below read the key from `STOWARR_API_TOKEN`. If Stowarr generated
+the key, copy it from the first-start log into your current shell without
+writing it to the repository:
+
+```bash
+read -rsp "Stowarr API key: " STOWARR_API_TOKEN && export STOWARR_API_TOKEN
+echo
+```
+
+If the password is lost, replace it from inside the API container. Omitting
+`--password` generates a new random password and prints it once:
+
+```bash
+docker compose exec stowarr-api stowarr reset-password
+```
+
+Open `http://127.0.0.1:8787` and sign in. On the first start, Stowarr displays a blocking
 connection setup for only the three required services:
 
 - qBittorrent URL and API key, or legacy username/password fallback;
@@ -163,8 +200,8 @@ still require an explicit plan confirmation for every destructive operation.
 The execution mode can also be changed under **Settings → Execution mode**.
 Stowarr validates that every configured pool is writable before enabling apply
 mode and stores the runtime choice in its SQLite state. Docker boundary settings
-such as bind mounts, mount mode, listener ports, and the API proxy token remain
-deployment settings and require a Compose recreate.
+such as bind mounts, mount mode, listener ports, and an environment-provided
+API key remain deployment settings and require a Compose recreate.
 
 ## Move transaction
 
@@ -197,18 +234,39 @@ The WebUI **Guide** page summarizes every page and action button.
 The stack contains two services:
 
 - `stowarr-web` serves static assets and proxies `/api`. It has no media or
-  state mounts. Its proxy receives `STOWARR_API_TOKEN` as a container
-  environment variable, but the token is not delivered to frontend code.
+  state mounts. Browser requests require an authenticated administrator
+  session stored in an `HttpOnly`, `SameSite=Strict` cookie and a CSRF header.
 - `stowarr-api` owns service credentials, SQLite state, media access, and all
   filesystem operations.
 
-The WebUI is bound to `127.0.0.1:8787`. The direct API listener is bound to
-`127.0.0.1:8788` and requires the bearer token. Do not expose either listener
-to another network without adding TLS and appropriate access controls.
+The WebUI is bound to `127.0.0.1:8787` and uses its own admin authentication.
+The direct API listener is bound to `127.0.0.1:8788` and independently requires
+the API token. It accepts the *Arr-compatible `X-Api-Key` header as well as a
+Bearer token. Do not expose either listener to another network without TLS.
+
+Forms authentication is the secure default. `STOWARR_AUTH_METHOD=external`
+trusts the username supplied by `STOWARR_EXTERNAL_USER_HEADER` (default
+`X-Forwarded-User`) and is intended only for Authelia, Authentik, or another
+authentication proxy. In external mode, the Stowarr WebUI port must not be
+reachable by clients through any path that bypasses that proxy. The proxy must
+replace, rather than merely preserve, the trusted username header supplied by
+the client.
+
+Settings shows active in-memory WebUI sessions and a persistent security event
+log. Restarting the API invalidates WebUI sessions. Password changes and the
+**Sign out all sessions** action invalidate every existing session.
 
 ## API
 
-Read-only requests use the bearer token:
+API requests can use the same `X-Api-Key` convention as Radarr, Sonarr, and
+Prowlarr:
+
+```bash
+curl -H "X-Api-Key: $STOWARR_API_TOKEN" \
+  http://127.0.0.1:8788/api/operations
+```
+
+Bearer authentication remains supported:
 
 ```bash
 curl -H "Authorization: Bearer $STOWARR_API_TOKEN" \

@@ -35,3 +35,12 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(config.pool_for_category("sonarr-p1")[1], "sonarr")
             self.assertEqual(config.qbittorrent.password, "secret")
             self.assertEqual(config.qbittorrent.api_key, "preferred")
+            self.assertEqual(config.auth_method, "forms")
+
+    def test_rejects_unknown_authentication_method(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"pools": {}}))
+            with patch.dict(os.environ, {"STOWARR_AUTH_METHOD": "unsafe"}, clear=True):
+                with self.assertRaisesRegex(ValueError, "forms or external"):
+                    load_config(path)

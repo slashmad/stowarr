@@ -29,6 +29,11 @@ class Store:
             token_hash TEXT PRIMARY KEY, kind TEXT NOT NULL, torrent_hash TEXT NOT NULL,
             fingerprint TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER)"""
         )
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS security_events (
+            id INTEGER PRIMARY KEY, event TEXT NOT NULL, username TEXT, client TEXT,
+            detail TEXT NOT NULL, created_at INTEGER NOT NULL)"""
+        )
         self.db.commit()
 
     def setting(self, key: str) -> dict | None:
@@ -42,6 +47,19 @@ class Store:
             (key, json.dumps(value), int(time.time())),
         )
         self.db.commit()
+
+    def security_event(self, event: str, username: str = "", client: str = "", detail: dict | None = None) -> None:
+        self.db.execute(
+            "INSERT INTO security_events(event,username,client,detail,created_at) VALUES(?,?,?,?,?)",
+            (event, username, client, json.dumps(detail or {}), int(time.time())),
+        )
+        self.db.commit()
+
+    def recent_security_events(self, limit: int = 100) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT * FROM security_events ORDER BY id DESC LIMIT ?", (max(1, min(limit, 500)),)
+        ).fetchall()
+        return [{**dict(row), "detail": json.loads(row["detail"])} for row in rows]
 
     def create_confirmation(self, token: str, kind: str, torrent_hash: str, fingerprint: str, expires_at: int) -> None:
         token_hash = hashlib.sha256(token.encode()).hexdigest()
