@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from stowarr.archive import ArchiveMember, ExtractedFile
 from stowarr.config import Pool
-from stowarr.engine import MovePlan, Plan, Stowarr, is_archive, sha256, title_matches
+from stowarr.engine import FilePair, MovePlan, Plan, Stowarr, is_archive, sha256, title_matches
 
 
 class EngineTest(unittest.TestCase):
@@ -352,6 +352,60 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(plan.item_id, 42)
             self.assertEqual(plan.pairs[0].torrent_file, str(torrent_media))
             self.assertEqual(plan.pairs[0].target_library, str(p1.radarr_root / "Movie (2020)" / "Movie.mkv"))
+
+    def test_nested_move_links_rechecked_library_seeded_media_after_source_relocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_item = root / "p3" / "movies" / "Movie (2020)"
+            target_item = root / "p1" / "movies" / "Movie (2020)"
+            relocated = root / "p1" / "download" / "Movie (2020)" / "Movie.mkv"
+            old_item.mkdir(parents=True)
+            relocated.parent.mkdir(parents=True)
+            relocated.write_bytes(b"qBittorrent rechecked media")
+            old_source = old_item / "Movie.mkv"
+            target = target_item / "Movie.mkv"
+            record = {
+                "id": 7, "path": str(old_source), "relativePath": "Movie.mkv",
+                "size": relocated.stat().st_size, "episodeIds": [],
+            }
+            item = {"id": 42, "title": "Movie", "path": str(old_item), "tags": []}
+            mapping = {"item": item, "files": [record]}
+            refreshed = {
+                "item": {**item, "path": str(target_item)},
+                "files": [{**record, "path": str(target)}],
+            }
+            plan = Plan(
+                "abc", "Movie.2020", "radarr", "p1", 42, "Movie",
+                str(old_item), str(target_item),
+                [FilePair(str(old_source), str(target), str(relocated), relocated.stat().st_size, "repairable")],
+                "ready", managed_files=[record],
+            )
+            pool = Pool(
+                "p1", root / "p1", (root / "p1" / "download",),
+                root / "p1" / "movies", root / "p1" / "series",
+                "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+            )
+            client = SimpleNamespace(
+                download_mapping=lambda torrent_hash: None,
+                library_mapping=lambda paths: refreshed,
+                sync_pool=lambda current, destination, tag, pool_tags: None,
+                rescan=lambda item_id: None,
+            )
+            manager = Stowarr.__new__(Stowarr)
+            manager.plan = lambda *args, **kwargs: plan
+            manager.arr = {"radarr": client}
+            manager.config = SimpleNamespace(apply=True, pools=(pool,))
+            manager.store = SimpleNamespace(update=lambda *args, **kwargs: None)
+
+            result = manager.reconcile(
+                "abc", operation_id=9, mapping_hint=mapping, app_hint="radarr",
+                relocated_library_sources={str(old_source)},
+            )
+
+            self.assertEqual(result["state"], "COMPLETE")
+            self.assertTrue(target.exists())
+            self.assertEqual((target.stat().st_dev, target.stat().st_ino),
+                             (relocated.stat().st_dev, relocated.stat().st_ino))
 
     def test_verified_additional_copy_rejects_changed_source(self):
         with tempfile.TemporaryDirectory() as directory:
