@@ -1103,6 +1103,16 @@ class Stowarr:
             self.store.update(operation_id, state, detail)
             return {"operation_id": operation_id, "state": state, "plan": plan.json()}
 
+        mapping_hint = self.arr[plan.app].download_mapping(torrent_hash)
+        if not mapping_hint:
+            resolver = getattr(self.arr[plan.app], "library_mapping", None)
+            if resolver:
+                mapping_hint = resolver([record["path"] for record in plan.managed_files])
+        if not mapping_hint or int(mapping_hint.get("item", {}).get("id", -1)) != int(plan.item_id or -2):
+            raise RuntimeError(
+                f"The verified {plan.app.capitalize()} mapping changed before the Move transaction started"
+            )
+
         extracted: list[dict] = []
         temporary_category = f"{plan.app}-stowarr-moving-{torrent_hash[:12].casefold()}"
         last_progress: tuple[str, int, str, str] | None = None
@@ -1179,14 +1189,20 @@ class Stowarr:
                    message="All selected additional download files are verified")
             report("MOVE_LIBRARY_VERIFYING", 0, message="Resolving the destination library plan")
             verified_derived = {item["target"] for item in extracted}
-            post_plan = self.plan(torrent_hash, verified_derived_paths=verified_derived)
+            post_plan = self.plan(
+                torrent_hash,
+                verified_derived_paths=verified_derived,
+                mapping_hint=mapping_hint,
+                app_hint=plan.app,
+            )
             selected_auxiliary = {
                 item.source
                 for item in (post_plan.auxiliary_files or [])
                 if item.origin == "qbittorrent" or actions.get(item.source) == "move"
             }
             result = self.reconcile(torrent_hash, selected_auxiliary, operation_id=operation_id,
-                                    verified_derived_paths=verified_derived, progress_callback=report)
+                                    verified_derived_paths=verified_derived, progress_callback=report,
+                                    mapping_hint=mapping_hint, app_hint=plan.app)
             if result["state"] != "COMPLETE":
                 raise RuntimeError(f'Reconciliation did not complete after qBittorrent move: {result["state"]}')
             report("MOVE_DERIVATIVE_CLEANUP", 0, message="Checking for verified Unpackerr derivatives")
@@ -1241,7 +1257,13 @@ class Stowarr:
             })
             raise
 
-    def plan(self, torrent_hash: str, verified_derived_paths: set[str] | None = None) -> Plan:
+    def plan(
+        self,
+        torrent_hash: str,
+        verified_derived_paths: set[str] | None = None,
+        mapping_hint: dict | None = None,
+        app_hint: str | None = None,
+    ) -> Plan:
         verified_derived_paths = verified_derived_paths or set()
         torrent = next((t for t in self.qbit.torrents() if t["hash"].lower() == torrent_hash.lower()), None)
         if not torrent:
@@ -1256,10 +1278,10 @@ class Stowarr:
             library_app = "radarr"
         elif save_path == pool.sonarr_root or save_path.is_relative_to(pool.sonarr_root):
             library_app = "sonarr"
-        app = category_match[1] if category_match else library_app or (
+        app = app_hint or (category_match[1] if category_match else library_app or (
             "sonarr" if torrent.get("category", "").startswith("sonarr") else "radarr"
-        )
-        mapping = self.arr[app].download_mapping(torrent_hash)
+        ))
+        mapping = self.arr[app].download_mapping(torrent_hash) or mapping_hint
         if not mapping:
             return Plan(torrent_hash, torrent["name"], app, pool.name, None, None, None, None, [], "blocked", "No matching *Arr history item")
         item = mapping["item"]
@@ -1729,8 +1751,15 @@ class Stowarr:
         operation_id: int | None = None,
         verified_derived_paths: set[str] | None = None,
         progress_callback=None,
+        mapping_hint: dict | None = None,
+        app_hint: str | None = None,
     ) -> dict:
-        plan = self.plan(torrent_hash, verified_derived_paths=verified_derived_paths)
+        plan = self.plan(
+            torrent_hash,
+            verified_derived_paths=verified_derived_paths,
+            mapping_hint=mapping_hint,
+            app_hint=app_hint,
+        )
         selected_auxiliary = auxiliary_sources or set()
         blocked_sidecars = {"target-conflict", "torrent-name-conflict"}
         allowed_auxiliary = {
@@ -1846,7 +1875,7 @@ class Stowarr:
                     copied_auxiliary.append((source, target))
                 self.store.update(operation_id, state_name("AUXILIARY_COPIED", "MOVE_LIBRARY_AUXILIARY"), plan.json())
             pool = next(pool for pool in self.config.pools if pool.name == plan.target_pool)
-            mapping = self.arr[plan.app].download_mapping(torrent_hash)
+            mapping = self.arr[plan.app].download_mapping(torrent_hash) or mapping_hint
             if not mapping:
                 raise RuntimeError("The *Arr download mapping disappeared during reconciliation")
             item = mapping["item"]
@@ -1864,7 +1893,15 @@ class Stowarr:
             if progress_callback:
                 progress_callback("MOVE_ARR_RESCANNING", 100, message=f"{plan.app.capitalize()} rescan completed")
             self.store.update(operation_id, state_name("ARR_RESCANNED", "MOVE_ARR_RESCANNED"), plan.json())
+            expected_paths = [
+                str(Path(plan.target_item_path or "") / record["relativePath"])
+                for record in plan.managed_files or []
+            ]
             refreshed = self.arr[plan.app].download_mapping(torrent_hash)
+            if not refreshed and expected_paths:
+                resolver = getattr(self.arr[plan.app], "library_mapping", None)
+                if resolver:
+                    refreshed = resolver(expected_paths)
             refreshed_files = {record.get("id"): Path(record.get("path", "")) for record in (refreshed or {}).get("files", [])}
             for record in plan.managed_files or []:
                 expected = Path(plan.target_item_path or "") / record["relativePath"]
