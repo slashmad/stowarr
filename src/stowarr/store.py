@@ -88,7 +88,9 @@ class Store:
             (torrent_hash, app, kind, state, json.dumps(detail), now, now),
         )
         self.db.commit()
-        return int(cursor.lastrowid)
+        operation_id = int(cursor.lastrowid)
+        print(f"stowarr operation id={operation_id} kind={kind} state={state}", flush=True)
+        return operation_id
 
     def update(self, operation_id: int, state: str, detail: dict) -> None:
         self.db.execute(
@@ -96,6 +98,7 @@ class Store:
             (state, json.dumps(detail), int(time.time()), operation_id),
         )
         self.db.commit()
+        print(f"stowarr operation id={operation_id} state={state}", flush=True)
 
     def recent(self, limit: int = 100) -> list[dict]:
         rows = self.db.execute("SELECT * FROM operations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()

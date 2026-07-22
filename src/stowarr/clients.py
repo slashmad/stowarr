@@ -211,3 +211,12 @@ class QBittorrentClient:
 
     def set_category(self, torrent_hash: str, category: str) -> None:
         self.http.request("POST", "/api/v2/torrents/setCategory", form={"hashes": torrent_hash, "category": category})
+
+    def ensure_category(self, category: str, save_path: str) -> None:
+        endpoint = "editCategory" if category in self.categories() else "createCategory"
+        self.http.request(
+            "POST", f"/api/v2/torrents/{endpoint}", form={"category": category, "savePath": save_path}
+        )
+
+    def delete_category(self, category: str) -> None:
+        self.http.request("POST", "/api/v2/torrents/removeCategories", form={"categories": category})

@@ -196,6 +196,12 @@
     <dl id="confirm-details" class="confirm-details"></dl>
     <div class="confirm-actions"><button id="confirm-cancel" class="secondary" type="button">Cancel</button><button id="confirm-accept" class="primary" type="button">Confirm</button></div>
   </dialog>
+  <dialog id="operation-dialog" class="operation-dialog">
+    <div class="guide-head"><div><h2 id="operation-title">Move in progress</h2><p id="operation-summary">Waiting for the operation to start</p></div><button id="operation-close" aria-label="Close operation details" disabled>×</button></div>
+    <ol id="operation-steps" class="operation-steps"></ol>
+    <div id="operation-error" class="alert inline-alert hidden"></div>
+    <div class="confirm-actions"><button id="operation-done" class="primary" type="button" disabled>Close</button></div>
+  </dialog>
   <div id="toast" role="status"></div>
   <script src="/assets/app.js"></script>
 </body>
