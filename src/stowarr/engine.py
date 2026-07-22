@@ -119,11 +119,16 @@ class MovePlan:
         return asdict(self)
 
 
-def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024, progress=None) -> str:
     digest = hashlib.sha256()
+    total = path.stat().st_size
+    completed = 0
     with path.open("rb") as handle:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
+            completed += len(chunk)
+            if progress:
+                progress(completed, total)
     return digest.hexdigest()
 
 
@@ -619,16 +624,41 @@ class Stowarr:
             extraction_files=extraction_files,
         )
 
-    def _wait_for_torrent(self, torrent_hash: str, predicate, timeout: int = 1800) -> dict:
+    def _wait_for_torrent(self, torrent_hash: str, predicate, timeout: int = 1800, progress=None) -> dict:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             torrent = self.qbit.torrent(torrent_hash)
             if not torrent:
                 raise RuntimeError("Torrent disappeared from qBittorrent during the operation")
+            if progress:
+                progress(torrent)
             if predicate(torrent):
                 return torrent
             time.sleep(2)
         raise RuntimeError(f"qBittorrent operation exceeded {timeout} seconds")
+
+    def _wait_for_recheck(self, torrent_hash: str, progress=None, timeout: int = 1800) -> dict:
+        """Wait for qBittorrent's asynchronous check to start and then finish."""
+        deadline = time.monotonic() + timeout
+        observed_checking = False
+        last_state = "unknown"
+        while time.monotonic() < deadline:
+            torrent = self.qbit.torrent(torrent_hash)
+            if not torrent:
+                raise RuntimeError("Torrent disappeared while qBittorrent was rechecking it")
+            last_state = str(torrent.get("state", ""))
+            checking = last_state.casefold().startswith("checking")
+            observed_checking = observed_checking or checking
+            if progress:
+                progress(torrent, observed_checking)
+            if observed_checking and not checking:
+                if float(torrent.get("progress", 0)) < 1:
+                    raise RuntimeError("qBittorrent recheck completed with missing torrent data")
+                return torrent
+            time.sleep(1)
+        if not observed_checking:
+            raise RuntimeError(f"qBittorrent never entered a checking state (last state: {last_state})")
+        raise RuntimeError(f"qBittorrent recheck exceeded {timeout} seconds (last state: {last_state})")
 
     @staticmethod
     def _is_seeding_state(torrent: dict) -> bool:
@@ -686,7 +716,7 @@ class Stowarr:
             raise RuntimeError(f"Additional file copy verification failed: {source}")
         os.replace(temporary, target)
 
-    def _extract_managed_media(self, torrent_hash: str, plan: MovePlan) -> list[dict]:
+    def _extract_managed_media(self, torrent_hash: str, plan: MovePlan, progress=None) -> list[dict]:
         """Regenerate archive-derived *Arr files on the destination pool."""
         torrent = self.qbit.torrent(torrent_hash)
         if not torrent:
@@ -719,13 +749,23 @@ class Stowarr:
                 )
             for index, entry in enumerate(entries):
                 output = staging / f"archive-{index:04d}"
-                extracted.extend(item.path for item in self.archive_extractor.extract(entry, output))
+                archive_progress = lambda percent, index=index, entry=entry: progress and progress({
+                        "percent": round((index + percent / 100) / len(entries) * 55),
+                        "current": entry.name,
+                        "message": f"Extracting archive {index + 1} of {len(entries)}",
+                    })
+                files = (
+                    self.archive_extractor.extract(entry, output, archive_progress)
+                    if progress else self.archive_extractor.extract(entry, output)
+                )
+                extracted.extend(item.path for item in files)
             videos = [path for path in extracted if path.suffix.casefold() in VIDEO_EXTENSIONS]
             if not videos:
                 raise RuntimeError("Archive extraction produced no supported media files")
             used: set[Path] = set()
             extraction_ids = {record.get("id") for record in (plan.extraction_files or [])}
-            for record in plan.managed_files:
+            media_records = [record for record in plan.managed_files if record.get("id") in extraction_ids]
+            for media_index, record in enumerate(media_records):
                 if record.get("id") not in extraction_ids:
                     continue
                 source = Path(record["path"])
@@ -733,12 +773,19 @@ class Stowarr:
                 expected_size = int(record.get("size", 0))
                 if not source.exists():
                     raise RuntimeError(f"Cannot verify regenerated media because the current *Arr file is missing: {source}")
-                expected_hash = sha256(source)
+                def hash_progress(completed, total, label="current library media"):
+                    if progress:
+                        progress({
+                            "percent": 55 + round((media_index + (completed / max(total, 1)) * .25) / max(len(media_records), 1) * 35),
+                            "completed_bytes": completed, "total_bytes": total,
+                            "current": source.name, "message": f"Hash-verifying {label}",
+                        })
+                expected_hash = sha256(source, progress=hash_progress)
                 candidates = []
                 for candidate in videos:
                     if candidate in used or candidate.stat().st_size != expected_size:
                         continue
-                    if sha256(candidate) == expected_hash:
+                    if sha256(candidate, progress=lambda done, total: hash_progress(done, total, "extracted media")) == expected_hash:
                         candidates.append(candidate)
                 if len(candidates) != 1:
                     raise RuntimeError(
@@ -755,7 +802,7 @@ class Stowarr:
                     temporary = target.with_name(f".{target.name}.stowarr-extract")
                     temporary.unlink(missing_ok=True)
                     shutil.copy2(candidate, temporary)
-                    if sha256(temporary) != expected_hash:
+                    if sha256(temporary, progress=lambda done, total: hash_progress(done, total, "published media")) != expected_hash:
                         temporary.unlink(missing_ok=True)
                         raise RuntimeError(f"Published archive-derived media failed verification: {target}")
                     os.replace(temporary, target)
@@ -763,6 +810,9 @@ class Stowarr:
                     "source": str(source), "target": str(target), "sha256": expected_hash,
                     "created": not existed_before,
                 })
+                if progress:
+                    progress({"percent": 90 + round((media_index + 1) / max(len(media_records), 1) * 10),
+                              "current": target.name, "message": "Published verified archive media"})
             return published
         except Exception:
             for item in published:
@@ -773,6 +823,43 @@ class Stowarr:
             raise
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+    def _cleanup_verified_unpackerr_derivatives(self, torrent_hash: str, extracted: list[dict], progress=None) -> list[str]:
+        """Remove only recognizable Unpackerr output whose media matches published library media."""
+        if not extracted:
+            return []
+        torrent = self.qbit.torrent(torrent_hash)
+        if not torrent:
+            raise RuntimeError("Torrent disappeared before Unpackerr derivative cleanup")
+        root = Path(torrent["save_path"])
+        torrent_name = str(torrent.get("name", ""))
+        expected = {(Path(item["target"]).stat().st_size, item["sha256"]) for item in extracted}
+        candidates = [
+            path for path in root.glob(f"{torrent_name}*_unpackerr*")
+            if path.is_dir() and path.name.casefold().endswith(("_unpackerrred", "_unpacked"))
+        ]
+        removed: list[str] = []
+        for index, directory in enumerate(candidates):
+            files = [path for path in directory.rglob("*") if path.is_file()]
+            markers = [path for path in files if path.name.casefold().startswith("_unpackerr") and path.suffix.casefold() == ".txt"]
+            videos = [path for path in files if path.suffix.casefold() in VIDEO_EXTENSIONS]
+            unknown = [path for path in files if path not in markers and path not in videos]
+            if not markers or not videos or unknown:
+                continue
+            for video in videos:
+                possible = {digest for size, digest in expected if size == video.stat().st_size}
+                if not possible:
+                    raise RuntimeError(f"Unpackerr derivative has no matching published library file: {video}")
+                digest = sha256(video, progress=lambda done, total, video=video: progress and progress({
+                    "percent": round((index + done / max(total, 1)) / max(len(candidates), 1) * 100),
+                    "completed_bytes": done, "total_bytes": total, "current": video.name,
+                    "message": "Hash-verifying Unpackerr derivative before cleanup",
+                }))
+                if digest not in possible:
+                    raise RuntimeError(f"Unpackerr derivative differs from published library media: {video}")
+            shutil.rmtree(directory)
+            removed.append(str(directory))
+        return removed
 
     def move(self, torrent_hash: str, target_pool_name: str, additional_actions: dict[str, str] | None = None) -> dict:
         if self.store.active(torrent_hash, kind="move"):
@@ -794,34 +881,56 @@ class Stowarr:
 
         extracted: list[dict] = []
         temporary_category = f"{plan.app}-stowarr-moving-{torrent_hash[:12].casefold()}"
+        last_progress: tuple[str, int, str, str] | None = None
+        def report(state: str, percent: float, **values) -> None:
+            nonlocal last_progress
+            percent_value = max(0, min(100, round(percent)))
+            marker = (state, percent_value, str(values.get("current", "")), str(values.get("message", "")))
+            if marker == last_progress:
+                return
+            last_progress = marker
+            payload = {
+                **detail, "temporary_category": temporary_category,
+                "progress": {"state": state, "percent": percent_value, **values},
+            }
+            self.store.update(operation_id, state, payload)
         self.qbit.pause(torrent_hash)
-        self.store.update(operation_id, "MOVE_PAUSED", {**detail, "temporary_category": temporary_category})
+        report("MOVE_PAUSED", 100, message="Torrent writes are paused")
         try:
             self.qbit.ensure_category(temporary_category, plan.target_save_path or "")
             self.qbit.set_category(torrent_hash, temporary_category)
-            self.store.update(operation_id, "MOVE_ISOLATED", {**detail, "temporary_category": temporary_category})
+            report("MOVE_ISOLATED", 100, message="Temporary category assigned")
             self.qbit.set_location(torrent_hash, plan.target_save_path or "")
-            self.store.update(operation_id, "MOVE_RELOCATING", {**detail, "temporary_category": temporary_category})
+            report("MOVE_RELOCATING", 0, message="qBittorrent is relocating tracked data")
             self._wait_for_torrent(
                 torrent_hash,
                 lambda torrent: Path(torrent.get("save_path", "")) == Path(plan.target_save_path or "")
                 and torrent.get("state") != "moving",
+                progress=lambda torrent: report(
+                    "MOVE_RELOCATING", 100 if Path(torrent.get("save_path", "")) == Path(plan.target_save_path or "")
+                    and torrent.get("state") != "moving" else 0,
+                    qbit_state=torrent.get("state", ""), message="qBittorrent is relocating tracked data",
+                ),
             )
             self.qbit.recheck(torrent_hash)
-            self.store.update(operation_id, "MOVE_RECHECKING", {**detail, "temporary_category": temporary_category})
-            self._wait_for_torrent(
+            report("MOVE_RECHECKING", 0, message="Waiting for qBittorrent to start rechecking")
+            self._wait_for_recheck(
                 torrent_hash,
-                lambda torrent: not str(torrent.get("state", "")).casefold().startswith("checking")
-                and float(torrent.get("progress", 0)) >= 1,
+                progress=lambda torrent, started: report(
+                    "MOVE_RECHECKING", float(torrent.get("progress", 0)) * 100 if started else 0,
+                    qbit_state=torrent.get("state", ""),
+                    message="qBittorrent is checking torrent pieces" if started else "Waiting for qBittorrent to enter checking state",
+                ),
             )
             self._wait_for_visible_torrent_files(torrent_hash)
-            self.store.update(operation_id, "MOVE_QBIT_COMPLETE", {**detail, "temporary_category": temporary_category})
+            report("MOVE_QBIT_COMPLETE", 100, message="Every selected qBittorrent file is visible at the destination")
             if plan.extraction_required:
-                self.store.update(operation_id, "MOVE_EXTRACTING", detail)
-                extracted = self._extract_managed_media(torrent_hash, plan)
-                self.store.update(operation_id, "MOVE_EXTRACTED", {**detail, "extracted_files": extracted})
+                report("MOVE_EXTRACTING", 0, message="Inspecting archive manifests")
+                extracted = self._extract_managed_media(torrent_hash, plan, lambda value: report("MOVE_EXTRACTING", **value))
+                report("MOVE_EXTRACTED", 100, message="Archive media extracted and hash-verified")
             download_records = [item for item in (plan.additional_files or []) if item["scope"] == "download"]
-            for item in download_records:
+            report("MOVE_ADDITIONAL_VERIFYING", 0, total_files=len(download_records), message="Verifying additional download files")
+            for item_index, item in enumerate(download_records):
                 source, target = Path(item["source"]), Path(item["target"])
                 expected_hash = item.get("sha256") or ""
                 if actions[item["source"]] == "move":
@@ -829,16 +938,29 @@ class Stowarr:
                         self._copy_verified(source, target, expected_hash)
                     elif not target.exists() or sha256(target) != expected_hash:
                         raise RuntimeError(f"Additional download file was not preserved by qBittorrent: {source}")
-            self.store.update(operation_id, "MOVE_ADDITIONAL_VERIFIED", detail)
-            post_plan = self.plan(torrent_hash)
+                report("MOVE_ADDITIONAL_VERIFYING", (item_index + 1) / max(len(download_records), 1) * 100,
+                       completed_files=item_index + 1, total_files=len(download_records), current=source.name,
+                       message="Verified additional download file")
+            report("MOVE_ADDITIONAL_VERIFIED", 100, completed_files=len(download_records), total_files=len(download_records),
+                   message="All selected additional download files are verified")
+            report("MOVE_LIBRARY_VERIFYING", 0, message="Resolving the destination library plan")
+            verified_derived = {item["target"] for item in extracted}
+            post_plan = self.plan(torrent_hash, verified_derived_paths=verified_derived)
             selected_auxiliary = {
                 item.source
                 for item in (post_plan.auxiliary_files or [])
                 if item.origin == "qbittorrent" or actions.get(item.source) == "move"
             }
-            result = self.reconcile(torrent_hash, selected_auxiliary, operation_id=operation_id)
+            result = self.reconcile(torrent_hash, selected_auxiliary, operation_id=operation_id,
+                                    verified_derived_paths=verified_derived, progress_callback=report)
             if result["state"] != "COMPLETE":
                 raise RuntimeError(f'Reconciliation did not complete after qBittorrent move: {result["state"]}')
+            report("MOVE_DERIVATIVE_CLEANUP", 0, message="Checking for verified Unpackerr derivatives")
+            removed_derivatives = self._cleanup_verified_unpackerr_derivatives(
+                torrent_hash, extracted, lambda value: report("MOVE_DERIVATIVE_CLEANUP", **value)
+            )
+            report("MOVE_DERIVATIVE_CLEANUP", 100, completed_files=len(removed_derivatives),
+                   total_files=len(removed_derivatives), message="Verified Unpackerr derivatives cleaned")
             for item in plan.additional_files or []:
                 source, target = Path(item["source"]), Path(item["target"])
                 if actions[item["source"]] == "delete":
@@ -863,7 +985,9 @@ class Stowarr:
             resumed = self._wait_for_torrent(torrent_hash, self._is_seeding_state, timeout=120)
             self.store.update(operation_id, "MOVE_SEEDING", {**detail, "qbittorrent_state": resumed.get("state", "")})
             self.qbit.delete_category(temporary_category)
-            self.store.update(operation_id, "COMPLETE", {**detail, "extracted_files": extracted, "reconcile_operation_id": result["operation_id"]})
+            self.store.update(operation_id, "COMPLETE", {**detail, "extracted_files": extracted,
+                              "removed_unpackerr_derivatives": removed_derivatives,
+                              "reconcile_operation_id": result["operation_id"]})
             return {"operation_id": operation_id, "state": "COMPLETE", "plan": plan.json(), "reconcile": result}
         except Exception as error:
             for item in extracted:
@@ -881,7 +1005,8 @@ class Stowarr:
             })
             raise
 
-    def plan(self, torrent_hash: str) -> Plan:
+    def plan(self, torrent_hash: str, verified_derived_paths: set[str] | None = None) -> Plan:
+        verified_derived_paths = verified_derived_paths or set()
         torrent = next((t for t in self.qbit.torrents() if t["hash"].lower() == torrent_hash.lower()), None)
         if not torrent:
             return Plan(torrent_hash, "", "unknown", "", None, None, None, None, [], "blocked", "Torrent not found")
@@ -966,6 +1091,8 @@ class Stowarr:
             if not candidates and has_archives:
                 if source == target and source.exists():
                     state = "already-on-target"
+                elif str(target) in verified_derived_paths and target.exists() and target.stat().st_size == size:
+                    state = "verified-derived"
                 elif source.exists() and target.exists() and source.stat().st_size == target.stat().st_size and sha256(source) == sha256(target):
                     state = "verified-derived"
                 elif not source.exists():
@@ -1329,8 +1456,10 @@ class Stowarr:
         torrent_hash: str,
         auxiliary_sources: set[str] | None = None,
         operation_id: int | None = None,
+        verified_derived_paths: set[str] | None = None,
+        progress_callback=None,
     ) -> dict:
-        plan = self.plan(torrent_hash)
+        plan = self.plan(torrent_hash, verified_derived_paths=verified_derived_paths)
         selected_auxiliary = auxiliary_sources or set()
         blocked_sidecars = {"target-conflict", "torrent-name-conflict"}
         allowed_auxiliary = {
@@ -1353,9 +1482,18 @@ class Stowarr:
         created: list[Path] = []
         copied_auxiliary: list[tuple[Path, Path]] = []
         try:
-            for pair in plan.pairs:
+            pair_total = max(len(plan.pairs), 1)
+            for pair_index, pair in enumerate(plan.pairs):
                 source = Path(pair.source_library)
                 target = Path(pair.target_library)
+                def pair_progress(completed, total, label="library media"):
+                    if progress_callback:
+                        progress_callback(
+                            "MOVE_LIBRARY_VERIFYING",
+                            (pair_index + completed / max(total, 1)) / pair_total * 100,
+                            completed_bytes=completed, total_bytes=total, current=source.name,
+                            message=f"Hash-verifying {label}",
+                        )
                 if pair.status in {"linked", "already-on-target", "verified-derived"}:
                     continue
                 if pair.strategy == "verified-copy":
@@ -1364,7 +1502,9 @@ class Stowarr:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     temporary = target.with_name(f".{target.name}.stowarr-copy")
                     shutil.copy2(source, temporary)
-                    if sha256(source) != sha256(temporary):
+                    if sha256(source, progress=lambda done, total: pair_progress(done, total, "derived source")) != sha256(
+                        temporary, progress=lambda done, total: pair_progress(done, total, "derived destination")
+                    ):
                         temporary.unlink(missing_ok=True)
                         raise RuntimeError(f"Derived media copy verification failed: {source}")
                     if target.exists() and sha256(target) != sha256(source):
@@ -1378,7 +1518,9 @@ class Stowarr:
                 torrent_file = Path(pair.torrent_file)
                 if not source.exists() or source.stat().st_size != torrent_file.stat().st_size:
                     raise RuntimeError(f"Source changed or missing: {source}")
-                if sha256(source) != sha256(torrent_file):
+                if sha256(source, progress=lambda done, total: pair_progress(done, total, "current library media")) != sha256(
+                    torrent_file, progress=lambda done, total: pair_progress(done, total, "qBittorrent media")
+                ):
                     raise RuntimeError(f"Hash mismatch: {source} != {torrent_file}")
                 if target.exists():
                     target_stat, torrent_stat = target.stat(), torrent_file.stat()
@@ -1394,6 +1536,10 @@ class Stowarr:
                     target.unlink()
                 os.replace(temporary, target)
                 created.append(target)
+                if progress_callback:
+                    progress_callback("MOVE_LIBRARY_VERIFYING", (pair_index + 1) / pair_total * 100,
+                                      completed_files=pair_index + 1, total_files=len(plan.pairs), current=target.name,
+                                      message="Created verified library file")
             self.store.update(operation_id, state_name("LINKED", "MOVE_LIBRARY_LINKED"), plan.json())
             if selected_auxiliary:
                 for item in plan.auxiliary_files or []:
@@ -1441,7 +1587,11 @@ class Stowarr:
             ]
             self.arr[plan.app].sync_pool(item, str(root), tag, pool_tags)
             self.store.update(operation_id, state_name("ARR_UPDATED", "MOVE_ARR_UPDATED"), plan.json())
+            if progress_callback:
+                progress_callback("MOVE_ARR_RESCANNING", 0, message=f"Waiting for {plan.app.capitalize()} rescan")
             self.arr[plan.app].rescan(int(item["id"]))
+            if progress_callback:
+                progress_callback("MOVE_ARR_RESCANNING", 100, message=f"{plan.app.capitalize()} rescan completed")
             self.store.update(operation_id, state_name("ARR_RESCANNED", "MOVE_ARR_RESCANNED"), plan.json())
             refreshed = self.arr[plan.app].download_mapping(torrent_hash)
             refreshed_files = {record.get("id"): Path(record.get("path", "")) for record in (refreshed or {}).get("files", [])}

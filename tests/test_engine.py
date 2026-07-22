@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from stowarr.archive import ArchiveMember, ExtractedFile
 from stowarr.config import Pool
@@ -10,6 +11,46 @@ from stowarr.engine import MovePlan, Plan, Stowarr, is_archive, sha256, title_ma
 
 
 class EngineTest(unittest.TestCase):
+    def test_recheck_must_be_observed_before_completion(self):
+        states = iter([
+            {"state": "pausedUP", "progress": 1},
+            {"state": "checkingUP", "progress": .35},
+            {"state": "checkingUP", "progress": .82},
+            {"state": "pausedUP", "progress": 1},
+        ])
+        manager = Stowarr.__new__(Stowarr)
+        manager.qbit = SimpleNamespace(torrent=lambda torrent_hash: next(states))
+        progress = []
+
+        with patch("stowarr.engine.time.sleep"):
+            result = manager._wait_for_recheck("hash", lambda torrent, started: progress.append((torrent["state"], started)))
+
+        self.assertEqual(result["state"], "pausedUP")
+        self.assertEqual(progress[0], ("pausedUP", False))
+        self.assertIn(("checkingUP", True), progress)
+
+    def test_verified_unpackerr_derivative_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            torrent_name = "Release"
+            derived = root / f"{torrent_name}_unpackerrred"
+            library = root / "library" / "Movie.mkv"
+            derived.mkdir()
+            library.parent.mkdir()
+            media = derived / "release.mkv"
+            media.write_bytes(b"verified-media")
+            library.write_bytes(b"verified-media")
+            (derived / f"_unpackerrred.{torrent_name}.txt").write_text("complete")
+            manager = Stowarr.__new__(Stowarr)
+            manager.qbit = SimpleNamespace(torrent=lambda torrent_hash: {"save_path": str(root), "name": torrent_name})
+
+            removed = manager._cleanup_verified_unpackerr_derivatives(
+                "hash", [{"target": str(library), "sha256": sha256(library)}]
+            )
+
+            self.assertEqual(removed, [str(derived)])
+            self.assertFalse(derived.exists())
+
     def test_move_requires_a_completed_upload_state_before_success(self):
         self.assertTrue(Stowarr._is_seeding_state({"state": "stalledUP", "progress": 1}))
         self.assertTrue(Stowarr._is_seeding_state({"state": "uploading", "progress": 1}))

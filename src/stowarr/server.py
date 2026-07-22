@@ -272,6 +272,10 @@ def handler(manager: Stowarr):
                 self.send_json(404, {"error": "not found"})
 
         def log_message(self, fmt, *args):
+            request = str(args[0]) if args else ""
+            status = str(args[1]) if len(args) > 1 else ""
+            if status.startswith("2") and (request.startswith("GET /api/operations ") or request.startswith("GET /api/health ")):
+                return
             print(f"stowarr request: {fmt % args}", flush=True)
 
         def log_operation_error(self, operation: str, error: Exception) -> None:

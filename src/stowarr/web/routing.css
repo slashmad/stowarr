@@ -524,6 +524,34 @@
   color: #9a9da2;
 }
 
+.operation-step-title {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.operation-step-title b {
+  color: #b8bdc3;
+  font-variant-numeric: tabular-nums;
+}
+
+.operation-progress {
+  background: #363a3f;
+  height: 4px;
+  overflow: hidden;
+}
+
+.operation-progress i {
+  background: #3b8edb;
+  display: block;
+  height: 100%;
+  transition: width .25s ease;
+}
+
+.operation-steps li.complete .operation-progress i {
+  background: #49a55d;
+}
+
 .operation-dialog > .alert {
   margin: 0 20px 18px;
 }
