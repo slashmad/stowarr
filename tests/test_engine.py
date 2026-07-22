@@ -300,6 +300,59 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(additional[0]["scope"], "library")
             self.assertEqual(additional[0]["target"], str(target_pool.radarr_root / movie.name / subtitle.name))
 
+    def test_reconciliation_plan_keeps_verified_library_mapping_after_qbit_move(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            p1 = Pool(
+                "p1", root / "p1", (root / "p1" / "download",),
+                root / "p1" / "movies", root / "p1" / "series",
+                "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+            )
+            p3 = Pool(
+                "p3", root / "p3", (root / "p3" / "download",),
+                root / "p3" / "movies", root / "p3" / "series",
+                "radarr-p3", "sonarr-p3", "radarr-p3", "sonarr-p3",
+            )
+            release = p1.download_roots[0] / "Release"
+            old_library = p3.radarr_root / "Movie (2020)"
+            release.mkdir(parents=True)
+            old_library.mkdir(parents=True)
+            torrent_media = release / "Movie.mkv"
+            library_media = old_library / "Movie.mkv"
+            torrent_media.write_bytes(b"same media")
+            library_media.write_bytes(b"same media")
+            torrent = {
+                "hash": "abc", "name": "Movie.2020", "category": "radarr-stowarr-moving-abc",
+                "save_path": str(p1.download_roots[0]), "progress": 1, "total_size": torrent_media.stat().st_size,
+            }
+            mapping = {
+                "item": {"id": 42, "title": "Movie", "path": str(old_library), "tags": []},
+                "files": [{
+                    "id": 7, "path": str(library_media), "relativePath": "Movie.mkv",
+                    "size": library_media.stat().st_size, "episodeIds": [],
+                }],
+            }
+            manager = Stowarr.__new__(Stowarr)
+            manager.qbit = SimpleNamespace(
+                torrents=lambda: [torrent],
+                files=lambda torrent_hash: [{
+                    "name": "Release/Movie.mkv", "size": torrent_media.stat().st_size, "priority": 1,
+                }],
+            )
+            manager.arr = {"radarr": SimpleNamespace(download_mapping=lambda torrent_hash: None)}
+            manager.config = SimpleNamespace(
+                pools=(p1, p3), apply=True,
+                pool_for_path=lambda path: p1 if str(path).startswith(str(p1.prefix)) else p3,
+                pool_for_category=lambda category: None,
+            )
+
+            plan = manager.plan("abc", mapping_hint=mapping, app_hint="radarr")
+
+            self.assertEqual(plan.status, "ready")
+            self.assertEqual(plan.item_id, 42)
+            self.assertEqual(plan.pairs[0].torrent_file, str(torrent_media))
+            self.assertEqual(plan.pairs[0].target_library, str(p1.radarr_root / "Movie (2020)" / "Movie.mkv"))
+
     def test_verified_additional_copy_rejects_changed_source(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
