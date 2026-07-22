@@ -118,6 +118,49 @@ nav {
   display: none;
 }
 
+.login-dialog {
+  width: min(430px, calc(100vw - 32px));
+  padding: 28px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 16px 60px #000b;
+}
+
+.login-dialog::backdrop {
+  background: #090b0ddd;
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 22px;
+  letter-spacing: 1px;
+}
+
+.login-brand > span:last-child > span {
+  color: var(--blue);
+  font-weight: 700;
+}
+
+.login-dialog h1 { margin: 26px 0 4px; font-size: 26px; font-weight: 400; }
+.login-dialog > p { margin: 0 0 20px; color: var(--muted); }
+.login-dialog form, .password-form { display: grid; gap: 15px; }
+.login-dialog label, .password-form label { display: grid; gap: 7px; color: var(--muted-strong); font-weight: 600; }
+.login-dialog input, .password-form input { min-height: 40px; padding: 9px 11px; border: 1px solid #555b62; background: var(--panel-inset); color: var(--text); }
+.login-dialog .primary { min-height: 40px; margin-top: 5px; }
+.password-form { grid-template-columns: repeat(3, minmax(0, 1fr)) auto; align-items: end; padding: 18px; }
+.password-form label { margin-bottom: 0; }
+.password-form > .primary { min-height: 40px; }
+.security-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--border); border-bottom: 1px solid var(--border); }
+.security-summary > div { display: flex; flex-direction: column; gap: 6px; padding: 18px; background: var(--panel); }
+.security-summary small { color: var(--muted); text-transform: uppercase; font-size: 11px; font-weight: 700; }
+
+@media (max-width: 900px) {
+  .password-form { grid-template-columns: 1fr; }
+}
+
 main {
   width: calc(100% - 220px);
   margin-left: 220px;

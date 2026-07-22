@@ -4,7 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#15171a">
   <title>Stowarr</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/assets/app.css">
   <link rel="stylesheet" href="/assets/routing.css">
   <link rel="stylesheet" href="/assets/cohesion.css">
@@ -35,6 +37,7 @@
         <div class="nav-heading">System</div>
         <button class="nav-item" data-page="settings"><svg class="icon"><use href="#icon-settings"/></svg>Settings</button>
         <button class="nav-item" data-page="guide"><svg class="icon"><use href="#icon-history"/></svg>Guide</button>
+        <button class="nav-item" id="logout"><svg class="icon"><use href="#icon-move"/></svg>Sign out</button>
       </nav>
       <div class="sidebar-status"><span id="side-dot" class="dot"></span><span><strong id="side-mode">Loading</strong><small>Stowarr service</small></span></div>
     </aside>
@@ -132,6 +135,20 @@
           <div class="panel-head"><div><h2>Discover routing</h2><p>Start with qBittorrent categories and save paths, then match Radarr and Sonarr download clients</p></div><button id="discover-routing" class="primary compact">Discover routes</button></div>
           <div id="discovery-result" class="empty">Run discovery after all required connections are configured</div>
         </article>
+        <article id="password-panel" class="panel form-panel">
+          <div class="panel-head"><div><h2>Administrator password</h2><p>Change the password used to sign in to this WebUI</p></div></div>
+          <form id="password-form" class="password-form">
+            <label>Current password<input name="current-password" type="password" autocomplete="current-password" required></label>
+            <label>New password<input name="new-password" type="password" autocomplete="new-password" minlength="12" required></label>
+            <label>Confirm new password<input name="confirm-password" type="password" autocomplete="new-password" minlength="12" required></label>
+            <button class="primary" type="submit">Change password</button>
+          </form>
+        </article>
+        <article class="panel security-panel">
+          <div class="panel-head"><div><h2>Security</h2><p>WebUI authentication, active sessions, and recent authentication events</p></div><button id="revoke-sessions" class="danger compact">Sign out all sessions</button></div>
+          <div id="security-summary" class="security-summary"></div>
+          <div class="table-wrap"><table><thead><tr><th>Event</th><th>Username</th><th>Client</th><th>Time</th></tr></thead><tbody id="security-events"><tr><td colspan="4" class="empty">Loading security events…</td></tr></tbody></table></div>
+        </article>
         <div id="settings-pools"></div>
       </section>
 
@@ -148,6 +165,17 @@
       </section>
     </main>
   </div>
+  <dialog id="login-dialog" class="login-dialog">
+    <div class="login-brand"><span class="brand-mark"><i></i><i></i><i></i></span><span>STOW<span>ARR</span></span></div>
+    <h1>Sign in</h1>
+    <p>Use the administrator credentials printed in the API container log during first startup.</p>
+    <div id="login-error" class="alert inline-alert hidden"></div>
+    <form id="login-form">
+      <label>Username<input name="username" autocomplete="username" value="admin" required></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password" autofocus required></label>
+      <button class="primary" type="submit">Sign in</button>
+    </form>
+  </dialog>
   <dialog id="connection-setup" class="connection-setup">
     <div class="guide-head"><div><h2>Connect Stowarr</h2><p>Configure the three services required by Stowarr</p></div><button id="close-connection-setup" aria-label="Close connection setup">×</button></div>
     <div id="setup-error" class="alert inline-alert hidden"></div>

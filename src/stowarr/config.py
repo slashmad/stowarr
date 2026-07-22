@@ -46,6 +46,8 @@ class Config:
     port: int
     api_token: str
     api_only: bool
+    auth_method: str
+    external_user_header: str
 
     def pool_for_path(self, path: str | Path) -> Pool | None:
         candidate = Path(path)
@@ -88,6 +90,9 @@ def load_config(path: str | Path | None = None) -> Config:
         )
         for name, value in raw["pools"].items()
     )
+    auth_method = os.getenv("STOWARR_AUTH_METHOD", raw.get("auth_method", "forms")).strip().casefold()
+    if auth_method not in {"forms", "external"}:
+        raise ValueError("STOWARR_AUTH_METHOD must be forms or external")
     return Config(
         pools=pools,
         qbittorrent=_service(raw, "qbittorrent"),
@@ -99,4 +104,6 @@ def load_config(path: str | Path | None = None) -> Config:
         port=int(os.getenv("STOWARR_PORT", raw.get("port", 8787))),
         api_token=os.getenv("STOWARR_API_TOKEN", raw.get("api_token", "")),
         api_only=os.getenv("STOWARR_API_ONLY", str(raw.get("api_only", False))).lower() == "true",
+        auth_method=auth_method,
+        external_user_header=os.getenv("STOWARR_EXTERNAL_USER_HEADER", "X-Forwarded-User").strip(),
     )

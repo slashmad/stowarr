@@ -1,10 +1,12 @@
 FROM python:3.12-slim
 WORKDIR /app
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends 7zip \
+    && apt-get install -y --no-install-recommends 7zip gosu \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml ./
 COPY src ./src
 RUN pip install --no-cache-dir .
-ENTRYPOINT ["stowarr"]
-CMD ["serve"]
+COPY docker/entrypoint.sh /usr/local/bin/stowarr-entrypoint
+RUN chmod 0755 /usr/local/bin/stowarr-entrypoint
+ENTRYPOINT ["stowarr-entrypoint"]
+CMD ["stowarr", "serve"]

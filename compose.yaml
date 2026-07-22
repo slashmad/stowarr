@@ -6,11 +6,17 @@ services:
     restart: unless-stopped
     environment:
       TZ: Europe/Stockholm
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      UMASK: ${UMASK:-002}
       STOWARR_CONFIG: /config/config.json
       STOWARR_APPLY: ${STOWARR_APPLY:-false}
       STOWARR_API_ONLY: "true"
       STOWARR_PORT: "8788"
-      STOWARR_API_TOKEN: ${STOWARR_API_TOKEN:-stowarr-local-api}
+      STOWARR_API_TOKEN: ${STOWARR_API_TOKEN:-}
+      STOWARR_ADMIN_PASSWORD: ${STOWARR_ADMIN_PASSWORD:-}
+      STOWARR_AUTH_METHOD: ${STOWARR_AUTH_METHOD:-forms}
+      STOWARR_EXTERNAL_USER_HEADER: ${STOWARR_EXTERNAL_USER_HEADER:-X-Forwarded-User}
       STOWARR_MEDIA_MOUNT_MODE: ${STOWARR_MEDIA_MOUNT_MODE:-ro}
       RADARR_API_KEY: ${RADARR_API_KEY:-}
       SONARR_API_KEY: ${SONARR_API_KEY:-}
@@ -39,8 +45,6 @@ services:
       dockerfile: Dockerfile.web
     container_name: stowarr-web
     restart: unless-stopped
-    environment:
-      STOWARR_API_TOKEN: ${STOWARR_API_TOKEN:-stowarr-local-api}
     depends_on:
       stowarr-api:
         condition: service_healthy

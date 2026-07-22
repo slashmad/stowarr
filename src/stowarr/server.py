@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hmac
 import json
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from urllib.parse import parse_qs, urlparse
@@ -17,17 +19,19 @@ def handler(manager: Stowarr):
             ".svg": "image/svg+xml",
         }
 
-        def send_bytes(self, status: int, payload: bytes, content_type: str) -> None:
+        def send_bytes(self, status: int, payload: bytes, content_type: str, headers: dict[str, str] | None = None) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-cache")
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(payload)
 
-        def send_json(self, status: int, value) -> None:
+        def send_json(self, status: int, value, headers: dict[str, str] | None = None) -> None:
             payload = json.dumps(value, indent=2).encode()
-            self.send_bytes(status, payload, "application/json")
+            self.send_bytes(status, payload, "application/json", headers)
 
         def send_web(self, name: str) -> None:
             resource = files("stowarr").joinpath("web", name)
@@ -37,12 +41,41 @@ def handler(manager: Stowarr):
             suffix = "." + name.rsplit(".", 1)[-1] if "." in name else ""
             self.send_bytes(200, resource.read_bytes(), self.WEB_TYPES.get(suffix, "application/octet-stream"))
 
+        def session_token(self) -> str:
+            cookie = SimpleCookie(self.headers.get("Cookie", ""))
+            return cookie["stowarr_session"].value if "stowarr_session" in cookie else ""
+
+        def web_request(self) -> bool:
+            return self.headers.get("X-Stowarr-Web-Proxy") == "1"
+
+        def client_identity(self) -> str:
+            return self.headers.get("X-Real-IP") or self.client_address[0]
+
         def authorized(self) -> bool:
+            if self.web_request():
+                if manager.config.auth_method == "external":
+                    return bool(self.headers.get(manager.config.external_user_header, "").strip())
+                return manager.auth.valid_session(self.session_token())
             if not manager.config.api_token:
                 return True
             bearer = self.headers.get("Authorization", "")
-            proxy_token = self.headers.get("X-Stowarr-Proxy-Token", "")
-            return bearer == f"Bearer {manager.config.api_token}" or proxy_token == manager.config.api_token
+            api_key = self.headers.get("X-Api-Key", "")
+            return hmac.compare_digest(bearer, f"Bearer {manager.config.api_token}") or hmac.compare_digest(
+                api_key, manager.config.api_token
+            )
+
+        def csrf_valid(self) -> bool:
+            return not self.web_request() or self.headers.get("X-Stowarr-CSRF") == "1"
+
+        def session_cookie(self, token: str, expired: bool = False) -> str:
+            parts = [f"stowarr_session={token}", "Path=/", "HttpOnly", "SameSite=Strict"]
+            if expired:
+                parts.extend(("Max-Age=0", "Expires=Thu, 01 Jan 1970 00:00:00 GMT"))
+            else:
+                parts.append(f"Max-Age={manager.auth.SESSION_SECONDS}")
+            if self.headers.get("X-Forwarded-Proto") == "https":
+                parts.append("Secure")
+            return "; ".join(parts)
 
         def read_json(self) -> dict:
             length = int(self.headers.get("Content-Length", "0"))
@@ -57,11 +90,23 @@ def handler(manager: Stowarr):
             if manager.config.api_only and not path.startswith("/api/"):
                 self.send_json(404, {"error": "API service"})
                 return
-            if path.startswith("/api/") and path != "/api/health" and not self.authorized():
-                self.send_json(401, {"error": "Valid API bearer token required"})
+            public = {"/api/health", "/api/auth/status"}
+            if path.startswith("/api/") and path not in public and not self.authorized():
+                self.send_json(401, {"error": "Authentication required"})
                 return
             if path == "/api/health":
                 self.send_json(200, {"status": "ok" if manager.connections_ready else "setup-required", "apply": manager.config.apply})
+            elif path == "/api/auth/status":
+                external_user = self.headers.get(manager.config.external_user_header, "").strip()
+                self.send_json(200, {
+                    "authenticated": self.authorized(),
+                    "username": external_user if manager.config.auth_method == "external" else ("admin" if self.authorized() else None),
+                    "method": manager.config.auth_method,
+                })
+            elif path == "/api/auth/sessions":
+                self.send_json(200, {"sessions": manager.auth.session_summary(self.session_token())})
+            elif path == "/api/security/events":
+                self.send_json(200, {"events": manager.store.recent_security_events()})
             elif path == "/api/config":
                 self.send_json(200, {
                     "apply": manager.config.apply,
@@ -123,10 +168,47 @@ def handler(manager: Stowarr):
         def do_POST(self):
             parsed = urlparse(self.path)
             path = parsed.path
-            if not self.authorized():
-                self.send_json(401, {"error": "Valid API bearer token required"})
+            if path == "/api/auth/login":
+                if manager.config.auth_method != "forms":
+                    self.send_json(409, {"error": "Form login is disabled while external authentication is active"})
+                    return
+                try:
+                    body = self.read_json()
+                    token = manager.auth.authenticate(
+                        str(body.get("username", "")), str(body.get("password", "")),
+                        self.client_identity(),
+                    )
+                    self.send_json(200, {"authenticated": True, "username": "admin"}, {
+                        "Set-Cookie": self.session_cookie(token),
+                    })
+                except PermissionError as error:
+                    self.send_json(401, {"error": str(error)})
+                except Exception as error:
+                    self.send_json(400, {"error": str(error)})
                 return
-            if path == "/api/settings/connections":
+            if not self.authorized():
+                manager.store.security_event("request-denied", "", self.client_identity(), {"method": "POST", "path": path})
+                self.send_json(401, {"error": "Authentication required"})
+                return
+            if not self.csrf_valid():
+                self.send_json(403, {"error": "Valid CSRF header required"})
+                return
+            if path == "/api/auth/logout":
+                manager.auth.logout(self.session_token(), self.client_identity())
+                self.send_json(200, {"authenticated": False}, {"Set-Cookie": self.session_cookie("", expired=True)})
+            elif path == "/api/auth/sessions/revoke":
+                manager.auth.revoke_sessions(self.client_identity())
+                self.send_json(200, {"revoked": True}, {"Set-Cookie": self.session_cookie("", expired=True)})
+            elif path == "/api/auth/password":
+                try:
+                    body = self.read_json()
+                    manager.auth.change_password(str(body.get("currentPassword", "")), str(body.get("newPassword", "")))
+                    self.send_json(200, {"changed": True}, {"Set-Cookie": self.session_cookie("", expired=True)})
+                except PermissionError as error:
+                    self.send_json(403, {"error": str(error)})
+                except Exception as error:
+                    self.send_json(400, {"error": str(error)})
+            elif path == "/api/settings/connections":
                 try:
                     self.send_json(200, manager.update_connections(self.read_json()))
                 except Exception as error:
@@ -191,7 +273,24 @@ def handler(manager: Stowarr):
     return Handler
 
 
+def print_startup_credentials(manager: Stowarr) -> None:
+    if manager.auth.generated_password and manager.config.auth_method == "forms":
+        print("=" * 72, flush=True)
+        print("Stowarr WebUI administrator account created", flush=True)
+        print("Username: admin", flush=True)
+        print(f"Password: {manager.auth.generated_password}", flush=True)
+        print("Save this password now. It will not be displayed again.", flush=True)
+        print("=" * 72, flush=True)
+    if manager.generated_api_token:
+        print("=" * 72, flush=True)
+        print("Stowarr API key created", flush=True)
+        print(f"API key: {manager.generated_api_token}", flush=True)
+        print("Save this API key now. It will not be displayed again.", flush=True)
+        print("=" * 72, flush=True)
+
+
 def serve(manager: Stowarr) -> None:
     server = ThreadingHTTPServer((manager.config.listen, manager.config.port), handler(manager))
+    print_startup_credentials(manager)
     print(f"stowarr listening on {manager.config.listen}:{manager.config.port}; apply={manager.config.apply}")
     server.serve_forever()

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .clients import ArrClient, QBittorrentClient
 from .archive import ArchiveExtractor, is_archive_path, select_archive_entries
+from .auth import AuthManager
 from .config import Config, Pool, Service
 from .store import Store
 
@@ -144,6 +145,16 @@ def is_archive(path: Path) -> bool:
 class Stowarr:
     def __init__(self, config: Config):
         self.store = Store(config.database)
+        self.auth = AuthManager(self.store)
+        self.generated_api_token = None
+        saved_api_auth = self.store.setting("api_auth") or {}
+        if not config.api_token:
+            api_token = str(saved_api_auth.get("token", ""))
+            if not api_token:
+                api_token = secrets.token_urlsafe(32)
+                self.store.set_setting("api_auth", {"token": api_token})
+                self.generated_api_token = api_token
+            config = replace(config, api_token=api_token)
         runtime = self.store.setting("runtime")
         if runtime and isinstance(runtime.get("apply"), bool):
             config = replace(config, apply=runtime["apply"])
@@ -295,9 +306,17 @@ class Stowarr:
                 "listen": self.config.listen,
                 "port": self.config.port,
                 "api_only": self.config.api_only,
+                "auth_method": self.config.auth_method,
+                "external_user_header": self.config.external_user_header,
                 "api_token_set": bool(self.config.api_token),
                 "media_mount_mode": os.getenv("STOWARR_MEDIA_MOUNT_MODE", "unknown"),
                 "timezone": os.getenv("TZ", "UTC"),
+                "configured_puid": os.getenv("PUID", "not set"),
+                "configured_pgid": os.getenv("PGID", "not set"),
+                "process_uid": os.getuid(),
+                "process_gid": os.getgid(),
+                "umask": os.getenv("UMASK", "not set"),
+                "running_as_root": os.getuid() == 0,
                 "pool_mounts": [
                     {
                         "name": pool.name,
