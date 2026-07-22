@@ -1333,6 +1333,35 @@
   padding: 10px 12px;
 }
 
+.torrent-membership-column {
+  width: 155px;
+  min-width: 155px;
+  max-width: 155px;
+  border-right: 1px solid #474b50;
+  text-align: center;
+}
+
+th.torrent-membership-column {
+  background: #202327;
+  color: #d7dadd;
+}
+
+td.torrent-membership-yes {
+  background: #20352a;
+}
+
+td.torrent-membership-no {
+  background: #392526;
+}
+
+tbody tr:hover td.torrent-membership-yes {
+  background: #284232;
+}
+
+tbody tr:hover td.torrent-membership-no {
+  background: #472d2f;
+}
+
 @media (max-width: 850px) {
   .aux-row {
     grid-template-columns: 1fr;
