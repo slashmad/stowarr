@@ -237,19 +237,28 @@ Move uses a complete, confirmation-bound manifest:
 
 1. qBittorrent-owned files are identified from the torrent manifest.
 2. Radarr/Sonarr-managed library files are resolved from download history.
-3. Untracked files below the torrent content directory and additional files in
+3. For direct media, Stowarr proves that every current *Arr-managed file is the
+   selected torrent release by hardlink identity or SHA-256. The torrent
+   infohash proves historical item ownership but is not treated as proof that
+   the item's current media file is still the same release. A replaced release
+   blocks Move before qBittorrent or the filesystem is changed.
+4. Untracked files below the torrent content directory and additional files in
    the current library directory are inventoried and hashed.
-4. Every additional file must be assigned either **Move and verify** or
+5. Every additional file must be assigned either **Move and verify** or
    **Delete after verification** in the WebUI.
-5. qBittorrent is paused, relocates its tracked data, and completes a recheck.
-6. Archive-derived media is regenerated in isolated staging when required. Each
+6. qBittorrent is paused, relocates its tracked data, and completes a recheck.
+7. Archive-derived media is regenerated in isolated staging when required. Each
    output must uniquely match the current *Arr-managed file by size and SHA-256.
-7. Additional files selected for Move are copied and hash-verified.
-8. Stowarr rebuilds the library, updates Radarr/Sonarr, waits for a successful
+8. Additional files selected for Move are copied and hash-verified.
+9. Stowarr rebuilds the library, updates Radarr/Sonarr, waits for a successful
    rescan command, confirms the managed paths, and verifies selected sidecars.
-9. Files selected for Delete and verified old sources are removed.
-10. Empty old content and library directories are removed last. An unexpected
+10. Files selected for Delete and verified old sources are removed.
+11. Empty old content and library directories are removed last. An unexpected
    remaining file fails the operation instead of being deleted recursively.
+
+Torrents seeded directly from a configured movie or series library are listed
+separately as **Library-seeded**. They are not assumed to be malformed downloads
+and are never silently reassigned to a download category.
 
 The Move confirmation fingerprint includes the destination pool, full plan,
 and every additional-file action. A stale or altered plan cannot reuse an old
@@ -336,6 +345,8 @@ torrent manifest.
 | Scenario | Destination operation | Verification |
 | --- | --- | --- |
 | Direct torrent media | Hardlink from qBittorrent data | Source, torrent, and existing target hashes must agree |
+| Current *Arr file replaced by another release | Block before mutation | Import the intended torrent release or select the torrent matching the current file, then recheck identity |
+| Torrent seeded directly from a library | Classify as Library-seeded | Preserve its path until an explicit, verified migration is requested |
 | Torrent sidecar | Hardlink from qBittorrent data | Existing targets must be identical |
 | Library or plugin sidecar | Optional verified copy | Source and temporary destination hashes must agree |
 | Packed media already on the authoritative pool | Keep imported media | Validate qBittorrent and *Arr paths |

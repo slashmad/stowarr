@@ -73,6 +73,49 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(source.stat().st_nlink, 2)
             self.assertEqual(sha256(source), sha256(library))
 
+    def test_release_identity_accepts_exact_hardlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download = root / "download"
+            library = root / "movies" / "Movie"
+            (download / "Release").mkdir(parents=True)
+            library.mkdir(parents=True)
+            torrent_file = download / "Release" / "Movie.mkv"
+            arr_file = library / "Movie.mkv"
+            torrent_file.write_bytes(b"same release")
+            os.link(torrent_file, arr_file)
+
+            result = Stowarr._release_identity(
+                {"save_path": str(download)},
+                [{"name": "Release/Movie.mkv", "size": torrent_file.stat().st_size, "priority": 1}],
+                {"files": [{"id": 7, "path": str(arr_file), "size": arr_file.stat().st_size}]},
+            )
+
+            self.assertTrue(result["verified"])
+            self.assertEqual(result["files"][0]["method"], "hardlink")
+
+    def test_release_identity_blocks_replaced_arr_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download = root / "download"
+            library = root / "movies" / "Movie"
+            (download / "Release-A").mkdir(parents=True)
+            library.mkdir(parents=True)
+            torrent_file = download / "Release-A" / "Movie.mkv"
+            arr_file = library / "Release-B.mkv"
+            torrent_file.write_bytes(b"release-a")
+            arr_file.write_bytes(b"release-b")
+
+            result = Stowarr._release_identity(
+                {"save_path": str(download)},
+                [{"name": "Release-A/Movie.mkv", "size": torrent_file.stat().st_size, "priority": 1}],
+                {"files": [{"id": 8, "path": str(arr_file), "size": arr_file.stat().st_size}]},
+            )
+
+            self.assertFalse(result["verified"])
+            self.assertEqual(result["status"], "release-mismatch")
+            self.assertEqual(result["files"][0]["matching_count"], 0)
+
     def test_plan_exposes_structured_error_details(self):
         plan = Plan(
             "hash", "torrent", "radarr", "p1", 118, "The Shawshank Redemption",
@@ -110,6 +153,20 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(is_archive(Path("movie.001")))
         self.assertTrue(is_archive(Path("movie.7z")))
         self.assertFalse(is_archive(Path("movie.mkv")))
+
+    def test_subtitle_inventory_distinguishes_subfolders_and_archives(self):
+        torrent = {"save_path": "/downloads", "content_path": "/downloads/Release"}
+        files = [
+            {"name": "Release/Movie.en.srt", "priority": 1},
+            {"name": "Release/Subs/Movie.sv.srt", "priority": 1},
+            {"name": "Release/Subs/skipped.srt", "priority": 0},
+        ]
+        archive_members = [(Path("/downloads/Release/release.rar"), ArchiveMember("Subs/Movie.fi.srt", 42))]
+
+        subtitles = Stowarr._subtitle_inventory(torrent, files, archive_members)
+
+        self.assertEqual([item["location"] for item in subtitles], ["torrent", "subfolder", "archive"])
+        self.assertEqual(subtitles[-1]["archive"], "/downloads/Release/release.rar")
 
     def test_archive_extraction_publishes_only_exact_managed_match(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -169,6 +226,15 @@ class EngineTest(unittest.TestCase):
         )
         result = Stowarr._target_download_path(current, target, Path("/media/p3/download/manual"))
         self.assertEqual(result, Path("/media/p1/download/manual"))
+
+    def test_destination_library_folder_is_not_treated_as_stale_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "Movie"
+            destination.mkdir()
+            (destination / "Movie.mkv").write_bytes(b"media")
+
+            self.assertFalse(Stowarr._old_library_folder_remaining(destination, destination))
+            self.assertTrue(Stowarr._old_library_folder_remaining(destination, destination.parent / "Other"))
 
     def test_move_inventory_separates_tracked_and_additional_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -249,6 +315,7 @@ class EngineTest(unittest.TestCase):
             {"hash": "A", "name": "Movie", "category": "radarr-p1", "save_path": "/p1/download", "progress": 1},
             {"hash": "B", "name": "Series", "save_path": "/p3/download/tv", "progress": 1},
             {"hash": "C", "name": "Legacy", "save_path": "/other", "progress": 1},
+            {"hash": "D", "name": "Manual season", "save_path": "/p3/series/Show/Season 01", "progress": 1},
         ])
         manager.config = SimpleNamespace(
             pools=(p1, p3),
@@ -257,12 +324,15 @@ class EngineTest(unittest.TestCase):
 
         result = manager.qbit_catalog()
 
-        self.assertEqual(result["total"], 3)
+        self.assertEqual(result["total"], 4)
         self.assertEqual(result["routes"][0]["count"], 1)
         self.assertEqual(result["routes"][0]["paths"][0]["torrents"][0]["route_status"], "aligned")
         self.assertEqual([group["pool"] for group in result["unmanaged"]], ["p3", None])
         self.assertEqual(result["unmanaged"][0]["paths"][0]["path"], "/p3/download/tv")
         self.assertEqual(result["unmanaged"][0]["paths"][0]["route"], "download")
+        self.assertEqual(result["library_seeded"][0]["app"], "sonarr")
+        self.assertEqual(result["library_seeded"][0]["paths"][0]["route"], "library")
+        self.assertEqual(result["library_seeded"][0]["paths"][0]["torrents"][0]["route_status"], "library-seeded")
 
     def test_routing_audit_distinguishes_category_route_from_tag_restriction(self):
         pool = SimpleNamespace(

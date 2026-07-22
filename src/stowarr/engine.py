@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from .clients import ArrClient, QBittorrentClient
-from .archive import ArchiveExtractor, is_archive_path, select_archive_entries
+from .archive import ArchiveExtractor, ArchiveMember, is_archive_path, select_archive_entries
 from .auth import AuthManager
 from .config import Config, Pool, Service
 from .store import Store
@@ -114,6 +114,12 @@ class MovePlan:
     extraction_required: bool = False
     extraction_space: int = 0
     extraction_files: list[dict] | None = None
+    archive_verified: bool = False
+    archive_entries: list[dict] | None = None
+    subtitle_files: list[dict] | None = None
+    release_identity: dict | None = None
+    error_code: str | None = None
+    error_details: dict | None = None
 
     def json(self) -> dict:
         return asdict(self)
@@ -531,6 +537,133 @@ class Stowarr:
         additional.sort(key=lambda item: (item["scope"], item["source"].casefold()))
         return tracked, additional
 
+    def _archive_paths(self, torrent_hash: str) -> list[Path]:
+        torrent = self.qbit.torrent(torrent_hash)
+        if not torrent:
+            raise RuntimeError("Torrent disappeared before archive verification")
+        save_path = Path(torrent["save_path"])
+        return [
+            save_path / record["name"] for record in self.qbit.files(torrent_hash)
+            if int(record.get("priority", 1)) > 0 and is_archive(Path(record.get("name", "")))
+        ]
+
+    def _verify_archive_sets(self, torrent_hash: str, progress=None) -> list[dict]:
+        entries = select_archive_entries(self._archive_paths(torrent_hash))
+        verified: list[dict] = []
+        for index, entry in enumerate(entries):
+            if progress:
+                progress(index / len(entries) * 100, entry, index + 1, len(entries))
+            self.archive_extractor.test(entry)
+            members = self.archive_extractor.members(entry)
+            verified.append({"path": str(entry), "members": len(members)})
+            if progress:
+                progress((index + 1) / len(entries) * 100, entry, index + 1, len(entries))
+        return verified
+
+    @classmethod
+    def _subtitle_inventory(
+        cls, torrent: dict, torrent_files: list[dict], archive_members: list[tuple[Path, ArchiveMember]],
+    ) -> list[dict]:
+        content_root = cls._torrent_content_root(torrent, torrent_files)
+        content_prefix = None
+        if content_root:
+            try:
+                content_prefix = content_root.relative_to(Path(torrent["save_path"]))
+            except ValueError:
+                pass
+        subtitles: list[dict] = []
+        for record in torrent_files:
+            relative = Path(record.get("name", ""))
+            if int(record.get("priority", 1)) <= 0 or relative.suffix.casefold() not in SUBTITLE_EXTENSIONS:
+                continue
+            inside = relative
+            if content_prefix:
+                try:
+                    inside = relative.relative_to(content_prefix)
+                except ValueError:
+                    pass
+            subtitles.append({
+                "location": "subfolder" if len(inside.parts) > 1 else "torrent",
+                "path": str(relative), "archive": None,
+            })
+        for entry, member in archive_members:
+            if Path(member.relative_path).suffix.casefold() in SUBTITLE_EXTENSIONS:
+                subtitles.append({
+                    "location": "archive", "path": member.relative_path, "archive": str(entry),
+                })
+        return subtitles
+
+    @staticmethod
+    def _release_identity(torrent: dict, torrent_files: list[dict], mapping: dict | None) -> dict:
+        """Prove that the current *Arr files belong to the selected torrent.
+
+        The torrent info hash proves the historical *Arr item association, but the
+        item may now contain a different release. Direct media therefore requires
+        inode or content-hash equality before a Move transaction may begin.
+        """
+        managed = list((mapping or {}).get("files") or [])
+        if not managed:
+            return {
+                "status": "unresolved",
+                "verified": False,
+                "reason": "The selected torrent has no current managed *Arr media files",
+                "files": [],
+            }
+        save_path = Path(str(torrent.get("save_path") or ""))
+        candidates = [
+            (save_path / str(record.get("name") or ""), int(record.get("size", 0)))
+            for record in torrent_files
+            if int(record.get("priority", 1)) > 0
+            and Path(str(record.get("name") or "")).suffix.casefold() in VIDEO_EXTENSIONS
+        ]
+        results = []
+        verified = True
+        for record in managed:
+            library = Path(str(record.get("path") or ""))
+            size = int(record.get("size", 0))
+            same_size = [path for path, candidate_size in candidates if candidate_size == size]
+            matches = []
+            method = None
+            if library.exists():
+                library_stat = library.stat()
+                library_hash = None
+                for candidate in same_size:
+                    if not candidate.exists():
+                        continue
+                    candidate_stat = candidate.stat()
+                    if (library_stat.st_dev, library_stat.st_ino) == (candidate_stat.st_dev, candidate_stat.st_ino):
+                        matches.append(candidate)
+                        method = "hardlink"
+                    else:
+                        library_hash = library_hash or sha256(library)
+                        candidate_matches = library_hash == sha256(candidate)
+                        if not candidate_matches:
+                            continue
+                        matches.append(candidate)
+                        method = "sha256"
+            status = "verified" if len(matches) == 1 else "mismatch" if library.exists() else "missing-library"
+            if status != "verified":
+                verified = False
+            results.append({
+                "arr_file": str(library),
+                "arr_file_id": record.get("id"),
+                "size": size,
+                "status": status,
+                "method": method,
+                "torrent_file": str(matches[0]) if len(matches) == 1 else None,
+                "candidate_count": len(same_size),
+                "matching_count": len(matches),
+            })
+        return {
+            "status": "verified" if verified else "release-mismatch",
+            "verified": verified,
+            "reason": "" if verified else (
+                "The current *Arr media file is not identical to the selected torrent. "
+                "Another release may have replaced it after this torrent was imported."
+            ),
+            "files": results,
+        }
+
     def move_plan(self, torrent_hash: str, target_pool_name: str) -> MovePlan:
         torrent = self.qbit.torrent(torrent_hash)
         target_pool = next((pool for pool in self.config.pools if pool.name == target_pool_name), None)
@@ -540,12 +673,22 @@ class Stowarr:
             return MovePlan(torrent_hash, torrent.get("name", ""), "unknown", None, target_pool_name, torrent.get("save_path", ""), None, None, None, None, [], int(torrent.get("total_size", 0)), None, "blocked", "Target pool is not configured")
         current_pool = self.config.pool_for_path(torrent.get("save_path", ""))
         category_match = self.config.pool_for_category(torrent.get("category", ""))
-        app = category_match[1] if category_match else ("sonarr" if "sonarr" in torrent.get("category", "").casefold() else "radarr")
+        save_path = Path(str(torrent.get("save_path") or ""))
+        library_app = None
+        if current_pool:
+            if save_path == current_pool.radarr_root or save_path.is_relative_to(current_pool.radarr_root):
+                library_app = "radarr"
+            elif save_path == current_pool.sonarr_root or save_path.is_relative_to(current_pool.sonarr_root):
+                library_app = "sonarr"
+        app = category_match[1] if category_match else library_app or (
+            "sonarr" if "sonarr" in torrent.get("category", "").casefold() else "radarr"
+        )
         mapping = self.arr[app].download_mapping(torrent_hash)
         torrent_files = self.qbit.files(torrent_hash)
         archive_count = sum(is_archive(Path(record.get("name", ""))) for record in torrent_files if int(record.get("priority", 1)) > 0)
         video_count = sum(Path(record.get("name", "")).suffix.casefold() in VIDEO_EXTENSIONS for record in torrent_files if int(record.get("priority", 1)) > 0)
         content_mode = "mixed" if archive_count and video_count else "archive" if archive_count else "direct" if video_count else "unknown"
+        release_identity = self._release_identity(torrent, torrent_files, mapping)
         target_category = target_pool.radarr_category if app == "radarr" else target_pool.sonarr_category
         if not current_pool:
             return MovePlan(torrent_hash, torrent["name"], app, None, target_pool.name, torrent.get("save_path", ""), None, target_category, None, None, [], int(torrent.get("total_size", 0)), None, "blocked", "Current qBittorrent save path is outside configured pools")
@@ -554,12 +697,46 @@ class Stowarr:
         size = int(torrent.get("total_size", 0))
         reason = ""
         status = "ready"
+        error_code = None
+        error_details = None
         if current_pool.name == target_pool.name:
             status, reason = "blocked", "Torrent is already on the selected pool"
         elif not mapping:
-            status, reason = "blocked", "No unique Radarr/Sonarr mapping was found for this torrent"
+            if library_app:
+                status, reason = "blocked", (
+                    f"This torrent is seeded directly from the {library_app.capitalize()} library, "
+                    "but its info hash has no unique *Arr history association"
+                )
+                error_code = "LIBRARY_SEEDED_MAPPING_REQUIRED"
+                error_details = {
+                    "torrent_hash": torrent_hash,
+                    "torrent_name": torrent.get("name", ""),
+                    "save_path": torrent.get("save_path", ""),
+                    "action": (
+                        f"Keep the torrent in place or manually import/associate its media in "
+                        f"{library_app.capitalize()}. Then recheck the Move plan. Stowarr will not "
+                        "infer ownership from a similar title or folder name."
+                    ),
+                }
+            else:
+                status, reason = "blocked", "No unique Radarr/Sonarr mapping was found for this torrent"
         elif app == "sonarr" and not mapping.get("mappingComplete"):
             status, reason = "blocked", "Sonarr episode-to-file mapping is incomplete"
+        elif content_mode == "direct" and not release_identity["verified"]:
+            status, reason = "blocked", release_identity["reason"]
+            error_code = "ARR_CURRENT_RELEASE_MISMATCH"
+            error_details = {
+                "torrent_hash": torrent_hash,
+                "torrent_name": torrent.get("name", ""),
+                "arr_item_id": (mapping or {}).get("item", {}).get("id"),
+                "arr_item_title": (mapping or {}).get("item", {}).get("title"),
+                "files": release_identity["files"],
+                "action": (
+                    f"In {app.capitalize()}, import the selected qBittorrent release as the current media "
+                    "file or select the torrent that matches the current library release. Then recheck "
+                    "release identity in Stowarr."
+                ),
+            }
         elif content_mode == "unknown":
             status, reason = "blocked", "Torrent contains no supported video or archive content"
         elif archive_count and not self.archive_extractor.available():
@@ -583,6 +760,23 @@ class Stowarr:
                 if not direct_match:
                     extraction_files.append(record)
         extraction_space = sum(int(record.get("size", 0)) for record in extraction_files)
+        archive_entries: list[dict] = []
+        archive_verified = False
+        archive_members: list[tuple[Path, ArchiveMember]] = []
+        if status == "ready" and extraction_files:
+            try:
+                entries = select_archive_entries([
+                    Path(torrent["save_path"]) / record["name"] for record in torrent_files
+                    if int(record.get("priority", 1)) > 0 and is_archive(Path(record.get("name", "")))
+                ])
+                for entry in entries:
+                    self.archive_extractor.test(entry)
+                    members = self.archive_extractor.members(entry)
+                    archive_entries.append({"path": str(entry), "members": len(members)})
+                    archive_members.extend((entry, member) for member in members)
+                archive_verified = True
+            except Exception as error:
+                status, reason = "blocked", f"Archive integrity verification failed: {error}"
         required_space = size + extraction_space
         if status == "ready" and free_space is not None and required_space > free_space:
             status, reason = "blocked", "Target pool does not have enough free space"
@@ -596,6 +790,8 @@ class Stowarr:
             for record in mapping.get("files", []):
                 managed_files.append({**record, "targetPath": str(target_item / record["relativePath"])})
             tracked_files, additional_files = self._move_inventory(torrent, torrent_files, mapping, target_pool, target_save, app)
+        content_root = self._torrent_content_root(torrent, torrent_files)
+        subtitle_files = self._subtitle_inventory(torrent, torrent_files, archive_members)
         return MovePlan(
             torrent_hash=torrent_hash,
             torrent_name=torrent.get("name", ""),
@@ -618,10 +814,16 @@ class Stowarr:
             target_item_path=str(target_item) if target_item else None,
             tracked_files=tracked_files,
             additional_files=additional_files,
-            current_content_root=str(self._torrent_content_root(torrent, torrent_files) or "") or None,
+            current_content_root=str(content_root or "") or None,
             extraction_required=bool(extraction_files),
             extraction_space=extraction_space,
             extraction_files=extraction_files,
+            archive_verified=archive_verified,
+            archive_entries=archive_entries,
+            subtitle_files=subtitle_files,
+            release_identity=release_identity,
+            error_code=error_code,
+            error_details=error_details,
         )
 
     def _wait_for_torrent(self, torrent_hash: str, predicate, timeout: int = 1800, progress=None) -> dict:
@@ -698,6 +900,11 @@ class Stowarr:
                 directory.rmdir()
         if root.exists() and not any(root.iterdir()):
             root.rmdir()
+
+    @staticmethod
+    def _old_library_folder_remaining(current: Path | None, target: Path | None) -> bool:
+        """Return true only when a distinct source library folder still exists."""
+        return bool(current and target and current != target and current.exists())
 
     @staticmethod
     def _copy_verified(source: Path, target: Path, expected_hash: str) -> None:
@@ -925,6 +1132,16 @@ class Stowarr:
             self._wait_for_visible_torrent_files(torrent_hash)
             report("MOVE_QBIT_COMPLETE", 100, message="Every selected qBittorrent file is visible at the destination")
             if plan.extraction_required:
+                report("MOVE_ARCHIVE_VERIFYING", 0, message="Testing archive integrity at the destination")
+                self._verify_archive_sets(
+                    torrent_hash,
+                    lambda percent, entry, current, total: report(
+                        "MOVE_ARCHIVE_VERIFYING", percent, current=entry.name,
+                        completed_files=current, total_files=total,
+                        message=f"Testing archive set {current} of {total}",
+                    ),
+                )
+                report("MOVE_ARCHIVE_VERIFIED", 100, message="Every required archive set passed integrity verification")
                 report("MOVE_EXTRACTING", 0, message="Inspecting archive manifests")
                 extracted = self._extract_managed_media(torrent_hash, plan, lambda value: report("MOVE_EXTRACTING", **value))
                 report("MOVE_EXTRACTED", 100, message="Archive media extracted and hash-verified")
@@ -971,12 +1188,14 @@ class Stowarr:
                     if not target.exists() or sha256(source) != sha256(target):
                         raise RuntimeError(f"Final additional file verification failed: {source}")
                     source.unlink()
-            self._remove_empty_tree(Path(plan.current_item_path) if plan.current_item_path else None)
+            old_item = Path(plan.current_item_path) if plan.current_item_path else None
+            target_item = Path(plan.target_item_path) if plan.target_item_path else None
+            if old_item != target_item:
+                self._remove_empty_tree(old_item)
             content_root = Path(plan.current_content_root) if plan.current_content_root else None
             if content_root and content_root != Path(plan.current_save_path):
                 self._remove_empty_tree(content_root)
-            old_item = Path(plan.current_item_path) if plan.current_item_path else None
-            if old_item and old_item.exists():
+            if self._old_library_folder_remaining(old_item, target_item):
                 raise RuntimeError(f"Old library folder still contains unclassified files: {old_item}")
             self.qbit.set_category(torrent_hash, plan.target_category or "")
             self.store.update(operation_id, "MOVE_ROUTE_COMMITTED", detail)
@@ -1014,7 +1233,15 @@ class Stowarr:
         category_match = self.config.pool_for_category(torrent.get("category", ""))
         if not pool:
             return Plan(torrent_hash, torrent["name"], "unknown", "", None, None, None, None, [], "blocked", "Save path is outside configured pools")
-        app = category_match[1] if category_match else ("sonarr" if torrent.get("category", "").startswith("sonarr") else "radarr")
+        save_path = Path(str(torrent.get("save_path") or ""))
+        library_app = None
+        if save_path == pool.radarr_root or save_path.is_relative_to(pool.radarr_root):
+            library_app = "radarr"
+        elif save_path == pool.sonarr_root or save_path.is_relative_to(pool.sonarr_root):
+            library_app = "sonarr"
+        app = category_match[1] if category_match else library_app or (
+            "sonarr" if torrent.get("category", "").startswith("sonarr") else "radarr"
+        )
         mapping = self.arr[app].download_mapping(torrent_hash)
         if not mapping:
             return Plan(torrent_hash, torrent["name"], app, pool.name, None, None, None, None, [], "blocked", "No matching *Arr history item")
@@ -1284,6 +1511,7 @@ class Stowarr:
             for pool in self.config.pools
         }
         groups["outside"] = {"pool": None, "prefix": None, "download_roots": (), "paths": {}}
+        library_groups: dict[tuple[str, str], dict] = {}
         total = 0
         for torrent in self.qbit.torrents():
             total += 1
@@ -1304,6 +1532,24 @@ class Stowarr:
                 row["route_status"] = "aligned" if pool and pool.name == route["pool"] else "path-mismatch"
                 route["paths"].setdefault(save_path or "<empty save path>", []).append(row)
             else:
+                library_app = None
+                if pool:
+                    candidate = Path(save_path)
+                    if candidate == pool.radarr_root or candidate.is_relative_to(pool.radarr_root):
+                        library_app = "radarr"
+                    elif candidate == pool.sonarr_root or candidate.is_relative_to(pool.sonarr_root):
+                        library_app = "sonarr"
+                if library_app:
+                    row["route_status"] = "library-seeded"
+                    row["library_app"] = library_app
+                    key = (library_app, pool.name)
+                    group = library_groups.setdefault(key, {
+                        "app": library_app, "pool": pool.name, "root": str(
+                            pool.radarr_root if library_app == "radarr" else pool.sonarr_root
+                        ), "paths": {},
+                    })
+                    group["paths"].setdefault(save_path or "<empty save path>", []).append(row)
+                    continue
                 key = pool.name if pool else "outside"
                 row["route_status"] = "unmanaged"
                 groups[key]["paths"].setdefault(save_path or "<empty save path>", []).append(row)
@@ -1325,7 +1571,15 @@ class Stowarr:
             group_total = sum(path["count"] for path in paths)
             if group_total:
                 result.append({"pool": group["pool"], "prefix": group["prefix"], "count": group_total, "paths": paths})
-        return {"total": total, "routes": route_result, "unmanaged": result}
+        library_result = []
+        for group in library_groups.values():
+            paths = [
+                {"path": path, "route": "library", "count": len(rows), "torrents": sorted(rows, key=lambda row: row["name"].casefold())}
+                for path, rows in sorted(group["paths"].items())
+            ]
+            library_result.append({**group, "count": sum(path["count"] for path in paths), "paths": paths})
+        library_result.sort(key=lambda group: (group["app"], group["pool"]))
+        return {"total": total, "routes": route_result, "library_seeded": library_result, "unmanaged": result}
 
     @staticmethod
     def _client_field(client: dict, name: str):
