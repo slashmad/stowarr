@@ -201,12 +201,16 @@
     <div class="confirm-actions"><button id="confirm-cancel" class="secondary" type="button">Cancel</button><button id="confirm-accept" class="primary" type="button">Confirm</button></div>
   </dialog>
   <dialog id="operation-dialog" class="operation-dialog">
-    <div class="guide-head"><div><h2 id="operation-title">Move in progress</h2><p id="operation-summary">Waiting for the operation to start</p></div><button id="operation-close" aria-label="Close operation details" disabled>×</button></div>
+    <div class="guide-head"><div><h2 id="operation-title">Move in progress</h2><p id="operation-summary">Waiting for the operation to start</p></div><button id="operation-close" aria-label="Hide operation details">×</button></div>
     <div id="operation-steps" class="operation-steps"></div>
     <div id="operation-error" class="alert inline-alert hidden"></div>
-    <details id="operation-log-panel" class="operation-log-panel hidden" open><summary>Execution log <span id="operation-log-count"></span></summary><ol id="operation-log" class="operation-log"></ol></details>
+    <details id="operation-log-panel" class="operation-log-panel hidden"><summary>Execution log <span id="operation-log-count"></span></summary><ol id="operation-log" class="operation-log"></ol></details>
     <div class="confirm-actions"><button id="operation-done" class="primary" type="button" disabled>Close</button></div>
   </dialog>
+  <button id="operation-minimized" class="operation-minimized hidden" type="button" aria-label="Show operation details">
+    <span id="operation-minimized-dot" class="dot warn"></span>
+    <span><strong id="operation-minimized-title">Move in progress…</strong><small id="operation-minimized-summary">Open operation details</small></span>
+  </button>
   <div id="toast" role="status"></div>
   <script src="/assets/app.js"></script>
 </body>
