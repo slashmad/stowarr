@@ -7,10 +7,57 @@ from unittest.mock import patch
 
 from stowarr.archive import ArchiveMember, ExtractedFile
 from stowarr.config import Pool
-from stowarr.engine import AuxiliaryFile, FilePair, MovePlan, Plan, Stowarr, is_archive, sha256, title_matches
+from stowarr.engine import (
+    AuxiliaryFile,
+    FilePair,
+    MovePlan,
+    Plan,
+    Stowarr,
+    is_archive,
+    release_folder_warning,
+    sha256,
+    title_matches,
+)
 
 
 class EngineTest(unittest.TestCase):
+    def test_release_folder_warning_ignores_conventional_radarr_folder(self):
+        warning = release_folder_warning(
+            {
+                "title": "Americana",
+                "year": 2025,
+                "path": "/media/movies/Americana (2025)",
+            },
+            "AMERICANA.2023.2160p.AMZN.WEB-DL.DDP5.1.HDR.H.265-TiTTNEYSWOONEY",
+            "radarr",
+        )
+
+        self.assertIsNone(warning)
+
+    def test_release_folder_warning_flags_different_release_name(self):
+        warning = release_folder_warning(
+            {
+                "title": "Americana",
+                "year": 2025,
+                "path": "/media/movies/Americana.2023.NORDiC.1080p.BluRay.REMUX.AVC.TrueHD.7.1-EGEN",
+            },
+            "AMERICANA.2023.2160p.AMZN.WEB-DL.DDP5.1.HDR.H.265-TiTTNEYSWOONEY",
+            "radarr",
+        )
+
+        self.assertEqual(warning["code"], "RADARR_RELEASE_FOLDER_MISMATCH")
+        self.assertEqual(warning["suggestedPath"], "/media/movies/Americana (2025)")
+
+    def test_release_folder_warning_ignores_matching_release_folder(self):
+        release = "AMERICANA.2023.2160p.AMZN.WEB-DL.DDP5.1.HDR.H.265-TiTTNEYSWOONEY"
+        warning = release_folder_warning(
+            {"title": "Americana", "year": 2025, "path": f"/media/movies/{release}"},
+            release,
+            "radarr",
+        )
+
+        self.assertIsNone(warning)
+
     def test_move_plan_stops_before_file_discovery_when_torrent_is_already_on_target(self):
         pool = Pool(
             name="p1",
@@ -97,6 +144,21 @@ class EngineTest(unittest.TestCase):
         self.assertFalse(Stowarr._is_seeding_state({"state": "pausedUP", "progress": 1}))
         self.assertFalse(Stowarr._is_seeding_state({"state": "stoppedUP", "progress": 1}))
         self.assertFalse(Stowarr._is_seeding_state({"state": "stalledUP", "progress": 0.9}))
+
+    def test_confirmation_fingerprint_ignores_volatile_free_space(self):
+        payload = {"targetPool": "p1", "additionalFiles": {}}
+        first = {"status": "ready", "target_save_path": "/media/p1/download", "free_space": 100}
+        second = {"status": "ready", "target_save_path": "/media/p1/download", "free_space": 99}
+
+        self.assertEqual(
+            Stowarr._operation_fingerprint("move", first, payload),
+            Stowarr._operation_fingerprint("move", second, payload),
+        )
+        second["target_save_path"] = "/media/p3/download"
+        self.assertNotEqual(
+            Stowarr._operation_fingerprint("move", first, payload),
+            Stowarr._operation_fingerprint("move", second, payload),
+        )
 
     def test_title_match_rejects_unrelated_release(self):
         self.assertTrue(title_matches("The Shawshank Redemption", "The.Shawshank.Redemption.1994.1080p"))
