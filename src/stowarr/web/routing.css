@@ -555,6 +555,67 @@
   background: #08090bcc;
 }
 
+.operation-minimized {
+  align-items: center;
+  background: #24282c;
+  border: 1px solid #4b5158;
+  border-left: 4px solid #3b8edb;
+  border-radius: 3px;
+  bottom: 22px;
+  box-shadow: 0 8px 28px #000a;
+  color: #e7e7e7;
+  cursor: pointer;
+  display: flex;
+  gap: 11px;
+  max-width: min(420px, calc(100vw - 32px));
+  min-width: 270px;
+  padding: 12px 15px;
+  position: fixed;
+  right: 22px;
+  text-align: left;
+  z-index: 29;
+}
+
+.operation-minimized:hover {
+  background: #2d3237;
+  border-color: #626a72;
+  border-left-color: #58a8ed;
+}
+
+.operation-minimized.complete {
+  border-left-color: #49a55d;
+}
+
+.operation-minimized.failed {
+  border-left-color: #cf5555;
+}
+
+.operation-minimized > span:last-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.operation-minimized strong,
+.operation-minimized small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.operation-minimized small {
+  color: #9a9da2;
+}
+
+.operation-minimized .dot.failed {
+  background: #cf5555;
+  box-shadow: 0 0 8px #cf555599;
+}
+
+#toast {
+  bottom: 88px;
+}
+
 .operation-steps {
   margin: 0;
   padding: 18px 20px;
