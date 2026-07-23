@@ -21,6 +21,11 @@ VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".vtt"}
 ARTWORK_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 TITLE_STOPWORDS = {"the", "and", "for", "with", "from", "part", "movie"}
+RELEASE_FOLDER_MARKERS = re.compile(
+    r"(?i)(?:^|[._ -])(?:720p|1080[pi]|2160p|uhd|bluray|blu-ray|web(?:[._ -]?dl)?|"
+    r"remux|x26[45]|h[._ -]?26[45]|hevc|avc|hdr10p?|dv|dolby[._ -]?vision|"
+    r"truehd|atmos|ddp(?:[._ -]?\d)?)(?:$|[._ -])"
+)
 
 
 def title_tokens(value: str) -> set[str]:
@@ -37,6 +42,43 @@ def title_matches(item_title: str, *candidate_names: str) -> bool:
         return True
     actual = title_tokens(" ".join(candidate_names))
     return bool(expected & actual)
+
+
+def release_folder_warning(item: dict | None, torrent_name: str, app: str) -> dict | None:
+    """Return a non-blocking warning when a Radarr folder names another release."""
+    if app != "radarr" or not item or not item.get("path"):
+        return None
+    folder = Path(str(item["path"])).name
+    title = str(item.get("title") or "").strip()
+    year = item.get("year")
+    conventional = f"{title} ({year})" if title and year else title
+
+    def normalized(value: str) -> str:
+        return "".join(re.findall(r"[a-z0-9]+", value.casefold()))
+
+    if conventional and normalized(folder) == normalized(conventional):
+        return None
+    if not RELEASE_FOLDER_MARKERS.search(folder):
+        return None
+    if normalized(folder) == normalized(torrent_name):
+        return None
+    suggested = str(Path(str(item["path"])).parent / conventional) if conventional else None
+    return {
+        "code": "RADARR_RELEASE_FOLDER_MISMATCH",
+        "title": "Radarr library folder appears to name a different release",
+        "message": (
+            "The current Radarr folder looks release-specific and does not match the selected "
+            "qBittorrent release. Move can continue, but Stowarr will preserve Radarr's existing "
+            "folder name."
+        ),
+        "currentPath": str(item["path"]),
+        "selectedRelease": torrent_name,
+        "suggestedPath": suggested,
+        "action": (
+            "Review the movie path in Radarr and rename it before Move if the folder should use "
+            "the conventional title and year."
+        ),
+    }
 
 
 @dataclass
@@ -118,6 +160,7 @@ class MovePlan:
     archive_entries: list[dict] | None = None
     subtitle_files: list[dict] | None = None
     release_identity: dict | None = None
+    warnings: list[dict] | None = None
     error_code: str | None = None
     error_details: dict | None = None
 
@@ -371,7 +414,15 @@ class Stowarr:
 
     @staticmethod
     def _operation_fingerprint(kind: str, plan: dict, payload: dict) -> str:
-        canonical = json.dumps({"kind": kind, "plan": plan, "payload": payload}, sort_keys=True, separators=(",", ":"))
+        # Free space is advisory and may change between issuing and consuming a
+        # confirmation. It must not invalidate an otherwise identical plan.
+        stable_plan = dict(plan)
+        stable_plan.pop("free_space", None)
+        canonical = json.dumps(
+            {"kind": kind, "plan": stable_plan, "payload": payload},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     def issue_confirmation(self, kind: str, torrent_hash: str, payload: dict) -> dict:
@@ -835,6 +886,10 @@ class Stowarr:
             tracked_files, additional_files = self._move_inventory(torrent, torrent_files, mapping, target_pool, target_save, app)
         content_root = self._torrent_content_root(torrent, torrent_files)
         subtitle_files = self._subtitle_inventory(torrent, torrent_files, archive_members)
+        warnings = []
+        folder_warning = release_folder_warning(item, torrent.get("name", ""), app)
+        if folder_warning:
+            warnings.append(folder_warning)
         return MovePlan(
             torrent_hash=torrent_hash,
             torrent_name=torrent.get("name", ""),
@@ -865,6 +920,7 @@ class Stowarr:
             archive_entries=archive_entries,
             subtitle_files=subtitle_files,
             release_identity=release_identity,
+            warnings=warnings,
             error_code=error_code,
             error_details=error_details,
         )
