@@ -58,6 +58,21 @@ class AuthManagerTest(unittest.TestCase):
             auth.revoke_sessions("10.0.0.8")
             self.assertFalse(auth.valid_session(token))
 
+    def test_session_survives_auth_manager_restart(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ", {"STOWARR_ADMIN_PASSWORD": "initial-password-123"}, clear=True
+        ):
+            database = Path(directory) / "state.sqlite3"
+            first = AuthManager(Store(database))
+            token = first.authenticate("admin", "initial-password-123", "10.0.0.8")
+
+            restarted = AuthManager(Store(database))
+
+            self.assertTrue(restarted.valid_session(token))
+            sessions = restarted.session_summary(token)
+            self.assertEqual(len(sessions), 1)
+            self.assertTrue(sessions[0]["current"])
+
     def test_security_events_do_not_contain_passwords(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
             "os.environ", {"STOWARR_ADMIN_PASSWORD": "initial-password-123"}, clear=True

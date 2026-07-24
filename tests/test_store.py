@@ -91,3 +91,84 @@ class StoreTest(unittest.TestCase):
             remaining = {item["id"] for item in store.recent()}
             self.assertEqual(remaining, {active_id})
             self.assertNotIn(failed_id, remaining)
+
+    def test_move_queue_is_fifo_persistent_and_rejects_duplicate_active_torrent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.db"
+            store = Store(path)
+            first = store.enqueue_move(
+                "FIRST", "p1", {"additionalFiles": []}, "first-fingerprint", {"torrent_name": "First"}
+            )
+            second = store.enqueue_move(
+                "SECOND", "p3", {"additionalFiles": []}, "second-fingerprint", {"torrent_name": "Second"}
+            )
+            with self.assertRaisesRegex(ValueError, "already has an active"):
+                store.enqueue_move(
+                    "first", "p3", {"additionalFiles": []}, "duplicate", {"torrent_name": "Duplicate"}
+                )
+
+            reopened = Store(path)
+            claimed = reopened.claim_next_move()
+            self.assertEqual(claimed["id"], first["id"])
+            self.assertEqual(claimed["state"], "RUNNING")
+            reopened.finish_move(first["id"], "COMPLETE", operation_id=42)
+            self.assertEqual(reopened.claim_next_move()["id"], second["id"])
+
+    def test_queued_move_can_be_cancelled_but_running_move_cannot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            queued = store.enqueue_move(
+                "queued", "p1", {"additionalFiles": []}, "queued-fingerprint", {}
+            )
+            self.assertTrue(store.cancel_queued_move(queued["id"]))
+            self.assertFalse(store.cancel_queued_move(queued["id"]))
+
+            running = store.enqueue_move(
+                "running", "p1", {"additionalFiles": []}, "running-fingerprint", {}
+            )
+            store.claim_next_move()
+            self.assertFalse(store.cancel_queued_move(running["id"]))
+
+    def test_running_queue_entries_are_interrupted_instead_of_replayed_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.db"
+            store = Store(path)
+            queued = store.enqueue_move(
+                "hash", "p1", {"additionalFiles": []}, "fingerprint", {"torrent_name": "Movie"}
+            )
+            store.claim_next_move()
+
+            reopened = Store(path)
+            self.assertEqual(reopened.interrupt_running_moves(), 1)
+            entry = next(item for item in reopened.move_queue() if item["id"] == queued["id"])
+            self.assertEqual(entry["state"], "INTERRUPTED")
+            self.assertIsNone(reopened.claim_next_move())
+
+    def test_deleting_history_keeps_completed_queue_record_without_dangling_operation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            queued = store.enqueue_move(
+                "hash", "p1", {"additionalFiles": []}, "fingerprint", {}
+            )
+            store.claim_next_move()
+            operation_id = store.record("hash", "radarr", "COMPLETE", {}, kind="move")
+            store.finish_move(queued["id"], "COMPLETE", operation_id)
+
+            self.assertEqual(store.delete_operations([operation_id]), 1)
+            entry = next(item for item in store.move_queue() if item["id"] == queued["id"])
+            self.assertIsNone(entry["operation_id"])
+
+    def test_queue_lists_active_fifo_and_terminal_entries_newest_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            old = store.enqueue_move("old", "p1", {"additionalFiles": []}, "old", {})
+            store.claim_next_move()
+            store.finish_move(old["id"], "COMPLETE")
+            new = store.enqueue_move("new", "p1", {"additionalFiles": []}, "new", {})
+            store.claim_next_move()
+            store.finish_move(new["id"], "FAILED")
+            queued = store.enqueue_move("queued", "p1", {"additionalFiles": []}, "queued", {})
+
+            entries = store.move_queue()
+            self.assertEqual(entries[0]["id"], queued["id"])
+            self.assertEqual([item["id"] for item in entries[1:]], [new["id"], old["id"]])

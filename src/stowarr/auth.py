@@ -6,21 +6,12 @@ import os
 import secrets
 import threading
 import time
-from dataclasses import dataclass
 
 from .store import Store
 
 
-@dataclass
-class Session:
-    token_hash: str
-    expires_at: int
-    created_at: int
-    client: str
-
-
 class AuthManager:
-    """Persist an admin password hash and manage short-lived WebUI sessions."""
+    """Persist an admin password hash and hashed WebUI sessions."""
 
     SESSION_SECONDS = 12 * 60 * 60
     ATTEMPT_WINDOW = 5 * 60
@@ -29,7 +20,6 @@ class AuthManager:
     def __init__(self, store: Store):
         self.store = store
         self.lock = threading.RLock()
-        self.sessions: dict[str, Session] = {}
         self.attempts: dict[str, list[int]] = {}
         self.generated_password: str | None = None
         if not self.store.setting("web_auth"):
@@ -74,7 +64,7 @@ class AuthManager:
             self.attempts.pop(client, None)
             token = secrets.token_urlsafe(32)
             token_hash = hashlib.sha256(token.encode()).hexdigest()
-            self.sessions[token_hash] = Session(token_hash, now + self.SESSION_SECONDS, now, client)
+            self.store.create_web_session(token_hash, client, now, now + self.SESSION_SECONDS)
             self.store.security_event("login-succeeded", username, client)
             return token
 
@@ -84,38 +74,32 @@ class AuthManager:
         now = int(time.time())
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         with self.lock:
-            session = self.sessions.get(token_hash)
-            if not session or session.expires_at < now:
-                self.sessions.pop(token_hash, None)
-                return False
-            return True
+            return self.store.web_session(token_hash, now) is not None
 
     def logout(self, token: str, client: str = "") -> None:
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         with self.lock:
-            self.sessions.pop(token_hash, None)
+            self.store.delete_web_session(token_hash)
         self.store.security_event("logout", "admin", client)
 
     def session_summary(self, current_token: str = "") -> list[dict]:
         now = int(time.time())
         current_hash = hashlib.sha256(current_token.encode()).hexdigest() if current_token else ""
         with self.lock:
-            self.sessions = {key: value for key, value in self.sessions.items() if value.expires_at >= now}
             return [
                 {
-                    "id": session.token_hash[:12],
-                    "client": session.client,
-                    "created_at": session.created_at,
-                    "expires_at": session.expires_at,
-                    "current": session.token_hash == current_hash,
+                    "id": session["token_hash"][:12],
+                    "client": session["client"],
+                    "created_at": session["created_at"],
+                    "expires_at": session["expires_at"],
+                    "current": session["token_hash"] == current_hash,
                 }
-                for session in sorted(self.sessions.values(), key=lambda item: item.created_at, reverse=True)
+                for session in self.store.web_sessions(now)
             ]
 
     def revoke_sessions(self, client: str = "") -> None:
         with self.lock:
-            count = len(self.sessions)
-            self.sessions.clear()
+            count = self.store.delete_web_sessions()
         self.store.security_event("sessions-revoked", "admin", client, {"count": count})
 
     def change_password(self, current_password: str, new_password: str) -> None:
@@ -126,11 +110,11 @@ class AuthManager:
             raise PermissionError("Current admin password is incorrect")
         self._save_password(new_password)
         with self.lock:
-            self.sessions.clear()
+            self.store.delete_web_sessions()
         self.store.security_event("password-changed", "admin", "webui")
 
     def reset_password(self, new_password: str) -> None:
         self._save_password(new_password)
         with self.lock:
-            self.sessions.clear()
+            self.store.delete_web_sessions()
         self.store.security_event("password-reset", "admin", "command-line")

@@ -9,6 +9,8 @@ from importlib.resources import files
 from urllib.parse import parse_qs, urlparse
 
 from .engine import Stowarr
+from .queue import MoveQueueWorker
+from . import __version__
 
 
 def handler(manager: Stowarr):
@@ -96,7 +98,11 @@ def handler(manager: Stowarr):
                 self.send_json(401, {"error": "Authentication required"})
                 return
             if path == "/api/health":
-                self.send_json(200, {"status": "ok" if manager.connections_ready else "setup-required", "apply": manager.config.apply})
+                self.send_json(200, {
+                    "status": "ok" if manager.connections_ready else "setup-required",
+                    "apply": manager.config.apply,
+                    "version": __version__,
+                })
             elif path == "/api/auth/status":
                 external_user = self.headers.get(manager.config.external_user_header, "").strip()
                 self.send_json(200, {
@@ -111,6 +117,7 @@ def handler(manager: Stowarr):
             elif path == "/api/config":
                 self.send_json(200, {
                     "apply": manager.config.apply,
+                    "version": __version__,
                     "pools": [
                         {
                             "name": pool.name,
@@ -128,6 +135,8 @@ def handler(manager: Stowarr):
                 })
             elif path == "/api/settings/connections":
                 self.send_json(200, manager.connection_settings())
+            elif path == "/api/status":
+                self.send_json(200, manager.service_status())
             elif path == "/api/settings/runtime":
                 self.send_json(200, manager.runtime_settings())
             elif path == "/api/settings/discovery":
@@ -138,6 +147,8 @@ def handler(manager: Stowarr):
                     self.send_json(409, {"error": str(error)})
             elif path == "/api/operations":
                 self.send_json(200, manager.store.recent())
+            elif path == "/api/queue":
+                self.send_json(200, manager.store.move_queue())
             elif path.startswith("/api/operations/") and path.endswith("/events"):
                 try:
                     operation_id = int(path.split("/")[3])
@@ -226,6 +237,14 @@ def handler(manager: Stowarr):
                     self.send_json(200, manager.update_runtime_settings(self.read_json()))
                 except Exception as error:
                     self.send_json(400, {"error": str(error)})
+            elif path.startswith("/api/queue/") and path.endswith("/cancel"):
+                try:
+                    queue_id = int(path.split("/")[3])
+                    if not manager.store.cancel_queued_move(queue_id):
+                        raise ValueError("Only a waiting queued Move can be cancelled")
+                    self.send_json(200, {"id": queue_id, "state": "CANCELLED"})
+                except (ValueError, IndexError) as error:
+                    self.send_json(409, {"error": str(error)})
             elif not manager.connections_ready:
                 self.send_json(503, {"error": "Configure qBittorrent, Radarr, and Sonarr in Settings first"})
             elif path == "/api/confirmations":
@@ -268,6 +287,25 @@ def handler(manager: Stowarr):
                     self.send_json(200, manager.move(torrent_hash, target_pool, additional_files))
                 except Exception as error:
                     self.log_operation_error("move", error)
+                    self.send_json(409, {"error": str(error)})
+            elif path == "/api/queue":
+                try:
+                    body = self.read_json()
+                    torrent_hash = body.get("torrentHash")
+                    target_pool = body.get("targetPool")
+                    additional_files = body.get("additionalFiles", {})
+                    if not isinstance(torrent_hash, str) or not torrent_hash:
+                        raise ValueError("torrentHash is required")
+                    if not isinstance(target_pool, str) or not target_pool:
+                        raise ValueError("targetPool is required")
+                    if not isinstance(additional_files, dict):
+                        raise ValueError("additionalFiles must be an object")
+                    payload = {"targetPool": target_pool, "additionalFiles": additional_files}
+                    queued = manager.enqueue_move(
+                        body.get("confirmationToken", ""), torrent_hash, payload
+                    )
+                    self.send_json(202, queued)
+                except Exception as error:
                     self.send_json(409, {"error": str(error)})
             elif path.startswith("/api/verify/"):
                 try:
@@ -340,6 +378,16 @@ def print_startup_credentials(manager: Stowarr) -> None:
 
 def serve(manager: Stowarr) -> None:
     server = ThreadingHTTPServer((manager.config.listen, manager.config.port), handler(manager))
+    queue_worker = MoveQueueWorker(manager)
+    queue_worker.start()
     print_startup_credentials(manager)
     print(f"stowarr listening on {manager.config.listen}:{manager.config.port}; apply={manager.config.apply}", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        if not queue_worker.stop():
+            print(
+                "stowarr queue worker is still finishing an active Move during shutdown",
+                flush=True,
+            )
+        server.server_close()

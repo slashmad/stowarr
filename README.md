@@ -196,7 +196,7 @@ the download path themselves. Stowarr's routing diagnostics compare the *Arr
 download clients, categories, tags, root folders, and qBittorrent category save
 paths.
 
-## Dry run and apply mode
+## Dry run and Write mode
 
 The default configuration is intentionally non-destructive:
 
@@ -208,8 +208,8 @@ STOWARR_MEDIA_MOUNT_MODE=ro
 Build and inspect plans in this mode first. A confirmed operation is recorded
 as `DRY_RUN` and cannot modify media.
 
-After validating the paths, permissions, and plans, enable execution by changing
-both settings and recreating the API container:
+After validating the paths, permissions, and plans, enable **Write mode** by
+changing both deployment settings and recreating the API container:
 
 ```dotenv
 STOWARR_APPLY=true
@@ -224,7 +224,7 @@ Write access does not remove the confirmation requirement. The WebUI and API
 still require an explicit plan confirmation for every destructive operation.
 
 The execution mode can also be changed under **Settings → Execution mode**.
-Stowarr validates that every configured pool is writable before enabling apply
+Stowarr validates that every configured pool is writable before enabling Write
 mode and stores the runtime choice in its SQLite state. Docker boundary settings
 such as `PUID`, `PGID`, `UMASK`, bind mounts, mount mode, listener ports, and an
 environment-provided API key remain deployment settings and require a Compose
@@ -264,7 +264,35 @@ The Move confirmation fingerprint includes the destination pool, full plan,
 and every additional-file action. A stale or altered plan cannot reuse an old
 confirmation token.
 
+### Move queue
+
+The WebUI can either start a confirmed Move immediately or add it to the
+persistent **Move queue**. Queued transactions run one at a time in FIFO order,
+so qBittorrent relocation, rechecks, library updates, and cleanup cannot overlap
+between Move operations.
+
+Each queued entry stores the reviewed destination and additional-file actions,
+then rebuilds the plan immediately before execution. If the current qBittorrent,
+filesystem, or *Arr state no longer matches the confirmation fingerprint, the
+entry fails before changing anything and must be reviewed again. A waiting
+entry can be cancelled from the Queue page; a running entry cannot be cancelled
+mid-transaction.
+
+Waiting entries survive normal container restarts. If Stowarr restarts while a
+Move is already running, that entry becomes **Interrupted** and is never
+automatically replayed. Inspect qBittorrent and the library before creating a
+new plan. Run only one `stowarr-api` replica against a state database and media
+set.
+
 The WebUI **Guide** page summarizes every page and action button.
+
+The sidebar reports live status for the Stowarr API, qBittorrent, Radarr, and
+Sonarr. Green means connected, amber means not configured, and red means a
+configured service is unavailable. It also shows **Write mode** or **Dry run**,
+the running Stowarr version, and a link to the official
+[slashmad/stowarr](https://github.com/slashmad/stowarr) repository. Status is
+refreshed periodically and after connection settings are saved; credentials are
+never returned with the status response.
 
 ## Service isolation
 
@@ -289,9 +317,16 @@ reachable by clients through any path that bypasses that proxy. The proxy must
 replace, rather than merely preserve, the trusted username header supplied by
 the client.
 
-Settings shows active in-memory WebUI sessions and a persistent security event
-log. Restarting the API invalidates WebUI sessions. Password changes and the
-**Sign out all sessions** action invalidate every existing session.
+Settings shows active WebUI sessions and a persistent, bounded security event
+log. Session tokens are stored only as hashes in the same SQLite state database
+as the rest of Stowarr, so an authenticated browser remains signed in across
+container and image updates when `/state` is persistent. Sessions expire after
+12 hours. Password changes and the **Sign out all sessions** action invalidate
+every existing session.
+
+The Security page shows the latest 100 events in a fixed-height scrolling
+table. Stowarr retains at most 500 security events in SQLite, preventing
+successful-login audit entries from growing the database without a limit.
 
 ## API
 
@@ -365,6 +400,32 @@ ZIP, 7z, TAR, and ISO layouts. It discovers independent archive sets, publishes
 only uniquely verified *Arr-managed media, and rolls back newly published files
 if a later transaction step fails.
 
+### Unpackerr coexistence
+
+Stowarr must be the only archive extractor for downloads that it can Move or
+Reconcile. Do not let Unpackerr automatically extract the same Radarr/Sonarr
+items or watch any download root managed by Stowarr. Two extractors operating on
+the same release can duplicate heavy disk I/O, race while files are changing,
+leave `_unpackerred` output behind, and invalidate Stowarr's verification plan.
+
+For a deployment where Stowarr manages all configured Radarr and Sonarr pools:
+
+- disable or remove Unpackerr's `[[radarr]]` and `[[sonarr]]` integrations;
+- disable or remove every Unpackerr `[[folder]]` entry whose `path` is a
+  Stowarr `download_root`;
+- restart Unpackerr after changing its configuration; and
+- keep the same media paths mounted read/write only where another, explicitly
+  separate Unpackerr workload still requires them.
+
+Unpackerr may remain enabled for applications or paths outside Stowarr, but the
+two tools must have mutually exclusive scopes. A delay, `parallel = 1`, or
+`move_back = false` does not prevent the race and is not an isolation boundary.
+
+Stowarr recognizes existing `_unpackerred` output as a derived artifact. It
+removes that output only after the extracted media hash matches the published
+library file and the complete Move transaction has passed verification. Do not
+manually delete old derived output while a Move is running.
+
 ## Development
 
 Build local images:
@@ -383,10 +444,19 @@ Pull requests run the test suite, syntax checks, Compose validation, container
 builds, and Gitleaks. Merges to `main` publish both multi-architecture GHCR
 images with provenance and SBOM attestations.
 
+## Versioning
+
+Stowarr follows Semantic Versioning. Prereleases use tags such as
+`v1.0.0-beta.1`, while the WebUI and API expose the corresponding product
+version `1.0.0-beta.1`. Python package metadata uses the PEP 440 equivalent
+`1.0.0b1`. Tagged builds are published to GHCR alongside commit-SHA images;
+`latest` continues to track `main`.
+
 ## Project status
 
-Stowarr is an early release. Keep dry-run enabled until plans have been reviewed
-against your own qBittorrent, Radarr, Sonarr, filesystem, and hardlink layout.
+Stowarr is an early release. Keep **Dry run** enabled until plans have been
+reviewed against your own qBittorrent, Radarr, Sonarr, filesystem, and hardlink
+layout.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 

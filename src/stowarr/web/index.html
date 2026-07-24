@@ -17,10 +17,12 @@
     <symbol id="icon-home" viewBox="0 0 24 24"><path d="m3 11 9-8 9 8M5 10v10h14V10M9 20v-6h6v6"/></symbol>
     <symbol id="icon-reconcile" viewBox="0 0 24 24"><path d="M7 7h13m0 0-3-3m3 3-3 3M17 17H4m0 0 3 3m-3-3 3-3"/></symbol>
     <symbol id="icon-move" viewBox="0 0 24 24"><path d="M4 12h15m0 0-5-5m5 5-5 5"/></symbol>
+    <symbol id="icon-queue" viewBox="0 0 24 24"><path d="M5 6h14M5 12h10M5 18h6"/><path d="m16 15 3 3-3 3"/></symbol>
     <symbol id="icon-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8m0-5v5h5M12 7v5l3 2"/></symbol>
     <symbol id="icon-settings" viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="m19 13.5 2 1.5-2 3.5-2.4-1a8 8 0 0 1-2.6 1.5L13.7 22h-4l-.3-3a8 8 0 0 1-2.6-1.5l-2.4 1L2.5 15l2-1.5a8 8 0 0 1 0-3l-2-1.5 2-3.5 2.4 1A8 8 0 0 1 9.4 5l.3-3h4l.3 3a8 8 0 0 1 2.6 1.5l2.4-1L21.5 9l-2 1.5a8 8 0 0 1 0 3Z"/></symbol>
     <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m16 16 5 5"/></symbol>
     <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6M20 4v7h-7"/></symbol>
+    <symbol id="icon-github" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12 .7a11.5 11.5 0 0 0-3.64 22.41c.58.11.79-.25.79-.56v-2.24c-3.22.7-3.9-1.37-3.9-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.16.08 1.78 1.2 1.78 1.2 1.04 1.77 2.72 1.26 3.38.96.1-.75.4-1.26.74-1.55-2.57-.29-5.27-1.28-5.27-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.04 0 0 .97-.31 3.16 1.18A10.96 10.96 0 0 1 12 6.15c.98 0 1.95.13 2.87.39 2.2-1.49 3.16-1.18 3.16-1.18.63 1.58.23 2.75.11 3.04.74.81 1.19 1.83 1.19 3.09 0 4.41-2.71 5.38-5.29 5.67.42.36.79 1.07.79 2.16v3.23c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .7Z"/></symbol>
   </svg>
   <div class="shell">
     <aside class="sidebar">
@@ -33,13 +35,29 @@
         <button class="nav-item" data-page="overview"><svg class="icon"><use href="#icon-home"/></svg>Overview</button>
         <button class="nav-item" data-page="reconcile"><svg class="icon"><use href="#icon-reconcile"/></svg>Reconcile</button>
         <button class="nav-item" data-page="move"><svg class="icon"><use href="#icon-move"/></svg>Move</button>
+        <button class="nav-item" data-page="queue"><svg class="icon"><use href="#icon-queue"/></svg>Queue <b id="queue-count"></b></button>
         <button class="nav-item" data-page="history"><svg class="icon"><use href="#icon-history"/></svg>History <b id="history-count"></b></button>
         <div class="nav-heading">System</div>
         <button class="nav-item" data-page="settings"><svg class="icon"><use href="#icon-settings"/></svg>Settings</button>
         <button class="nav-item" data-page="guide"><svg class="icon"><use href="#icon-history"/></svg>Guide</button>
         <button class="nav-item" id="logout"><svg class="icon"><use href="#icon-move"/></svg>Sign out</button>
       </nav>
-      <div class="sidebar-status"><span id="side-dot" class="dot"></span><span><strong id="side-mode">Loading</strong><small>Stowarr service</small></span></div>
+      <footer class="sidebar-status" aria-label="Service status">
+        <div class="sidebar-service-list">
+          <div class="sidebar-service"><span id="side-api-dot" class="dot pending"></span><span>Stowarr API</span></div>
+          <div class="sidebar-service"><span id="side-qbit-dot" class="dot pending"></span><span>qBittorrent</span></div>
+          <div class="sidebar-service"><span id="side-radarr-dot" class="dot pending"></span><span>Radarr</span></div>
+          <div class="sidebar-service"><span id="side-sonarr-dot" class="dot pending"></span><span>Sonarr</span></div>
+          <div class="sidebar-service"><span id="side-dot" class="dot pending"></span><strong id="side-mode">Loading</strong></div>
+        </div>
+        <div class="sidebar-meta">
+          <span id="side-version">Version —</span>
+          <a href="https://github.com/slashmad/stowarr" target="_blank" rel="noopener noreferrer" title="Open Stowarr on GitHub">
+            <svg class="icon"><use href="#icon-github"/></svg>
+            <span>GitHub</span>
+          </a>
+        </div>
+      </footer>
     </aside>
     <button id="sidebar-backdrop" class="sidebar-backdrop" aria-label="Close navigation"></button>
 
@@ -97,6 +115,14 @@
         <div id="move-result"></div>
       </section>
 
+      <section id="queue" class="page">
+        <div class="page-title"><div><h1>Move queue</h1><p>Confirmed Move transactions run one at a time in FIFO order</p></div></div>
+        <article class="panel">
+          <div class="panel-head"><div><h2>Transactions</h2><p>Queued work persists across page changes and service restarts</p></div><button id="refresh-queue" class="primary compact" type="button">Refresh queue</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Position</th><th>Torrent</th><th>Route</th><th>State</th><th>Operation</th><th>Updated</th><th></th></tr></thead><tbody id="queue-rows"><tr><td colspan="7" class="empty">The Move queue is empty</td></tr></tbody></table></div>
+        </article>
+      </section>
+
       <section id="history" class="page">
         <div class="page-title"><div><h1>History</h1><p>Recorded plans, transaction events, and reconciliation attempts</p></div></div>
         <article class="panel">
@@ -124,7 +150,15 @@
         <article class="panel connection-panel">
           <div class="panel-head"><div><h2>Service connections</h2><p>Configure qBittorrent, Radarr, and Sonarr together or one at a time</p></div><span id="connections-status" class="badge">Not configured</span></div>
           <div id="connection-error" class="alert inline-alert hidden"></div>
-          <div class="connection-summary"><div><strong id="qbit-auth-summary">qBittorrent not configured</strong><span>Configure services independently; full Move and Reconcile workflows require all three</span></div><button id="open-connection-setup" class="primary">Open connection setup</button></div>
+          <div class="connection-summary">
+            <div class="connection-service-list" aria-label="Service connection status">
+              <div class="connection-service-summary"><span id="qbit-summary-dot" class="dot warn"></span><strong>qBittorrent</strong><span id="qbit-auth-summary">Not configured</span></div>
+              <div class="connection-service-summary"><span id="radarr-summary-dot" class="dot warn"></span><strong>Radarr</strong><span id="radarr-auth-summary">Not configured</span></div>
+              <div class="connection-service-summary"><span id="sonarr-summary-dot" class="dot warn"></span><strong>Sonarr</strong><span id="sonarr-auth-summary">Not configured</span></div>
+              <small>Configure services independently; full Move and Reconcile workflows require all three.</small>
+            </div>
+            <button id="open-connection-setup" class="primary">Open connection setup</button>
+          </div>
         </article>
         <article class="panel runtime-panel">
           <div class="panel-head"><div><h2>Execution mode</h2><p>Runtime safety mode can be changed here; Docker deployment values are shown separately</p></div><span id="runtime-status" class="badge">Loading</span></div>
@@ -148,9 +182,10 @@
           </form>
         </article>
         <article class="panel security-panel">
-          <div class="panel-head"><div><h2>Security</h2><p>WebUI authentication, active sessions, and recent authentication events</p></div><button id="revoke-sessions" class="danger compact">Sign out all sessions</button></div>
+          <div class="panel-head"><div><h2>Security</h2><p>WebUI authentication and persistent sessions</p></div><button id="revoke-sessions" class="danger compact">Sign out all sessions</button></div>
           <div id="security-summary" class="security-summary"></div>
-          <div class="table-wrap"><table><thead><tr><th>Event</th><th>Username</th><th>Client</th><th>Time</th></tr></thead><tbody id="security-events"><tr><td colspan="4" class="empty">Loading security events…</td></tr></tbody></table></div>
+          <div class="security-log-head"><div><h3>Security event log</h3><p>Recent authentication and administrator events; retained independently of active sessions</p></div><span>Latest 100 events</span></div>
+          <div class="table-wrap security-event-log"><table><thead><tr><th>Event</th><th>Username</th><th>Client</th><th>Time</th></tr></thead><tbody id="security-events"><tr><td colspan="4" class="empty">Loading security events…</td></tr></tbody></table></div>
         </article>
         <div id="settings-pools"></div>
       </section>
@@ -159,12 +194,14 @@
         <div class="page-title"><div><h1>Guide</h1><p>How Stowarr pages, buttons, and safety boundaries work</p></div></div>
         <div class="guide-grid">
           <article class="panel guide-card"><h2>Sync</h2><p>Compares qBittorrent hashes, categories, save paths, and authoritative pools with Radarr or Sonarr history and library roots.</p><dl><dt>Run audit</dt><dd>Refreshes the selected Radarr or Sonarr comparison.</dd><dt>Reconcile</dt><dd>Opens a repair plan for the selected torrent hash.</dd></dl></article>
-          <article class="panel guide-card"><h2>Overview</h2><p>Summarizes operations, completed and blocked work, configured pools, routing, and recent activity.</p><dl><dt>View all</dt><dd>Opens the complete operation history.</dd><dt>Inspect</dt><dd>Builds a current Reconcile plan for that torrent.</dd></dl></article>
+          <article class="panel guide-card"><h2>Overview</h2><p>Summarizes operations, completed and blocked work, configured pools, routing, and recent activity.</p><dl><dt>View all</dt><dd>Opens the complete operation history.</dd><dt>Details</dt><dd>Opens the retained progress timeline and execution log for that operation.</dd></dl></article>
           <article class="panel guide-card"><h2>Reconcile</h2><p>Repairs an inconsistency using qBittorrent as the source of truth. It verifies content before creating hardlinks, updating *Arr, or removing a stale derivative.</p><dl><dt>Analyze</dt><dd>Builds a read-only plan from an info hash.</dd><dt>Verify content hashes</dt><dd>Hashes torrent, old library, new library, and selected sidecars.</dd><dt>Reconcile</dt><dd>Requests confirmation and executes the verified plan.</dd></dl></article>
-          <article class="panel guide-card"><h2>Move</h2><p>Moves a torrent between pools through qBittorrent, rebuilds the Radarr/Sonarr library, processes every additional file, and removes the empty old folder last.</p><dl><dt>Refresh torrents</dt><dd>Reloads qBittorrent and clears the current selection.</dd><dt>Column buttons</dt><dd>Show or hide Radarr, Sonarr, and unmanaged route columns.</dd><dt>Build move plan</dt><dd>Inventories torrent, *Arr, download, and library files without changing them.</dd><dt>Move all / Delete all</dt><dd>Sets the proposed action for every additional file.</dd><dt>Review &amp; move</dt><dd>Shows a final summary, issues a bound confirmation, and starts the transaction.</dd></dl></article>
-          <article class="panel guide-card"><h2>History</h2><p>Lists Move and Reconcile attempts with their final or current transaction state.</p><dl><dt>Inspect</dt><dd>Rebuilds a current plan; it does not replay the historical operation.</dd></dl></article>
+          <article class="panel guide-card"><h2>Move</h2><p>Moves a torrent between pools through qBittorrent, rebuilds the Radarr/Sonarr library, processes every additional file, and removes the empty old folder last.</p><dl><dt>Refresh torrents</dt><dd>Reloads qBittorrent and clears the current selection.</dd><dt>Column buttons</dt><dd>Show or hide Radarr, Sonarr, and unmanaged route columns.</dd><dt>Build move plan</dt><dd>Inventories torrent, *Arr, download, and library files without changing them.</dd><dt>Move all / Delete all</dt><dd>Sets the proposed action for every additional file.</dd><dt>Review &amp; move</dt><dd>Shows a final summary, issues a bound confirmation, and starts the transaction immediately.</dd><dt>Add to queue</dt><dd>Confirms and stores the reviewed transaction for serialized background execution.</dd></dl></article>
+          <article class="panel guide-card"><h2>Queue</h2><p>Shows persistent Move transactions waiting for or using the single execution slot.</p><dl><dt>Refresh queue</dt><dd>Reloads waiting, running, and recently finished queue entries.</dd><dt>Cancel</dt><dd>Cancels an entry that has not started. Running work must finish or fail safely.</dd><dt>Details</dt><dd>Opens the linked operation progress and execution log.</dd><dt>Restart safety</dt><dd>A Move interrupted by a service restart is marked for manual review and is never replayed automatically.</dd></dl></article>
+          <article class="panel guide-card"><h2>History</h2><p>Lists Move and Reconcile attempts with their final or current transaction state and retained execution events.</p><dl><dt>Details</dt><dd>Opens the stored progress timeline and execution log for that exact operation; it does not replay it.</dd><dt>Delete selected</dt><dd>Removes only the checked history entries after confirmation.</dd><dt>Clear history</dt><dd>Removes every terminal history entry after confirmation. Active work is never deleted.</dd></dl></article>
           <article class="panel guide-card"><h2>Settings</h2><p>Manages service credentials and runtime execution mode, discovers routing, and displays pool and Docker deployment configuration.</p><dl><dt>Open connection setup</dt><dd>Tests and saves one or more configured services without blocking the WebUI.</dd><dt>Save execution mode</dt><dd>Enables or disables confirmed writes after checking mount access.</dd><dt>Discover routes</dt><dd>Reads qBittorrent destinations first, then matches *Arr clients, categories, tags, and roots.</dd></dl></article>
-          <article class="panel guide-card"><h2>About Stowarr</h2><p>Developed by <a href="https://github.com/slashmad/stowarr" target="_blank" rel="noopener noreferrer">slashmad</a> and distributed under the Apache License 2.0.</p><dl><dt>Source code</dt><dd>github.com/slashmad/stowarr</dd><dt>Attribution</dt><dd>Redistributions must preserve the project license, copyright, and NOTICE attribution.</dd></dl></article>
+          <article class="panel guide-card"><h2>Service status</h2><p>The sidebar reports live connectivity and the effective execution mode without exposing credentials.</p><dl><dt>Green</dt><dd>The service is reachable, or confirmed writes are enabled for Write mode.</dd><dt>Amber</dt><dd>The service is not configured, or Stowarr is in Dry run.</dd><dt>Red</dt><dd>The configured service is currently unavailable.</dd><dt>Version</dt><dd>Shows the running Stowarr product version reported by the API. Service versions are available as status tooltips.</dd></dl></article>
+          <article class="panel guide-card"><h2>About Stowarr</h2><p>Developed by <a href="https://github.com/slashmad/stowarr" target="_blank" rel="noopener noreferrer">slashmad</a> and distributed under the Apache License 2.0.</p><dl><dt>GitHub</dt><dd>The sidebar link opens the official slashmad/stowarr repository.</dd><dt>Attribution</dt><dd>Redistributions must preserve the project license, copyright, and NOTICE attribution.</dd></dl></article>
         </div>
       </section>
     </main>

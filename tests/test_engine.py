@@ -21,6 +21,35 @@ from stowarr.engine import (
 
 
 class EngineTest(unittest.TestCase):
+    def test_service_status_reports_live_versions_without_credentials(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=True)
+        manager.qbit = SimpleNamespace(version=lambda: "5.2.1")
+        manager.arr = {
+            "radarr": SimpleNamespace(status=lambda: {"version": "6.0.0"}),
+            "sonarr": SimpleNamespace(status=lambda: {"version": "5.0.0"}),
+        }
+
+        result = manager.service_status()
+
+        self.assertEqual(result["version"], "1.0.0-beta.1")
+        self.assertTrue(result["apply"])
+        self.assertEqual(result["services"]["qbittorrent"]["version"], "5.2.1")
+        self.assertEqual(result["services"]["radarr"]["status"], "connected")
+        self.assertNotIn("credentials", result)
+
+    def test_service_status_distinguishes_unavailable_and_unconfigured(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=False)
+        manager.qbit = SimpleNamespace(version=lambda: (_ for _ in ()).throw(ConnectionError("offline")))
+        manager.arr = {}
+
+        result = manager.service_status()
+
+        self.assertEqual(result["services"]["qbittorrent"]["status"], "unavailable")
+        self.assertEqual(result["services"]["radarr"]["status"], "not_configured")
+        self.assertEqual(result["services"]["sonarr"]["status"], "not_configured")
+
     def test_release_folder_warning_ignores_conventional_radarr_folder(self):
         warning = release_folder_warning(
             {
