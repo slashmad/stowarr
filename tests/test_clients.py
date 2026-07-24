@@ -158,6 +158,14 @@ class ArrClientTest(unittest.TestCase):
 
 class QBittorrentClientTest(unittest.TestCase):
     @patch("stowarr.clients.JsonClient")
+    def test_version_uses_qbittorrent_plain_text_endpoint(self, json_client):
+        json_client.return_value.request_text.return_value = "v5.2.1"
+        client = QBittorrentClient(Service("http://qbit", api_key="key"))
+
+        self.assertEqual(client.version(), "v5.2.1")
+        json_client.return_value.request_text.assert_called_once_with("GET", "/api/v2/app/version")
+
+    @patch("stowarr.clients.JsonClient")
     def test_api_key_is_preferred_and_skips_login(self, json_client):
         QBittorrentClient(Service("http://qbit", api_key="key", username="user", password="password"))
 
