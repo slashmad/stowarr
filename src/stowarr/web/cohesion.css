@@ -111,7 +111,72 @@ nav {
 }
 
 .sidebar-status {
-  padding: 14px 20px;
+  display: block;
+  padding: 12px 18px 10px;
+}
+
+.sidebar-service-list {
+  display: grid;
+  gap: 2px;
+}
+
+.sidebar-service {
+  display: flex;
+  align-items: center;
+  min-height: 25px;
+  gap: 9px;
+  color: #b8bdc3;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.sidebar-service strong {
+  color: #d9dde1;
+  font-size: 12px;
+}
+
+.sidebar-service .dot {
+  flex: 0 0 auto;
+}
+
+.dot.failed {
+  background: #dc5a55;
+  box-shadow: 0 0 7px #dc5a5577;
+}
+
+.dot.pending {
+  background: #737980;
+}
+
+.sidebar-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid #303438;
+  color: #7f868d;
+  font-size: 10px;
+}
+
+.sidebar-meta a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #949ba2;
+  text-decoration: none;
+}
+
+.sidebar-meta a:hover {
+  color: var(--blue);
+}
+
+.sidebar-meta .icon {
+  width: 15px;
+  height: 15px;
+  fill: currentColor;
+  stroke: none;
 }
 
 .sidebar-backdrop {
@@ -156,6 +221,11 @@ nav {
 .security-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--border); border-bottom: 1px solid var(--border); }
 .security-summary > div { display: flex; flex-direction: column; gap: 6px; padding: 18px; background: var(--panel); }
 .security-summary small { color: var(--muted); text-transform: uppercase; font-size: 11px; font-weight: 700; }
+.security-log-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 18px; border-bottom: 1px solid var(--border); background: var(--panel); }
+.security-log-head h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+.security-log-head p, .security-log-head span { margin: 0; color: var(--muted); font-size: 12px; }
+.security-event-log { height: 360px; max-height: 45vh; overflow-y: auto; scrollbar-gutter: stable; overscroll-behavior: contain; }
+.security-event-log thead { position: sticky; top: 0; z-index: 1; }
 
 @media (max-width: 900px) {
   .password-form { grid-template-columns: 1fr; }

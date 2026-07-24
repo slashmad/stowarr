@@ -6,6 +6,7 @@ import re
 import shutil
 import secrets
 import json
+import threading
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -15,6 +16,7 @@ from .archive import ArchiveExtractor, ArchiveMember, is_archive_path, select_ar
 from .auth import AuthManager
 from .config import Config, Pool, Service
 from .store import Store
+from . import __version__
 
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
@@ -225,6 +227,8 @@ class Stowarr:
         self.arr = {}
         self.connection_error = None
         self.archive_extractor = ArchiveExtractor()
+        self._move_lock = threading.Lock()
+        self.queue_worker = None
         try:
             self._activate_connections(config.qbittorrent, config.radarr, config.sonarr, validate=False)
         except Exception as error:
@@ -289,6 +293,56 @@ class Stowarr:
                 "radarr": self._masked_service(self.config.radarr, "radarr"),
                 "sonarr": self._masked_service(self.config.sonarr, "sonarr"),
             },
+        }
+
+    def service_status(self) -> dict:
+        """Return live, credential-safe status for every connected service."""
+        services = {
+            "stowarr_api": {
+                "configured": True,
+                "status": "connected",
+                "version": __version__,
+            }
+        }
+        checks = {
+            "qbittorrent": (
+                self.qbit,
+                lambda client: client.version(),
+            ),
+            "radarr": (
+                self.arr.get("radarr"),
+                lambda client: client.status().get("version"),
+            ),
+            "sonarr": (
+                self.arr.get("sonarr"),
+                lambda client: client.status().get("version"),
+            ),
+        }
+        for name, (client, version_check) in checks.items():
+            if client is None:
+                services[name] = {
+                    "configured": False,
+                    "status": "not_configured",
+                    "version": None,
+                }
+                continue
+            try:
+                services[name] = {
+                    "configured": True,
+                    "status": "connected",
+                    "version": version_check(client) or None,
+                }
+            except Exception as error:
+                services[name] = {
+                    "configured": True,
+                    "status": "unavailable",
+                    "version": None,
+                    "error": str(error),
+                }
+        return {
+            "version": __version__,
+            "apply": self.config.apply,
+            "services": services,
         }
 
     def update_connections(self, payload: dict) -> dict:
@@ -457,7 +511,7 @@ class Stowarr:
         self.store.create_confirmation(token, kind, torrent_hash, fingerprint, expires_at)
         return {"token": token, "expires_at": expires_at, "kind": kind, "torrent_hash": torrent_hash, "plan": plan, "payload": normalized}
 
-    def consume_confirmation(self, token: str, kind: str, torrent_hash: str, payload: dict) -> None:
+    def consume_confirmation(self, token: str, kind: str, torrent_hash: str, payload: dict) -> dict:
         if not token:
             raise PermissionError("A confirmation token is required")
         if kind == "reconcile":
@@ -469,6 +523,28 @@ class Stowarr:
             plan = self.move_plan(torrent_hash, normalized["targetPool"]).json()
         fingerprint = self._operation_fingerprint(kind, plan, normalized)
         self.store.consume_confirmation(token, kind, torrent_hash, fingerprint)
+        return {"plan": plan, "payload": normalized, "fingerprint": fingerprint}
+
+    def enqueue_move(self, token: str, torrent_hash: str, payload: dict) -> dict:
+        if not self.config.apply:
+            raise RuntimeError("Move queue is unavailable in dry-run mode")
+        authorized = self.consume_confirmation(token, "move", torrent_hash, payload)
+        plan = authorized["plan"]
+        queued = self.store.enqueue_move(
+            torrent_hash,
+            authorized["payload"]["targetPool"],
+            authorized["payload"],
+            authorized["fingerprint"],
+            {
+                "torrent_name": plan.get("torrent_name", torrent_hash),
+                "app": plan.get("app"),
+                "current_pool": plan.get("current_pool"),
+                "target_pool": plan.get("target_pool"),
+            },
+        )
+        if self.queue_worker:
+            self.queue_worker.wake()
+        return queued
 
     @staticmethod
     def _torrent_paths(torrent: dict, files: list[dict]) -> list[tuple[Path, int]]:
@@ -1167,7 +1243,21 @@ class Stowarr:
             removed.append(str(directory))
         return removed
 
-    def move(self, torrent_hash: str, target_pool_name: str, additional_actions: dict[str, str] | None = None) -> dict:
+    def move(
+        self,
+        torrent_hash: str,
+        target_pool_name: str,
+        additional_actions: dict[str, str] | None = None,
+        wait_for_slot: bool = False,
+    ) -> dict:
+        if not self._move_lock.acquire(blocking=wait_for_slot):
+            raise RuntimeError("Another Move transaction is already running; add this Move to the queue")
+        try:
+            return self._run_move(torrent_hash, target_pool_name, additional_actions)
+        finally:
+            self._move_lock.release()
+
+    def _run_move(self, torrent_hash: str, target_pool_name: str, additional_actions: dict[str, str] | None = None) -> dict:
         if self.store.active(torrent_hash, kind="move"):
             raise RuntimeError("Another Move operation is already active for this torrent")
         plan = self.move_plan(torrent_hash, target_pool_name)

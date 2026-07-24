@@ -844,12 +844,24 @@
   padding: 18px 20px;
 }
 
-.connection-summary div {
+.connection-service-list {
   display: grid;
-  gap: 5px;
+  gap: 9px;
 }
 
-.connection-summary span,
+.connection-service-summary {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 10px minmax(100px, 130px) minmax(180px, 1fr);
+}
+
+.connection-service-summary .dot {
+  margin: 0;
+}
+
+.connection-service-summary > span:last-child,
+.connection-service-list > small,
 .auth-divider {
   color: #9a9da2;
   font-size: 12px;
