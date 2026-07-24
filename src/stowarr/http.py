@@ -13,6 +13,22 @@ class JsonClient:
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
 
     def request(self, method: str, path: str, *, query: dict | None = None, form: dict | None = None, body=None):
+        payload = self._request(method, path, query=query, form=form, body=body)
+        return json.loads(payload) if payload else None
+
+    def request_text(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict | None = None,
+        form: dict | None = None,
+        body=None,
+    ) -> str:
+        payload = self._request(method, path, query=query, form=form, body=body)
+        return payload.decode("utf-8").strip() if payload else ""
+
+    def _request(self, method: str, path: str, *, query: dict | None = None, form: dict | None = None, body=None) -> bytes:
         url = f"{self.base_url}{path}"
         if query:
             url += "?" + urllib.parse.urlencode(query)
@@ -26,5 +42,4 @@ class JsonClient:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         with self.opener.open(request, timeout=60) as response:
-            payload = response.read()
-            return json.loads(payload) if payload else None
+            return response.read()

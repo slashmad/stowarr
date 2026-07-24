@@ -265,7 +265,7 @@ class QBittorrentClient:
         return self.http.request("GET", "/api/v2/torrents/categories")
 
     def version(self) -> str:
-        return self.http.request("GET", "/api/v2/app/version")
+        return self.http.request_text("GET", "/api/v2/app/version")
 
     def pause(self, torrent_hash: str) -> None:
         self.http.request("POST", "/api/v2/torrents/stop", form={"hashes": torrent_hash})
