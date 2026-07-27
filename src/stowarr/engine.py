@@ -234,6 +234,13 @@ class Stowarr:
             self._activate_connections(config.qbittorrent, config.radarr, config.sonarr, validate=False)
         except Exception as error:
             self.connection_error = str(error)
+        if self.config.apply:
+            try:
+                self._validate_write_paths()
+            except Exception as error:
+                self.config = replace(self.config, apply=False)
+                self.store.set_setting("runtime", {"apply": False})
+                self.connection_error = f"Write mode was disabled during startup: {error}"
 
     @property
     def connections_ready(self) -> bool:
@@ -372,9 +379,23 @@ class Stowarr:
                     raise ValueError(f"{name.capitalize()} API key is required")
                 candidates[name] = Service(url=url, api_key=api_key if url else "")
 
-        versions = self._activate_connections(
-            candidates["qbittorrent"], candidates["radarr"], candidates["sonarr"], validate=True
-        )
+        previous_qbit = self.qbit
+        previous_arr = self.arr
+        previous_error = self.connection_error
+        try:
+            versions = self._activate_connections(
+                candidates["qbittorrent"],
+                candidates["radarr"],
+                candidates["sonarr"],
+                validate=True,
+            )
+            if self.config.apply:
+                self._validate_write_paths()
+        except Exception:
+            self.qbit = previous_qbit
+            self.arr = previous_arr
+            self.connection_error = previous_error
+            raise
 
         self.store.set_setting("connections", {name: asdict(service) for name, service in candidates.items()})
         self.config = replace(self.config, **candidates)
@@ -457,15 +478,7 @@ class Stowarr:
         if not isinstance(apply, bool):
             raise ValueError("apply must be a boolean")
         if apply:
-            for pool in self.config.pools:
-                for root in self._pool_media_paths(pool, strict_discovery=True):
-                    probe = root / f".stowarr-write-test-{secrets.token_hex(6)}"
-                    try:
-                        probe.write_bytes(b"")
-                        probe.unlink()
-                    except OSError as error:
-                        probe.unlink(missing_ok=True)
-                        raise PermissionError(f"Required media path is not writable inside the API container: {root}") from error
+            self._validate_write_paths()
         self.store.set_setting("runtime", {"apply": apply})
         self.config = replace(self.config, apply=apply)
         return self.runtime_settings()
@@ -748,25 +761,38 @@ class Stowarr:
         roots = {configured}
         client = getattr(self, "arr", {}).get(app)
         root_folders = getattr(client, "root_folders", None)
-        if root_folders:
-            try:
-                contains = getattr(
-                    pool,
-                    "contains",
-                    lambda path: Path(path) == pool.prefix or Path(path).is_relative_to(pool.prefix),
+        if not callable(root_folders):
+            if strict:
+                raise RuntimeError(
+                    f"{app.capitalize()} must be configured before Write mode can be enabled"
                 )
-                roots.update(
-                    Path(str(record["path"]))
-                    for record in root_folders()
-                    if record.get("path") and contains(Path(str(record["path"])))
+            return tuple(roots)
+        try:
+            contains = getattr(
+                pool,
+                "contains",
+                lambda path: Path(path) == pool.prefix or Path(path).is_relative_to(pool.prefix),
+            )
+            discovered = {
+                Path(str(record["path"]))
+                for record in root_folders()
+                if record.get("path") and contains(Path(str(record["path"])))
+            }
+            if strict and configured not in discovered:
+                raise RuntimeError(
+                    f'Configured {app.capitalize()} root "{configured}" is not exposed by '
+                    f"{app.capitalize()}"
                 )
-            except Exception as error:
-                if strict:
-                    raise RuntimeError(
-                        f"Unable to discover {app.capitalize()} root folders"
-                    ) from error
-                # Never infer additional writable roots when live discovery fails.
-                pass
+            roots.update(discovered)
+        except Exception as error:
+            if strict:
+                if isinstance(error, RuntimeError):
+                    raise
+                raise RuntimeError(
+                    f"Unable to discover {app.capitalize()} root folders"
+                ) from error
+            # Never infer additional writable roots when live discovery fails.
+            pass
         return tuple(sorted(roots, key=lambda root: (len(root.parts), str(root))))
 
     def _pool_media_paths(
@@ -778,6 +804,19 @@ class Stowarr:
             *self._pool_library_roots("sonarr", pool, strict=strict_discovery),
         )
         return tuple(dict.fromkeys(paths))
+
+    def _validate_write_paths(self) -> None:
+        for pool in self.config.pools:
+            for root in self._pool_media_paths(pool, strict_discovery=True):
+                probe = root / f".stowarr-write-test-{secrets.token_hex(6)}"
+                try:
+                    probe.write_bytes(b"")
+                    probe.unlink()
+                except OSError as error:
+                    probe.unlink(missing_ok=True)
+                    raise PermissionError(
+                        f"Required media path is not writable inside the API container: {root}"
+                    ) from error
 
     def _library_root_for_path(
         self, app: str, pool: Pool, path: str | Path,
