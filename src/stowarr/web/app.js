@@ -1,4 +1,4 @@
-const state={authenticated:false,auth:null,config:null,connections:null,serviceStatus:null,runtime:null,recovery:null,recoveryDiagnoses:new Map(),operations:[],queue:[],reconcileQueue:[],operationEvents:new Map(),selectedHistory:new Set(),securityEvents:[],sessions:[],plan:null,movePlan:null,moveTorrent:null,qbitCatalog:null,routingAudit:null,hiddenMoveColumns:new Set(),syncApp:'radarr',sync:{},syncExpanded:new Set(),syncHiddenStatuses:{radarr:new Set(),sonarr:new Set()},operationSections:{completed:false,remaining:false},operationTracking:false,operationTrackingGeneration:0,operationHidden:false,currentOperation:null};
+const state={authenticated:false,auth:null,config:null,connections:null,serviceStatus:null,runtime:null,recovery:null,recoveryDiagnoses:new Map(),operations:[],queue:[],reconcileQueue:[],operationEvents:new Map(),selectedHistory:new Set(),securityEvents:[],sessions:[],plan:null,movePlan:null,moveTorrent:null,qbitCatalog:null,routingAudit:null,hiddenMoveColumns:new Set(),syncApp:'radarr',sync:{},safeSyncPlans:{},syncExpanded:new Set(),syncHiddenStatuses:{radarr:new Set(),sonarr:new Set()},operationSections:{completed:false,remaining:false},operationTracking:false,operationTrackingGeneration:0,operationHidden:false,currentOperation:null};
 const $=(s,r=document)=>r.querySelector(s);const $$=(s,r=document)=>[...r.querySelectorAll(s)];
 const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const fmtTime=v=>v?new Date(v*1000).toLocaleString(): '—';
@@ -665,6 +665,7 @@ function setSyncApp(app){
   if(cached)renderSync(cached);else{
     $('#sync-summary').innerHTML='';
     $('#sync-filters').innerHTML='';
+    $('#sync-safe-actions').innerHTML='';
     $('#sync-rows').innerHTML=`<tr><td colspan="7" class="empty">Run the ${esc(app[0].toUpperCase()+app.slice(1))} audit to compare hashes</td></tr>`;
   }
 }
@@ -700,8 +701,10 @@ function renderSync(result){
   const expanded=state.syncExpanded.has(result.app);
   const healthyGroup=healthy.length?`<tr class="sync-group-row"><td colspan="7"><button type="button" class="sync-group-toggle" data-sync-group="${esc(result.app)}" aria-expanded="${expanded}"><span><i>${expanded?'▾':'▸'}</i><strong>In sync</strong><small>${healthy.length} ${healthy.length===1?'title':'titles'} without detected issues</small></span><b>${expanded?'Collapse':'Show'}</b></button></td></tr>${expanded?healthy.map(rowMarkup).join(''):''}`:'';
   $('#sync-summary').innerHTML=`<span><strong>${result.scanned}</strong><small>qBit torrents</small></span><span><strong>${result.matched_history}</strong><small>hash matches</small></span><span><strong>${result.in_sync}</strong><small>in sync</small></span><span><strong>${result.issues}</strong><small>issues</small></span><span><strong>${visibleRows.length}</strong><small>visible</small></span>`;
-  $('#sync-filters').innerHTML=`<span>Status</span><div>${[...statusCounts].map(([status,count])=>`<button type="button" class="sync-status-filter ${hidden.has(status)?'':'active'}" data-status="${esc(status)}" aria-pressed="${hidden.has(status)?'false':'true'}">${badge(status)}<b>${count}</b></button>`).join('')}</div><button type="button" class="text-button" id="sync-issues-only">Issues only</button><button type="button" class="text-button" id="sync-show-all">Show all</button>`;
+  const hasSafePossibilities=result.rows.some(row=>(row.status==='category-unconfigured'&&row.category_repairable)||row.status==='root-mismatch');
+  $('#sync-filters').innerHTML=`<span>Status</span><div>${[...statusCounts].map(([status,count])=>`<button type="button" class="sync-status-filter ${hidden.has(status)?'':'active'}" data-status="${esc(status)}" aria-pressed="${hidden.has(status)?'false':'true'}">${badge(status)}<b>${count}</b></button>`).join('')}</div><button type="button" class="text-button" id="sync-issues-only">Issues only</button><button type="button" class="text-button" id="sync-show-all">Show all</button>${hasSafePossibilities?'<button type="button" class="secondary compact" id="plan-safe-sync">Plan safe fixes</button>':''}`;
   $('#sync-rows').innerHTML=!result.rows.length?`<tr><td colspan="7" class="empty">No ${esc(result.app)} torrents found in qBittorrent</td></tr>`:visibleRows.length?`${issues.map(rowMarkup).join('')}${healthyGroup}`:'<tr><td colspan="7" class="empty">No audit rows match the selected status filters</td></tr>';
+  renderSafeSyncPlan(state.safeSyncPlans[result.app]);
 }
 async function repairSyncCategory(button){
   const app=button.dataset.app;
@@ -720,7 +723,79 @@ async function repairSyncCategory(button){
     button.textContent='Set category';
   }
 }
-async function runSync(){const app=state.syncApp;$('#sync-loading').classList.remove('hidden');$('#run-sync').disabled=true;try{const result=await api(`/api/sync/${app}`);state.sync[app]=result;state.syncExpanded.delete(app);renderSync(result)}catch(e){toast(`Audit failed: ${e.message}`)}finally{$(`#sync-loading`).classList.add('hidden');$('#run-sync').disabled=false}}
+function renderSafeSyncPlan(plan){
+  const target=$('#sync-safe-actions');
+  if(!plan){target.innerHTML='';return}
+  const category=plan.category_repairs||[];
+  const reconcile=plan.reconcile_candidates||[];
+  const queued=plan.queued_reconciles||[];
+  const manual=plan.manual||[];
+  const preview=(items,empty)=>items.length?`<ul>${items.slice(0,8).map(item=>`<li><strong>${esc(item.torrent_name)}</strong><small>${esc(item.category?`${item.current_category||'none'} → ${item.category}`:item.target_pool?`Reconcile to ${item.target_pool}`:item.reason||item.status)}</small></li>`).join('')}${items.length>8?`<li><strong>+ ${items.length-8} more</strong></li>`:''}</ul>`:`<p>${esc(empty)}</p>`;
+  const reconcileDisabled=!reconcile.length||!state.config?.apply||category.length>0;
+  target.innerHTML=`<section class="sync-safe-plan"><header><div><h3>Safe assisted repair</h3><p>Fresh plans only. Category fixes are applied first; Reconcile candidates enter the shared FIFO queue. Ambiguous items remain manual.</p></div><span>${plan.safe_count} safe</span></header><div class="sync-safe-columns"><article><h4>1 · Category fixes <b>${category.length}</b></h4>${preview(category,'No safely repairable categories.')}<button type="button" id="apply-safe-categories" class="primary compact" ${category.length&&state.config?.apply?'':'disabled'}>Apply safe category fixes</button></article><article><h4>2 · Reconcile queue <b>${reconcile.length}</b></h4>${preview(reconcile,'No root mismatches have a ready Reconcile plan.')}<button type="button" id="queue-safe-reconciles" class="primary compact" ${reconcileDisabled?'disabled':''}>${category.length?'Apply category fixes first':'Queue safe reconciles'}</button></article><article><h4>Manual review <b>${manual.length}</b></h4>${preview(manual,'No remaining manual issues in this plan.')}${queued.length?`<p>${queued.length} Reconcile ${queued.length===1?'job is':'jobs are'} already active.</p>`:''}</article></div></section>`;
+}
+async function planSafeSyncFixes(){
+  const app=state.syncApp;
+  const button=$('#plan-safe-sync');
+  if(button){button.disabled=true;button.textContent='Planning…'}
+  try{
+    const plan=await api(`/api/sync/${encodeURIComponent(app)}/safe-plan`);
+    state.safeSyncPlans[app]=plan;
+    renderSafeSyncPlan(plan);
+    toast(`${plan.safe_count} safe assisted action${plan.safe_count===1?'':'s'} found`);
+  }catch(error){
+    toast(`Safe plan failed: ${error.message}`);
+    if(button){button.disabled=false;button.textContent='Plan safe fixes'}
+  }
+}
+async function applySafeCategories(){
+  const app=state.syncApp;
+  const plan=state.safeSyncPlans[app];
+  const repairs=plan?.category_repairs||[];
+  if(!repairs.length)return;
+  if(!await confirmAction({title:`Apply ${repairs.length} safe category ${repairs.length===1?'fix':'fixes'}?`,message:'Before changing qBittorrent, Stowarr will rebuild the audit and verify every exact hash association, download path, pool route, and category destination. If any item changed, the entire batch is rejected.',details:repairs.slice(0,10).map(item=>[item.torrent_name,`${item.current_category||'none'} → ${item.category}`]),confirmLabel:'Apply safe fixes'}))return;
+  const hashes=repairs.map(item=>item.hash);
+  const button=$('#apply-safe-categories');
+  button.disabled=true;
+  button.textContent='Revalidating…';
+  try{
+    const confirmation=await api(`/api/sync/${encodeURIComponent(app)}/safe-category/confirmation`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHashes:hashes})});
+    const result=await api(`/api/sync/${encodeURIComponent(app)}/safe-category/apply`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHashes:hashes,confirmationToken:confirmation.token})});
+    toast(`${result.changed} qBittorrent ${result.changed===1?'category':'categories'} changed`);
+    await runSync();
+    await planSafeSyncFixes();
+  }catch(error){
+    toast(`No category batch was applied: ${error.message}`);
+    button.disabled=false;
+    button.textContent='Apply safe category fixes';
+  }
+}
+async function queueSafeReconciles(){
+  const app=state.syncApp;
+  const candidates=state.safeSyncPlans[app]?.reconcile_candidates||[];
+  if(!candidates.length)return;
+  if(!await confirmAction({title:`Queue ${candidates.length} safe Reconcile ${candidates.length===1?'job':'jobs'}?`,message:'Each candidate gets a fresh exact plan and confirmation. Changed or ambiguous candidates are skipped; accepted jobs enter the existing shared Move/Reconcile FIFO queue.',details:candidates.slice(0,10).map(item=>[item.torrent_name,`${item.target_pool} · ${item.auxiliary_count} auxiliary files`]),confirmLabel:'Queue safe reconciles'}))return;
+  const button=$('#queue-safe-reconciles');
+  button.disabled=true;
+  button.textContent='Revalidating…';
+  let queued=0;
+  const failures=[];
+  for(const candidate of candidates){
+    const payload={auxiliaryFiles:candidate.auxiliary_files};
+    try{
+      const confirmation=await api('/api/confirmations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'reconcile',torrentHash:candidate.hash,payload})});
+      await api('/api/reconcile-queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHash:candidate.hash,...payload,confirmationToken:confirmation.token})});
+      queued+=1;
+    }catch(error){
+      failures.push(`${candidate.torrent_name}: ${error.message}`);
+    }
+  }
+  await refreshQueue(true);
+  await runSync();
+  if(failures.length)toast(`${queued} queued; ${failures.length} skipped after fresh validation`);
+  else toast(`${queued} safe Reconcile ${queued===1?'job':'jobs'} added to the shared queue`);
+}
+async function runSync(){const app=state.syncApp;delete state.safeSyncPlans[app];$('#sync-safe-actions').innerHTML='';$('#sync-loading').classList.remove('hidden');$('#run-sync').disabled=true;try{const result=await api(`/api/sync/${app}`);state.sync[app]=result;state.syncExpanded.delete(app);renderSync(result)}catch(e){toast(`Audit failed: ${e.message}`)}finally{$(`#sync-loading`).classList.add('hidden');$('#run-sync').disabled=false}}
 async function viewSyncQueue(publicId){
   navigate('queue');
   await refreshQueue(true);
@@ -753,6 +828,9 @@ $('#runtime-form').addEventListener('submit',saveRuntime);
 $('#revoke-sessions').addEventListener('click',revokeSessions);
 document.addEventListener('click',event=>{const button=event.target.closest('.set-extra-action');if(button?.dataset.action==='move')$$('.move-extra-action').filter(input=>input.options[0].disabled).forEach(input=>input.value='delete')});
 document.addEventListener('click',event=>{
+  if(event.target.closest('#plan-safe-sync'))planSafeSyncFixes();
+  if(event.target.closest('#apply-safe-categories'))applySafeCategories();
+  if(event.target.closest('#queue-safe-reconciles'))queueSafeReconciles();
   const statusFilter=event.target.closest('.sync-status-filter');
   if(statusFilter){
     const hidden=state.syncHiddenStatuses[state.syncApp];

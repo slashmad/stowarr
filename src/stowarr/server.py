@@ -181,6 +181,14 @@ def handler(manager: Stowarr):
                 self.send_json(200, manager.qbit_catalog())
             elif path == "/api/routing/audit":
                 self.send_json(200, manager.routing_audit())
+            elif path.startswith("/api/sync/") and path.endswith("/safe-plan"):
+                try:
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 4:
+                        raise ValueError("Invalid safe Sync plan path")
+                    self.send_json(200, manager.safe_sync_plan(parts[2].casefold()))
+                except ValueError as error:
+                    self.send_json(400, {"error": str(error)})
             elif path.startswith("/api/sync/"):
                 try:
                     self.send_json(200, manager.sync_audit(path.rsplit("/", 1)[-1].casefold()))
@@ -317,6 +325,46 @@ def handler(manager: Stowarr):
                     if not isinstance(payload, dict):
                         raise ValueError("payload must be an object")
                     self.send_json(201, manager.issue_confirmation(kind, torrent_hash, payload))
+                except Exception as error:
+                    self.send_json(409, {"error": str(error)})
+            elif path.startswith("/api/sync/") and path.endswith("/safe-category/confirmation"):
+                try:
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 5:
+                        raise ValueError("Invalid safe category confirmation path")
+                    body = self.read_json()
+                    torrent_hashes = body.get("torrentHashes", [])
+                    if not isinstance(torrent_hashes, list) or not all(
+                        isinstance(item, str) for item in torrent_hashes
+                    ):
+                        raise ValueError("torrentHashes must be a list of hashes")
+                    self.send_json(
+                        201,
+                        manager.issue_safe_category_confirmation(
+                            parts[2].casefold(), torrent_hashes
+                        ),
+                    )
+                except Exception as error:
+                    self.send_json(409, {"error": str(error)})
+            elif path.startswith("/api/sync/") and path.endswith("/safe-category/apply"):
+                try:
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 5:
+                        raise ValueError("Invalid safe category apply path")
+                    body = self.read_json()
+                    torrent_hashes = body.get("torrentHashes", [])
+                    if not isinstance(torrent_hashes, list) or not all(
+                        isinstance(item, str) for item in torrent_hashes
+                    ):
+                        raise ValueError("torrentHashes must be a list of hashes")
+                    self.send_json(
+                        200,
+                        manager.apply_safe_category_repairs(
+                            str(body.get("confirmationToken") or ""),
+                            parts[2].casefold(),
+                            torrent_hashes,
+                        ),
+                    )
                 except Exception as error:
                     self.send_json(409, {"error": str(error)})
             elif path.startswith("/api/sync/") and path.endswith("/category"):
