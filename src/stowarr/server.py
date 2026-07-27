@@ -8,9 +8,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from urllib.parse import parse_qs, urlparse
 
+from . import __version__
 from .engine import Stowarr
 from .queue import OperationQueueWorker
-from . import __version__
 
 
 def handler(manager: Stowarr):
@@ -267,6 +267,8 @@ def handler(manager: Stowarr):
                     kind = body.get("kind")
                     torrent_hash = body.get("torrentHash")
                     payload = body.get("payload", {})
+                    if kind not in {"move", "reconcile"}:
+                        raise ValueError("kind must be move or reconcile")
                     if not isinstance(torrent_hash, str) or not torrent_hash:
                         raise ValueError("torrentHash is required")
                     if not isinstance(payload, dict):

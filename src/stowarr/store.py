@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import secrets
 import sqlite3
 import threading
 import time
-import secrets
 from pathlib import Path
 
 
@@ -154,8 +154,9 @@ class Store:
         for row in rows:
             current += 1
             table = "move_queue" if row["kind"] == "move" else "reconcile_queue"
+            # The table is selected from two constants above.
             self.db.execute(
-                f"UPDATE {table} SET queue_order=? WHERE id=?",
+                f"UPDATE {table} SET queue_order=? WHERE id=?",  # nosec
                 (current, row["id"]),
             )
 
@@ -311,6 +312,8 @@ class Store:
                 ) VALUES(?,?,?,?,?,?,?,?)""",
                 (torrent_hash, app, kind, state, json.dumps(detail), now, now, public_id),
             )
+            if cursor.lastrowid is None:
+                raise RuntimeError("Operation was not recorded")
             operation_id = int(cursor.lastrowid)
             self.db.execute(
                 "UPDATE move_queue SET operation_id=? WHERE public_id=?",
@@ -393,8 +396,10 @@ class Store:
                 if not selected:
                     return 0
                 placeholders = ",".join("?" for _ in selected)
+                # Only the placeholder count is interpolated; values remain parameterized.
                 rows = self.db.execute(
-                    f"SELECT id, state FROM operations WHERE id IN ({placeholders})", selected
+                    f"SELECT id, state FROM operations WHERE id IN ({placeholders})",  # nosec
+                    selected,
                 ).fetchall()
                 nonterminal = [row["id"] for row in rows if row["state"] not in terminal]
                 if nonterminal:
@@ -404,15 +409,21 @@ class Store:
                 return 0
             placeholders = ",".join("?" for _ in selected)
             self.db.execute(
-                f"UPDATE move_queue SET operation_id=NULL WHERE operation_id IN ({placeholders})",
+                f"UPDATE move_queue SET operation_id=NULL WHERE operation_id IN ({placeholders})",  # nosec
                 selected,
             )
             self.db.execute(
-                f"UPDATE reconcile_queue SET operation_id=NULL WHERE operation_id IN ({placeholders})",
+                f"UPDATE reconcile_queue SET operation_id=NULL WHERE operation_id IN ({placeholders})",  # nosec
                 selected,
             )
-            self.db.execute(f"DELETE FROM operation_events WHERE operation_id IN ({placeholders})", selected)
-            cursor = self.db.execute(f"DELETE FROM operations WHERE id IN ({placeholders})", selected)
+            self.db.execute(
+                f"DELETE FROM operation_events WHERE operation_id IN ({placeholders})",  # nosec
+                selected,
+            )
+            cursor = self.db.execute(
+                f"DELETE FROM operations WHERE id IN ({placeholders})",  # nosec
+                selected,
+            )
             self.db.commit()
             return int(cursor.rowcount)
 
@@ -494,7 +505,10 @@ class Store:
         if table not in {"move_queue", "reconcile_queue"}:
             raise ValueError("Unknown queue")
         with self.lock:
-            cursor = self.db.execute(f"DELETE FROM {table} WHERE state!='RUNNING'")
+            # The table is allowlisted above.
+            cursor = self.db.execute(
+                f"DELETE FROM {table} WHERE state!='RUNNING'"  # nosec
+            )
             self.db.commit()
             return int(cursor.rowcount)
 
@@ -648,16 +662,19 @@ class Store:
                 return None
             table = "move_queue" if row["kind"] == "move" else "reconcile_queue"
             now = int(time.time())
+            # The table is selected from two constants above.
+            update = f"""UPDATE {table} SET state='RUNNING',started_at=?,updated_at=?
+                WHERE id=? AND state='QUEUED'"""  # nosec
             cursor = self.db.execute(
-                f"""UPDATE {table} SET state='RUNNING',started_at=?,updated_at=?
-                WHERE id=? AND state='QUEUED'""",
+                update,
                 (now, now, row["id"]),
             )
             self.db.commit()
             if cursor.rowcount != 1:
                 return None
             claimed = self.db.execute(
-                f"SELECT * FROM {table} WHERE id=?", (row["id"],)
+                f"SELECT * FROM {table} WHERE id=?",  # nosec
+                (row["id"],),
             ).fetchone()
             return {**self._queue_row(claimed), "kind": row["kind"]}
 

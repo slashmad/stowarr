@@ -12,14 +12,20 @@ config/*.local.json
 state/
 
 # Python and test artifacts
+.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 *.egg-info/
 dist/
 build/
+
+# JavaScript development artifacts
+node_modules/
 
 # Editors and operating systems
 .idea/

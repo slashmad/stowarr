@@ -286,7 +286,7 @@ class StoreTest(unittest.TestCase):
                 public_id=finished["public_id"],
             )
             store.finish_move(finished["id"], "COMPLETE", operation_id)
-            waiting = store.enqueue_move("waiting", "p1", {}, "waiting", {})
+            store.enqueue_move("waiting", "p1", {}, "waiting", {})
 
             running = store.claim_next_move()
             queued = store.enqueue_move("queued", "p1", {}, "queued", {})

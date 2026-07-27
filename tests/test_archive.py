@@ -1,10 +1,15 @@
-import tempfile
 import unittest
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
-from stowarr.archive import ArchiveExtractor, is_archive_path, safe_member_path, select_archive_entries, select_archive_entry
+from stowarr.archive import (
+    ArchiveExtractor,
+    is_archive_path,
+    safe_member_path,
+    select_archive_entries,
+    select_archive_entry,
+)
 
 
 class ArchiveTest(unittest.TestCase):
