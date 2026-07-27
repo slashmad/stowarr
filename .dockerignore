@@ -31,3 +31,8 @@ build
 *.crt
 *.log
 *.tmp
+
+# Local-only project memory
+AGENTS.md
+AI_CONTEXT.md
+docs/project-memory
