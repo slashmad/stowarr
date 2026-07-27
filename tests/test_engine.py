@@ -104,6 +104,98 @@ class EngineTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "dry-run"):
             manager.enqueue_reconcile("token", "reconcile-hash", {})
 
+    def test_dry_run_submissions_stay_dry_when_write_mode_changes_while_waiting(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=False)
+        manager._move_lock = threading.RLock()
+        manager.store = SimpleNamespace(
+            has_active_queue_work=lambda: self.fail(
+                "Dry-run submissions must bypass persistent queue state"
+            )
+        )
+        confirmed = threading.Event()
+        manager.consume_confirmation = lambda token, kind, torrent_hash, payload: (
+            confirmed.set() or {
+                "plan": {"torrent_name": "Example"},
+                "payload": payload,
+                "fingerprint": f"{kind}-fingerprint",
+            }
+        )
+        observed = []
+        manager._run_move = lambda *args, **kwargs: (
+            observed.append(("move", kwargs.get("write_enabled"))) or
+            {"operation_id": 11, "state": "DRY_RUN"}
+        )
+
+        def reconcile(*args, **kwargs):
+            with manager._move_lock:
+                observed.append(("reconcile", kwargs.get("write_enabled")))
+                return {"operation_id": 12, "state": "DRY_RUN"}
+
+        manager.reconcile = reconcile
+
+        def submit_move():
+            manager.submit_move(
+                "move-token", "move-hash",
+                {"targetPool": "p1", "additionalFiles": {}},
+            )
+
+        manager._move_lock.acquire()
+        move_thread = threading.Thread(target=submit_move)
+        move_thread.start()
+        self.assertTrue(confirmed.wait(timeout=1))
+        manager.config = SimpleNamespace(apply=True)
+        manager._move_lock.release()
+        move_thread.join(timeout=1)
+        self.assertFalse(move_thread.is_alive())
+
+        manager.config = SimpleNamespace(apply=False)
+        confirmed.clear()
+        manager._move_lock.acquire()
+        reconcile_thread = threading.Thread(
+            target=lambda: manager.submit_reconcile(
+                "reconcile-token", "reconcile-hash", {"auxiliaryFiles": []},
+            )
+        )
+        reconcile_thread.start()
+        self.assertTrue(confirmed.wait(timeout=1))
+        manager.config = SimpleNamespace(apply=True)
+        manager._move_lock.release()
+        reconcile_thread.join(timeout=1)
+        self.assertFalse(reconcile_thread.is_alive())
+
+        self.assertEqual(observed, [("move", False), ("reconcile", False)])
+
+    def test_explicit_dry_run_mode_controls_move_and_reconcile_write_gates(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=True)
+        updates = []
+        manager.store = SimpleNamespace(
+            active=lambda *args, **kwargs: None,
+            record=lambda *args, **kwargs: 17,
+            update=lambda *args: updates.append(args),
+        )
+        manager.move_plan = lambda *args, **kwargs: MovePlan(
+            "move-hash", "Example", "radarr", "p1", "p3",
+            "/p1/download/Example", "/p3/download/Example", "radarr-pool3",
+            42, "Example", [], 100, 1000, "ready",
+        )
+        reconcile_plan = Plan(
+            "reconcile-hash", "Example", "radarr", "p3", 42, "Example",
+            "/p1/movies/Example", "/p3/movies/Example", [], "ready",
+        )
+
+        move = manager._run_move(
+            "move-hash", "p3", {}, write_enabled=False,
+        )
+        reconcile = manager._run_reconcile(
+            "reconcile-hash", prepared_plan=reconcile_plan, write_enabled=False,
+        )
+
+        self.assertEqual(move["state"], "DRY_RUN")
+        self.assertEqual(reconcile["state"], "DRY_RUN")
+        self.assertEqual([update[1] for update in updates], ["DRY_RUN", "DRY_RUN"])
+
     def test_service_status_reports_live_versions_without_credentials(self):
         manager = Stowarr.__new__(Stowarr)
         manager.config = SimpleNamespace(apply=True)

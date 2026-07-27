@@ -575,13 +575,15 @@ class Stowarr:
     def submit_move(self, token: str, torrent_hash: str, payload: dict) -> dict:
         """Record dry runs directly; serialize or queue confirmed write operations."""
         authorized = self.consume_confirmation(token, "move", torrent_hash, payload)
-        if not self.config.apply:
+        submission_apply = self.config.apply
+        if not submission_apply:
             with self._move_lock:
                 return {
                     **self._run_move(
                         torrent_hash,
                         authorized["payload"]["targetPool"],
                         authorized["payload"]["additionalFiles"],
+                        write_enabled=False,
                     ),
                     "kind": "move",
                     "disposition": "direct",
@@ -620,11 +622,13 @@ class Stowarr:
     def submit_reconcile(self, token: str, torrent_hash: str, payload: dict) -> dict:
         """Record dry runs directly; serialize or queue confirmed write operations."""
         authorized = self.consume_confirmation(token, "reconcile", torrent_hash, payload)
-        if not self.config.apply:
+        submission_apply = self.config.apply
+        if not submission_apply:
             return {
                 **self.reconcile(
                     torrent_hash,
                     set(authorized["payload"]["auxiliaryFiles"]),
+                    write_enabled=False,
                 ),
                 "kind": "reconcile",
                 "disposition": "direct",
@@ -1374,7 +1378,9 @@ class Stowarr:
     def _run_move(
         self, torrent_hash: str, target_pool_name: str,
         additional_actions: dict[str, str] | None = None, public_id: str | None = None,
+        write_enabled: bool | None = None,
     ) -> dict:
+        write_enabled = self.config.apply if write_enabled is None else write_enabled
         if self.store.active(torrent_hash, kind="move"):
             raise RuntimeError("Another Move operation is already active for this torrent")
         plan = self.move_plan(torrent_hash, target_pool_name)
@@ -1389,7 +1395,7 @@ class Stowarr:
         operation_id = self.store.record(
             torrent_hash, plan.app, "MOVE_PLANNED", detail, kind="move", public_id=public_id
         )
-        if plan.status != "ready" or not self.config.apply:
+        if plan.status != "ready" or not write_enabled:
             state = "BLOCKED" if plan.status != "ready" else "DRY_RUN"
             self.store.update(operation_id, state, detail)
             return {"operation_id": operation_id, "state": state, "plan": plan.json()}
@@ -1499,7 +1505,7 @@ class Stowarr:
                                     verified_derived_paths=verified_derived, progress_callback=report,
                                     mapping_hint=mapping_hint, app_hint=plan.app,
                                     relocated_library_sources=relocated_library_sources,
-                                    prepared_plan=post_plan)
+                                    prepared_plan=post_plan, write_enabled=write_enabled)
             if result["state"] != "COMPLETE":
                 raise RuntimeError(f'Reconciliation did not complete after qBittorrent move: {result["state"]}')
             report("MOVE_DERIVATIVE_CLEANUP", 0, message="Checking for verified Unpackerr derivatives")
@@ -2426,6 +2432,7 @@ class Stowarr:
         relocated_library_sources: set[str] | None = None,
         prepared_plan: Plan | None = None,
         public_id: str | None = None,
+        write_enabled: bool | None = None,
     ) -> dict:
         execute = lambda: self._run_reconcile(
             torrent_hash,
@@ -2438,6 +2445,7 @@ class Stowarr:
             relocated_library_sources=relocated_library_sources,
             prepared_plan=prepared_plan,
             public_id=public_id,
+            write_enabled=write_enabled,
         )
         lock = getattr(self, "_move_lock", None)
         if lock is None:
@@ -2457,7 +2465,9 @@ class Stowarr:
         relocated_library_sources: set[str] | None = None,
         prepared_plan: Plan | None = None,
         public_id: str | None = None,
+        write_enabled: bool | None = None,
     ) -> dict:
+        write_enabled = self.config.apply if write_enabled is None else write_enabled
         plan = prepared_plan or self.plan(
             torrent_hash,
             verified_derived_paths=verified_derived_paths,
@@ -2487,7 +2497,7 @@ class Stowarr:
                     **plan.json(),
                     "progress": {"state": state, "percent": percent, **progress},
                 })
-        if plan.status != "ready" or not self.config.apply:
+        if plan.status != "ready" or not write_enabled:
             state = "BLOCKED" if plan.status != "ready" else "DRY_RUN"
             if nested_move:
                 raise RuntimeError(f"Move library reconciliation is blocked: {plan.reason or state}")
