@@ -1,4 +1,4 @@
-const state={authenticated:false,auth:null,config:null,connections:null,serviceStatus:null,runtime:null,recovery:null,recoveryDiagnoses:new Map(),operations:[],queue:[],reconcileQueue:[],operationEvents:new Map(),selectedHistory:new Set(),securityEvents:[],sessions:[],plan:null,movePlan:null,moveTorrent:null,qbitCatalog:null,routingAudit:null,hiddenMoveColumns:new Set(),syncApp:'radarr',sync:{},safeSyncPlans:{},syncExpanded:new Set(),syncHiddenStatuses:{radarr:new Set(),sonarr:new Set()},operationSections:{completed:false,remaining:false},operationTracking:false,operationTrackingGeneration:0,operationHidden:false,currentOperation:null};
+const state={authenticated:false,auth:null,config:null,connections:null,serviceStatus:null,runtime:null,recovery:null,recoveryDiagnoses:new Map(),operations:[],queue:[],reconcileQueue:[],operationEvents:new Map(),selectedHistory:new Set(),securityEvents:[],sessions:[],plan:null,movePlan:null,moveTorrent:null,qbitCatalog:null,routingAudit:null,hiddenMoveColumns:new Set(),syncApp:'radarr',sync:{},safeSyncPlans:{},safeWorkflow:null,syncExpanded:new Set(),syncHiddenStatuses:{radarr:new Set(),sonarr:new Set()},operationSections:{completed:false,remaining:false},operationTracking:false,operationTrackingGeneration:0,operationHidden:false,currentOperation:null};
 const $=(s,r=document)=>r.querySelector(s);const $$=(s,r=document)=>[...r.querySelectorAll(s)];
 const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const fmtTime=v=>v?new Date(v*1000).toLocaleString(): '—';
@@ -6,6 +6,37 @@ const fmtBytes=v=>{const n=Number(v||0);if(!n)return '0 B';const units=['B','KiB
 const badge=v=>`<span class="badge ${esc(String(v).toLowerCase())}">${esc(String(v).replaceAll('_',' '))}</span>`;
 const poolForPath=path=>state.config?.pools.find(p=>String(path||'').startsWith(p.prefix))?.name||'unknown pool';
 async function api(path,options={}){const method=(options.method||'GET').toUpperCase();const headers=new Headers(options.headers||{});if(method!=='GET'&&method!=='HEAD')headers.set('X-Stowarr-CSRF','1');const response=await fetch(path,{...options,headers,credentials:'same-origin'});if(response.status===401&&path!=='/api/auth/login'){state.authenticated=false;showLogin()}if(!response.ok)throw new Error((await response.json().catch(()=>({}))).error||`HTTP ${response.status}`);return response.json()}
+async function streamApi(path,options={},onProgress=()=>{}){
+  const method=(options.method||'GET').toUpperCase();
+  const headers=new Headers(options.headers||{});
+  if(method!=='GET'&&method!=='HEAD')headers.set('X-Stowarr-CSRF','1');
+  const response=await fetch(path,{...options,headers,credentials:'same-origin'});
+  if(response.status===401){state.authenticated=false;showLogin()}
+  if(!response.ok)throw new Error((await response.json().catch(()=>({}))).error||`HTTP ${response.status}`);
+  if(!response.body)throw new Error('Progress stream is unavailable');
+  const reader=response.body.getReader();
+  const decoder=new TextDecoder();
+  let buffer='';
+  let result;
+  const consume=line=>{
+    if(!line.trim())return;
+    const event=JSON.parse(line);
+    if(event.type==='progress')onProgress(event);
+    else if(event.type==='result')result=event.result;
+    else if(event.type==='error')throw new Error(event.error||'Safe workflow failed');
+  };
+  while(true){
+    const {value,done}=await reader.read();
+    buffer+=decoder.decode(value||new Uint8Array(),{stream:!done});
+    const lines=buffer.split('\n');
+    buffer=lines.pop()||'';
+    lines.forEach(consume);
+    if(done)break;
+  }
+  consume(buffer);
+  if(result===undefined)throw new Error('Safe workflow ended without a result');
+  return result;
+}
 function showLogin(message=''){const dialog=$('#login-dialog');$('#login-error').textContent=message;$('#login-error').classList.toggle('hidden',!message);if(!dialog.open)dialog.showModal()}
 async function bootstrap(){try{const auth=await api('/api/auth/status');state.auth=auth;state.authenticated=auth.authenticated;if(auth.authenticated)load();else showLogin(auth.method==='external'?'External authentication did not provide a trusted username. Access Stowarr through the configured authentication proxy.':'')}catch(e){showLogin(e.message)}}
 async function login(event){event.preventDefault();const form=event.currentTarget;const button=form.querySelector('button');button.disabled=true;button.textContent='Signing in…';try{await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:form.elements.username.value,password:form.elements.password.value})});state.authenticated=true;form.reset();form.elements.username.value='admin';$('#login-dialog').close();await load()}catch(e){showLogin(e.message)}finally{button.disabled=false;button.textContent='Sign in'}}
@@ -13,6 +44,73 @@ async function logout(){try{await api('/api/auth/logout',{method:'POST'});}final
 async function changePassword(event){event.preventDefault();const form=event.currentTarget;const current=form.elements['current-password'].value;const password=form.elements['new-password'].value;const confirmation=form.elements['confirm-password'].value;if(password!==confirmation){toast('New passwords do not match');return}const button=form.querySelector('button');button.disabled=true;try{await api('/api/auth/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currentPassword:current,newPassword:password})});form.reset();state.authenticated=false;showLogin('Password changed. Sign in again.')}catch(e){toast(`Password was not changed: ${e.message}`)}finally{button.disabled=false}}
 function toast(message){const node=$('#toast');node.textContent=message;node.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>node.classList.remove('show'),2600)}
 function confirmAction({title,message='',details=[],confirmLabel='Confirm',danger=false}){const dialog=$('#confirm-dialog');$('#confirm-title').textContent=title;$('#confirm-message').textContent=message;$('#confirm-details').innerHTML=details.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('');const accept=$('#confirm-accept');accept.textContent=confirmLabel;accept.className=danger?'danger':'primary';if(dialog.open)dialog.close();dialog.showModal();return new Promise(resolve=>{let settled=false;const finish=result=>{if(settled)return;settled=true;dialog.removeEventListener('cancel',onCancel);dialog.removeEventListener('close',onClose);$('#confirm-cancel').removeEventListener('click',onCancel);$('#confirm-close').removeEventListener('click',onCancel);accept.removeEventListener('click',onAccept);if(dialog.open)dialog.close();resolve(result)};const onCancel=event=>{event?.preventDefault();finish(false)};const onClose=()=>finish(false);const onAccept=()=>finish(true);dialog.addEventListener('cancel',onCancel);dialog.addEventListener('close',onClose);$('#confirm-cancel').addEventListener('click',onCancel);$('#confirm-close').addEventListener('click',onCancel);accept.addEventListener('click',onAccept)})}
+function startSafeWorkflow(title,summary,steps){
+  state.safeWorkflow={title,summary,steps:steps.map(step=>({...step,current:0,total:1,message:step.description,status:'remaining'})),terminal:false,error:''};
+  state.safeWorkflow.steps[0].status='active';
+  renderSafeWorkflow();
+  const dialog=$('#safe-workflow-dialog');
+  if(!dialog.open)dialog.showModal();
+}
+function updateSafeWorkflow(event){
+  const workflow=state.safeWorkflow;
+  if(!workflow)return;
+  const index=workflow.steps.findIndex(step=>step.id===event.stage);
+  if(index<0)return;
+  workflow.steps.forEach((step,stepIndex)=>{
+    if(stepIndex<index)step.status='complete';
+    else if(stepIndex===index)step.status='active';
+    else if(step.status!=='complete')step.status='remaining';
+  });
+  const step=workflow.steps[index];
+  step.current=Math.max(0,Number(event.current||0));
+  step.total=Math.max(0,Number(event.total||0));
+  step.message=event.message||step.description;
+  if(step.total===0||step.current>=step.total){
+    step.status='complete';
+    if(workflow.steps[index+1])workflow.steps[index+1].status='active';
+  }
+  renderSafeWorkflow();
+}
+function finishSafeWorkflow(summary){
+  if(!state.safeWorkflow)return;
+  state.safeWorkflow.steps.forEach(step=>{step.status='complete';step.current=step.total||1;step.total=step.total||1});
+  state.safeWorkflow.summary=summary;
+  state.safeWorkflow.terminal=true;
+  renderSafeWorkflow();
+}
+function failSafeWorkflow(error){
+  if(!state.safeWorkflow)return;
+  const active=state.safeWorkflow.steps.find(step=>step.status==='active');
+  if(active)active.status='failed';
+  state.safeWorkflow.error=error;
+  state.safeWorkflow.summary='The workflow stopped safely';
+  state.safeWorkflow.terminal=true;
+  renderSafeWorkflow();
+}
+function renderSafeWorkflow(){
+  const workflow=state.safeWorkflow;
+  if(!workflow)return;
+  $('#safe-workflow-title').textContent=workflow.title;
+  $('#safe-workflow-summary').textContent=workflow.summary;
+  const fractions=workflow.steps.map(step=>step.status==='complete'?1:step.status==='remaining'?0:step.total?Math.min(1,step.current/step.total):0);
+  const overall=Math.round(100*fractions.reduce((sum,value)=>sum+value,0)/Math.max(1,fractions.length));
+  $('#safe-workflow-overall').innerHTML=`<div class="operation-step-title"><strong>${workflow.terminal?(workflow.error?'Stopped':'All steps complete'):'Workflow progress'}</strong><b>${overall}% overall</b></div><div class="operation-progress"><i style="width:${overall}%"></i></div>`;
+  $('#safe-workflow-steps').innerHTML=workflow.steps.map((step,index)=>{
+    const fraction=step.status==='complete'?1:step.total?Math.min(1,step.current/step.total):0;
+    const count=step.status==='remaining'?'Waiting':step.status==='failed'?'Stopped':step.total>1?`${Math.min(step.current,step.total)} / ${step.total}`:step.status==='complete'?'Complete':'Working';
+    return `<li class="${esc(step.status)}"><span class="safe-step-index">${step.status==='complete'?'✓':index+1}</span><div><div class="operation-step-title"><strong>${esc(step.title)}</strong><b>${esc(count)}</b></div><div class="operation-progress"><i style="width:${Math.round(fraction*100)}%"></i></div><small>${esc(step.message)}</small></div></li>`;
+  }).join('');
+  $('#safe-workflow-error').textContent=workflow.error;
+  $('#safe-workflow-error').classList.toggle('hidden',!workflow.error);
+  $('#safe-workflow-close').disabled=!workflow.terminal;
+  $('#safe-workflow-done').disabled=!workflow.terminal;
+}
+function closeSafeWorkflow(){
+  if(!state.safeWorkflow?.terminal)return;
+  const dialog=$('#safe-workflow-dialog');
+  if(dialog.open)dialog.close();
+  state.safeWorkflow=null;
+}
 const MOVE_PROGRESS=[['MOVE_PLANNED','Plan accepted','The operation is bound to the reviewed torrent and destination.'],['MOVE_PAUSED','Torrent paused','Writes are stopped before the storage path changes.'],['MOVE_ISOLATED','Torrent isolated','A temporary Stowarr category prevents *Arr cleanup during the transaction.'],['MOVE_RELOCATING','Torrent data relocating','qBittorrent moves its tracked files to the destination pool.'],['MOVE_RECHECKING','qBittorrent rechecking','Stowarr observes qBittorrent enter checking and follows its reported progress.'],['MOVE_QBIT_COMPLETE','Torrent content verified','The recheck finished and every selected qBittorrent file is visible.'],['MOVE_ARCHIVE_VERIFYING','Archive integrity verifying','Every required archive set is tested at the destination before extraction.'],['MOVE_ARCHIVE_VERIFIED','Archive integrity verified','Every required archive set passed its integrity and manifest checks.'],['MOVE_EXTRACTING','Archive media extracting','Extraction, hashing, and publication progress are reported separately.'],['MOVE_EXTRACTED','Archive media verified','Archive-derived media has been extracted and hash-verified.'],['MOVE_ADDITIONAL_VERIFYING','Additional files verifying','Selected subtitles, metadata, and artwork are being verified.'],['MOVE_ADDITIONAL_VERIFIED','Additional files verified','Selected subtitles, metadata, and artwork are copied and hash-verified.'],['MOVE_LIBRARY_VERIFYING','Library files verifying','Media hashes and hardlink destinations are being verified.'],['MOVE_LIBRARY_LINKED','Library files created','Verified hardlinks or extracted media are created on the destination pool.'],['MOVE_LIBRARY_AUXILIARY','Library sidecars copied','Selected subtitles, metadata, and artwork are present in the new library.'],['MOVE_ARR_UPDATED','*Arr route updated','The movie or series root folder and pool tag now point at the destination.'],['MOVE_ARR_RESCANNING','*Arr library rescanning','Stowarr waits for the Radarr or Sonarr rescan command to finish.'],['MOVE_ARR_RESCANNED','*Arr rescan verified','Radarr or Sonarr confirms every managed file at its new path.'],['MOVE_OLD_LIBRARY_REMOVED','Source library finalized','A distinct stale source folder is removed after verification; the destination folder is always kept.'],['MOVE_DERIVATIVE_CLEANUP','Derived output cleanup','Recognized Unpackerr output is removed only after its media hash matches the published library file.'],['MOVE_ROUTE_COMMITTED','Final route committed','The destination category is assigned only after the library update succeeds.'],['MOVE_RESUMING','Torrent resuming','qBittorrent is instructed to continue from the verified destination.'],['MOVE_SEEDING','Seeding verified','qBittorrent confirms an active or queued upload state at 100% progress.'],['COMPLETE','Move complete','qBittorrent is seeding and the *Arr library agrees.']];
 const RECONCILE_PROGRESS=[['PLANNED','Plan accepted','The reviewed repair plan has been registered.'],['RECONCILE_VERIFYING','Library files verifying','Source content is hash-verified before links or copies are created.'],['LINKED','Library files created','Verified media is present on the authoritative pool.'],['AUXILIARY_COPIED','Sidecars copied','Selected subtitles, artwork, and metadata have been verified.'],['ARR_UPDATED','*Arr route updated','The movie or series points at the authoritative pool.'],['ARR_RESCANNING','*Arr library rescanning','Stowarr waits for Radarr or Sonarr to finish.'],['ARR_RESCANNED','*Arr rescan verified','Managed files are confirmed at their expected paths.'],['SOURCE_UNLINKED','Stale source removed','Verified obsolete files are removed last.'],['COMPLETE','Reconcile complete','The library and qBittorrent agree.']];
 const ARCHIVE_PROGRESS_STATES=new Set(['MOVE_ARCHIVE_VERIFYING','MOVE_ARCHIVE_VERIFIED','MOVE_EXTRACTING','MOVE_EXTRACTED']);
@@ -533,7 +631,7 @@ function shouldShowSubmissionTracker(){
   return !activeQueueWork&&!activeOperationTracking;
 }
 
-async function refreshQueue(quiet=false){
+async function refreshQueue(quiet=false,throwOnError=false){
   if(!state.authenticated)return;
   const previousActiveReconcile=activeReconcileQueueSignature();
   try{
@@ -542,7 +640,7 @@ async function refreshQueue(quiet=false){
     renderRecovery();
     automaticallyTrackRunningQueue();
     if(previousActiveReconcile!==activeReconcileQueueSignature()&&state.sync[state.syncApp])renderSync(state.sync[state.syncApp]);
-  }catch(error){if(!quiet||location.hash==='#queue')toast(`Could not load queues: ${error.message}`)}
+  }catch(error){if(!quiet||location.hash==='#queue')toast(`Could not load queues: ${error.message}`);if(throwOnError)throw error}
 }
 
 async function cancelQueue(id,kind='move'){
@@ -716,7 +814,7 @@ async function repairSyncCategory(button){
   try{
     const result=await api(`/api/sync/${encodeURIComponent(app)}/${encodeURIComponent(hash)}/category`,{method:'POST'});
     toast(result.changed?`Category changed to ${result.category}`:`Category is already ${result.category}`);
-    await runSync();
+    await runSync({app,throwOnError:true});
   }catch(error){
     toast(`Category was not changed: ${error.message}`);
     button.disabled=false;
@@ -734,18 +832,31 @@ function renderSafeSyncPlan(plan){
   const reconcileDisabled=!reconcile.length||!state.config?.apply||category.length>0;
   target.innerHTML=`<section class="sync-safe-plan"><header><div><h3>Safe assisted repair</h3><p>Fresh plans only. Category fixes are applied first; Reconcile candidates enter the shared FIFO queue. Ambiguous items remain manual.</p></div><span>${plan.safe_count} safe</span></header><div class="sync-safe-columns"><article><h4>1 · Category fixes <b>${category.length}</b></h4>${preview(category,'No safely repairable categories.')}<button type="button" id="apply-safe-categories" class="primary compact" ${category.length&&state.config?.apply?'':'disabled'}>Apply safe category fixes</button></article><article><h4>2 · Reconcile queue <b>${reconcile.length}</b></h4>${preview(reconcile,'No root mismatches have a ready Reconcile plan.')}<button type="button" id="queue-safe-reconciles" class="primary compact" ${reconcileDisabled?'disabled':''}>${category.length?'Apply category fixes first':'Queue safe reconciles'}</button></article><article><h4>Manual review <b>${manual.length}</b></h4>${preview(manual,'No remaining manual issues in this plan.')}${queued.length?`<p>${queued.length} Reconcile ${queued.length===1?'job is':'jobs are'} already active.</p>`:''}</article></div></section>`;
 }
+const safePlanSteps=()=>[
+  {id:'audit',title:'Read current audit',description:'Reading qBittorrent and exact *Arr history associations.'},
+  {id:'categories',title:'Classify category fixes',description:'Checking save paths, pool routes, and configured categories.'},
+  {id:'reconciles',title:'Build fresh Reconcile plans',description:'Testing each root mismatch against the complete Reconcile safety plan.'},
+  {id:'manual',title:'Separate manual issues',description:'Keeping ambiguous or incomplete evidence outside automation.'},
+];
+async function fetchSafeSyncPlan(app,onProgress){
+  return streamApi(`/api/sync/${encodeURIComponent(app)}/safe-plan/progress`,{},onProgress);
+}
 async function planSafeSyncFixes(){
   const app=state.syncApp;
   const button=$('#plan-safe-sync');
-  if(button){button.disabled=true;button.textContent='Planning…'}
+  if(button)button.disabled=true;
+  startSafeWorkflow(`Plan safe ${app==='radarr'?'Radarr':'Sonarr'} repairs`,'Building a read-only safe action plan',safePlanSteps());
   try{
-    const plan=await api(`/api/sync/${encodeURIComponent(app)}/safe-plan`);
+    const plan=await fetchSafeSyncPlan(app,updateSafeWorkflow);
     state.safeSyncPlans[app]=plan;
-    renderSafeSyncPlan(plan);
+    if(state.syncApp===app)renderSafeSyncPlan(plan);
+    finishSafeWorkflow(`${plan.safe_count} safe actions found; ${plan.manual.length} remain manual`);
     toast(`${plan.safe_count} safe assisted action${plan.safe_count===1?'':'s'} found`);
   }catch(error){
+    failSafeWorkflow(error.message);
     toast(`Safe plan failed: ${error.message}`);
-    if(button){button.disabled=false;button.textContent='Plan safe fixes'}
+  }finally{
+    if(button?.isConnected)button.disabled=false;
   }
 }
 async function applySafeCategories(){
@@ -757,17 +868,31 @@ async function applySafeCategories(){
   const hashes=repairs.map(item=>item.hash);
   const button=$('#apply-safe-categories');
   button.disabled=true;
-  button.textContent='Revalidating…';
+  startSafeWorkflow(`Apply ${repairs.length} safe category ${repairs.length===1?'fix':'fixes'}`,'Revalidating the exact batch before the first change',[
+    {id:'confirmation',title:'Bind exact confirmation',description:'Binding the selected hashes and current safe plan to one single-use token.'},
+    {id:'validation',title:'Revalidate complete batch',description:'Every selected torrent must remain safe before any category changes.'},
+    {id:'apply',title:'Apply qBittorrent categories',description:'Changing only the previously validated category routes.'},
+    {id:'audit',title:'Refresh Sync audit',description:'Reading qBittorrent and *Arr again after the batch.'},
+    {id:'rebuild',title:'Rebuild safe action plan',description:'Discovering which root mismatches are now ready for Reconcile.'},
+  ]);
   try{
     const confirmation=await api(`/api/sync/${encodeURIComponent(app)}/safe-category/confirmation`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHashes:hashes})});
-    const result=await api(`/api/sync/${encodeURIComponent(app)}/safe-category/apply`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHashes:hashes,confirmationToken:confirmation.token})});
+    updateSafeWorkflow({stage:'confirmation',current:1,total:1,message:`Confirmation expires at ${new Date(confirmation.expires_at*1000).toLocaleTimeString()}`});
+    const result=await streamApi(`/api/sync/${encodeURIComponent(app)}/safe-category/apply-progress`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHashes:hashes,confirmationToken:confirmation.token})},updateSafeWorkflow);
     toast(`${result.changed} qBittorrent ${result.changed===1?'category':'categories'} changed`);
-    await runSync();
-    await planSafeSyncFixes();
+    updateSafeWorkflow({stage:'audit',current:0,total:1,message:'Refreshing the complete Sync audit'});
+    await runSync({app,throwOnError:true});
+    updateSafeWorkflow({stage:'audit',current:1,total:1,message:'Sync audit refreshed'});
+    updateSafeWorkflow({stage:'rebuild',current:0,total:1,message:'Building the next safe action plan'});
+    const nextPlan=await fetchSafeSyncPlan(app,event=>updateSafeWorkflow({stage:'rebuild',current:0,total:1,message:event.message}));
+    state.safeSyncPlans[app]=nextPlan;
+    if(state.syncApp===app)renderSafeSyncPlan(nextPlan);
+    updateSafeWorkflow({stage:'rebuild',current:1,total:1,message:`${nextPlan.safe_count} safe actions remain after category repair`});
+    finishSafeWorkflow(`${result.changed} categories changed; the refreshed safe plan is ready`);
   }catch(error){
-    toast(`No category batch was applied: ${error.message}`);
+    failSafeWorkflow(`${error.message}. Any category changes already shown as complete are retained; rerun the audit before continuing.`);
+    toast(`Category workflow stopped: ${error.message}`);
     button.disabled=false;
-    button.textContent='Apply safe category fixes';
   }
 }
 async function queueSafeReconciles(){
@@ -777,25 +902,73 @@ async function queueSafeReconciles(){
   if(!await confirmAction({title:`Queue ${candidates.length} safe Reconcile ${candidates.length===1?'job':'jobs'}?`,message:'Each candidate gets a fresh exact plan and confirmation. Changed or ambiguous candidates are skipped; accepted jobs enter the existing shared Move/Reconcile FIFO queue.',details:candidates.slice(0,10).map(item=>[item.torrent_name,`${item.target_pool} · ${item.auxiliary_count} auxiliary files`]),confirmLabel:'Queue safe reconciles'}))return;
   const button=$('#queue-safe-reconciles');
   button.disabled=true;
-  button.textContent='Revalidating…';
-  let queued=0;
-  const failures=[];
-  for(const candidate of candidates){
-    const payload={auxiliaryFiles:candidate.auxiliary_files};
-    try{
-      const confirmation=await api('/api/confirmations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'reconcile',torrentHash:candidate.hash,payload})});
-      await api('/api/reconcile-queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHash:candidate.hash,...payload,confirmationToken:confirmation.token})});
-      queued+=1;
-    }catch(error){
-      failures.push(`${candidate.torrent_name}: ${error.message}`);
+  startSafeWorkflow(`Queue ${candidates.length} safe Reconcile ${candidates.length===1?'job':'jobs'}`,'Every candidate is freshly authorized before it enters the shared FIFO',[
+    {id:'authorize',title:'Revalidate and authorize plans',description:'Issuing a fresh exact single-use confirmation for each candidate.'},
+    {id:'enqueue',title:'Add jobs to shared FIFO',description:'Appending authorized Reconcile jobs after all existing Move and Reconcile work.'},
+    {id:'refresh',title:'Refresh Queue and Sync',description:'Confirming accepted jobs and updating the audit view.'},
+  ]);
+  try{
+    let queued=0;
+    const failures=[];
+    const authorized=[];
+    for(const [index,candidate] of candidates.entries()){
+      const payload={auxiliaryFiles:candidate.auxiliary_files};
+      try{
+        const confirmation=await api('/api/confirmations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'reconcile',torrentHash:candidate.hash,payload})});
+        authorized.push({candidate,payload,confirmation});
+      }catch(error){
+        failures.push(`${candidate.torrent_name}: ${error.message}`);
+      }
+      updateSafeWorkflow({stage:'authorize',current:index+1,total:candidates.length,message:`Authorized ${authorized.length}; ${failures.length} skipped · ${candidate.torrent_name}`});
+    }
+    for(const [index,item] of authorized.entries()){
+      try{
+        await api('/api/reconcile-queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHash:item.candidate.hash,...item.payload,confirmationToken:item.confirmation.token})});
+        queued+=1;
+      }catch(error){
+        failures.push(`${item.candidate.torrent_name}: ${error.message}`);
+      }
+      updateSafeWorkflow({stage:'enqueue',current:index+1,total:authorized.length,message:`Queued ${queued} of ${authorized.length} authorized jobs · ${item.candidate.torrent_name}`});
+    }
+    updateSafeWorkflow({stage:'refresh',current:0,total:1,message:'Refreshing the shared Queue and Sync audit'});
+    await refreshQueue(true,true);
+    await runSync({app,throwOnError:true});
+    updateSafeWorkflow({stage:'refresh',current:1,total:1,message:`${queued} jobs confirmed in the shared Queue`});
+    finishSafeWorkflow(failures.length?`${queued} queued; ${failures.length} skipped safely`:`${queued} safe Reconcile ${queued===1?'job':'jobs'} queued`);
+    if(failures.length)toast(`${queued} queued; ${failures.length} skipped after fresh validation`);
+    else toast(`${queued} safe Reconcile ${queued===1?'job':'jobs'} added to the shared queue`);
+  }catch(error){
+    failSafeWorkflow(`${error.message}. Jobs already shown as queued remain in the shared FIFO.`);
+    toast(`Queue workflow stopped: ${error.message}`);
+    if(button?.isConnected)button.disabled=false;
+  }
+}
+async function runSync(options={}){
+  const app=typeof options?.app==='string'?options.app:state.syncApp;
+  const active=()=>state.syncApp===app;
+  delete state.safeSyncPlans[app];
+  if(active()){
+    $('#sync-safe-actions').innerHTML='';
+    $('#sync-loading').classList.remove('hidden');
+    $('#run-sync').disabled=true;
+  }
+  try{
+    const result=await api(`/api/sync/${app}`);
+    state.sync[app]=result;
+    state.syncExpanded.delete(app);
+    if(active())renderSync(result);
+    return result;
+  }catch(error){
+    toast(`Audit failed: ${error.message}`);
+    if(options?.throwOnError)throw error;
+    return null;
+  }finally{
+    if(active()){
+      $('#sync-loading').classList.add('hidden');
+      $('#run-sync').disabled=false;
     }
   }
-  await refreshQueue(true);
-  await runSync();
-  if(failures.length)toast(`${queued} queued; ${failures.length} skipped after fresh validation`);
-  else toast(`${queued} safe Reconcile ${queued===1?'job':'jobs'} added to the shared queue`);
 }
-async function runSync(){const app=state.syncApp;delete state.safeSyncPlans[app];$('#sync-safe-actions').innerHTML='';$('#sync-loading').classList.remove('hidden');$('#run-sync').disabled=true;try{const result=await api(`/api/sync/${app}`);state.sync[app]=result;state.syncExpanded.delete(app);renderSync(result)}catch(e){toast(`Audit failed: ${e.message}`)}finally{$(`#sync-loading`).classList.add('hidden');$('#run-sync').disabled=false}}
 async function viewSyncQueue(publicId){
   navigate('queue');
   await refreshQueue(true);
@@ -814,6 +987,9 @@ document.addEventListener('click',e=>{const nav=e.target.closest('[data-page]');
 document.addEventListener('change',e=>{if(e.target.id==='select-all-auxiliary'){$$('.aux-file:not(:disabled)').forEach(input=>input.checked=e.target.checked);updateAuxiliarySelection()}else if(e.target.classList.contains('aux-file'))updateAuxiliarySelection();else if(e.target.id==='select-all-history'){const terminal=state.operations.filter(op=>['COMPLETE','FAILED','BLOCKED','DRY_RUN'].includes(op.state));state.selectedHistory=e.target.checked?new Set(terminal.map(op=>op.id)):new Set();renderOperations()}else if(e.target.classList.contains('history-select')){const id=Number(e.target.dataset.operationId);if(e.target.checked)state.selectedHistory.add(id);else state.selectedHistory.delete(id);renderOperations()}});
 document.addEventListener('click',e=>{const details=e.target.closest('.inspect-operation');if(details)openOperationDetails(details.dataset.operationId);if(e.target.closest('#delete-history-selected'))deleteHistory(false);if(e.target.closest('#clear-history'))deleteHistory(true);if(e.target.closest('#operation-minimized'))showOperationTracking();if(e.target.closest('#operation-done')||e.target.closest('#operation-close')){if(state.operationTracking&&!terminalOperation(state.currentOperation))hideOperationTracking();else finishOperationTracking()}});
 $('#operation-dialog').addEventListener('cancel',e=>{e.preventDefault();if(state.operationTracking&&!terminalOperation(state.currentOperation))hideOperationTracking();else if(!$('#operation-done').disabled)finishOperationTracking()});
+$('#safe-workflow-dialog').addEventListener('cancel',e=>{e.preventDefault();closeSafeWorkflow()});
+$('#safe-workflow-close').addEventListener('click',closeSafeWorkflow);
+$('#safe-workflow-done').addEventListener('click',closeSafeWorkflow);
 $('#connections-form').addEventListener('submit',saveConnections);
 document.addEventListener('click',event=>{
   if(event.target.closest('#open-routing-guide'))refreshRoutingGuide()

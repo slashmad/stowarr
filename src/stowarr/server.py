@@ -36,6 +36,26 @@ def handler(manager: Stowarr):
             payload = json.dumps(value, indent=2).encode()
             self.send_bytes(status, payload, "application/json", headers)
 
+        def begin_ndjson(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+        def send_ndjson(self, value) -> None:
+            try:
+                self.wfile.write(
+                    json.dumps(value, separators=(",", ":")).encode() + b"\n"
+                )
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # Read-only planning and already-authorized mutation must not be
+                # interrupted merely because the browser stopped listening.
+                pass
+
         def send_web(self, name: str) -> None:
             resource = files("stowarr").joinpath("web", name)
             if not resource.is_file():
@@ -181,6 +201,22 @@ def handler(manager: Stowarr):
                 self.send_json(200, manager.qbit_catalog())
             elif path == "/api/routing/audit":
                 self.send_json(200, manager.routing_audit())
+            elif path.startswith("/api/sync/") and path.endswith("/safe-plan/progress"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 5:
+                    self.send_json(400, {"error": "Invalid safe Sync progress path"})
+                else:
+                    self.begin_ndjson()
+                    try:
+                        result = manager.safe_sync_plan(
+                            parts[2].casefold(),
+                            lambda event: self.send_ndjson({
+                                "type": "progress", **event,
+                            }),
+                        )
+                        self.send_ndjson({"type": "result", "result": result})
+                    except Exception as error:
+                        self.send_ndjson({"type": "error", "error": str(error)})
             elif path.startswith("/api/sync/") and path.endswith("/safe-plan"):
                 try:
                     parts = path.strip("/").split("/")
@@ -367,6 +403,38 @@ def handler(manager: Stowarr):
                     )
                 except Exception as error:
                     self.send_json(409, {"error": str(error)})
+            elif path.startswith("/api/sync/") and path.endswith("/safe-category/apply-progress"):
+                parts = path.strip("/").split("/")
+                if len(parts) != 5:
+                    self.send_json(400, {"error": "Invalid safe category progress path"})
+                else:
+                    try:
+                        body = self.read_json()
+                        torrent_hashes = body.get("torrentHashes", [])
+                        if not isinstance(torrent_hashes, list) or not all(
+                            isinstance(item, str) for item in torrent_hashes
+                        ):
+                            raise ValueError("torrentHashes must be a list of hashes")
+                    except Exception as error:
+                        self.send_json(409, {"error": str(error)})
+                    else:
+                        self.begin_ndjson()
+                        try:
+                            result = manager.apply_safe_category_repairs(
+                                str(body.get("confirmationToken") or ""),
+                                parts[2].casefold(),
+                                torrent_hashes,
+                                lambda event: self.send_ndjson({
+                                    "type": "progress", **event,
+                                }),
+                            )
+                            self.send_ndjson({
+                                "type": "result", "result": result,
+                            })
+                        except Exception as error:
+                            self.send_ndjson({
+                                "type": "error", "error": str(error),
+                            })
             elif path.startswith("/api/sync/") and path.endswith("/category"):
                 try:
                     parts = path.strip("/").split("/")

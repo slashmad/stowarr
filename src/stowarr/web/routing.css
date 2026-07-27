@@ -579,7 +579,8 @@
   background: #08090bcc;
 }
 
-.operation-dialog {
+.operation-dialog,
+.safe-workflow-dialog {
   background: #242629;
   border: 1px solid #555a60;
   color: #e7e7e7;
@@ -589,7 +590,8 @@
   width: calc(100% - 40px);
 }
 
-.operation-dialog::backdrop {
+.operation-dialog::backdrop,
+.safe-workflow-dialog::backdrop {
   background: #08090bcc;
 }
 
@@ -1217,8 +1219,10 @@
 
 .sync-safe-plan {
   background: #1b252d;
-  border-bottom: 1px solid #3b3e43;
+  border: 1px solid #3b3e43;
   border-left: 3px solid var(--blue);
+  box-shadow: var(--shadow);
+  margin-bottom: 22px;
   padding: 16px 18px;
 }
 
@@ -1303,6 +1307,87 @@
 .sync-safe-columns article > button {
   align-self: flex-start;
   margin-top: auto;
+}
+
+.safe-workflow-dialog > .operation-overall {
+  margin: 18px 20px 12px;
+}
+
+.safe-workflow-steps {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0 20px 18px;
+}
+
+.safe-workflow-steps li {
+  align-items: start;
+  background: #202428;
+  border: 1px solid #3b4045;
+  border-left: 3px solid #626970;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 28px minmax(0, 1fr);
+  padding: 12px;
+}
+
+.safe-workflow-steps li.active {
+  background: #1c2e3f;
+  border-left-color: var(--blue);
+}
+
+.safe-workflow-steps li.complete {
+  border-left-color: var(--green);
+}
+
+.safe-workflow-steps li.failed {
+  background: #422426;
+  border-left-color: var(--red);
+}
+
+.safe-workflow-steps li.remaining {
+  opacity: .62;
+}
+
+.safe-workflow-steps li > div {
+  min-width: 0;
+}
+
+.safe-workflow-steps small {
+  color: var(--muted);
+  display: block;
+  margin-top: 7px;
+  overflow-wrap: anywhere;
+}
+
+.safe-step-index {
+  align-items: center;
+  background: #343a40;
+  border-radius: 50%;
+  color: #dce0e4;
+  display: flex;
+  font-size: 12px;
+  font-weight: 700;
+  height: 26px;
+  justify-content: center;
+  width: 26px;
+}
+
+.safe-workflow-steps li.active .safe-step-index {
+  animation: spin .8s linear infinite;
+  background: transparent;
+  border: 2px solid #56616a;
+  border-top-color: var(--blue);
+  color: transparent;
+}
+
+.safe-workflow-steps li.complete .safe-step-index {
+  background: #2e7b42;
+}
+
+.safe-workflow-dialog > .alert {
+  margin: 0 20px 18px;
 }
 
 .sync-status-filter .badge {
