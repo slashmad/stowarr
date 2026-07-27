@@ -2721,6 +2721,278 @@ class Stowarr:
             "rows": rows,
         }
 
+    def safe_sync_plan(self, app: str) -> dict:
+        """Classify audit issues into narrowly safe assisted actions and manual work."""
+        audit = self.sync_audit(app)
+        active_reconciles = {
+            str(item.get("torrent_hash") or "").casefold(): item
+            for item in self.store.reconcile_queue()
+            if item.get("state") in {"QUEUED", "RUNNING"}
+        }
+        category_repairs = []
+        reconcile_candidates = []
+        queued_reconciles = []
+        manual = []
+        for row in audit["rows"]:
+            if row["status"] == "in-sync":
+                continue
+            if (
+                row["status"] == "category-unconfigured"
+                and row.get("category_repairable") is True
+            ):
+                category_repairs.append({
+                    "hash": row["hash"],
+                    "torrent_name": row["torrent_name"],
+                    "item_title": row.get("item_title"),
+                    "pool": row.get("qbit_pool"),
+                    "current_category": row.get("category") or "",
+                    "category": row["expected_category"],
+                })
+                continue
+            if row["status"] == "root-mismatch":
+                queued = active_reconciles.get(row["hash"].casefold())
+                if queued:
+                    queued_reconciles.append({
+                        "hash": row["hash"],
+                        "torrent_name": row["torrent_name"],
+                        "public_id": queued["public_id"],
+                        "state": queued["state"],
+                    })
+                    continue
+                try:
+                    plan = self.plan(row["hash"]).json()
+                except Exception as error:
+                    manual.append({
+                        "hash": row["hash"],
+                        "torrent_name": row["torrent_name"],
+                        "status": row["status"],
+                        "reason": f"Fresh Reconcile planning failed: {error}",
+                        "error_code": "FRESH_PLAN_FAILED",
+                    })
+                    continue
+                if plan["status"] == "ready":
+                    blocked_sidecars = {"target-conflict", "torrent-name-conflict"}
+                    auxiliary_files = sorted({
+                        item["source"]
+                        for item in plan.get("auxiliary_files", [])
+                        if item["status"] not in blocked_sidecars
+                    })
+                    reconcile_candidates.append({
+                        "hash": row["hash"],
+                        "torrent_name": plan["torrent_name"],
+                        "item_title": plan.get("item_title"),
+                        "target_pool": plan["target_pool"],
+                        "current_item_path": plan.get("current_item_path"),
+                        "target_item_path": plan.get("target_item_path"),
+                        "auxiliary_files": auxiliary_files,
+                        "auxiliary_count": len(auxiliary_files),
+                    })
+                    continue
+                manual.append({
+                    "hash": row["hash"],
+                    "torrent_name": row["torrent_name"],
+                    "status": row["status"],
+                    "reason": plan.get("reason") or row.get("reason"),
+                    "error_code": plan.get("error_code"),
+                })
+                continue
+            manual.append({
+                "hash": row["hash"],
+                "torrent_name": row["torrent_name"],
+                "status": row["status"],
+                "reason": row.get("reason"),
+                "error_code": (row.get("issues") or [{}])[0].get("code"),
+            })
+        return {
+            "app": app,
+            "audit": {
+                "scanned": audit["scanned"],
+                "issues": audit["issues"],
+            },
+            "category_repairs": category_repairs,
+            "reconcile_candidates": reconcile_candidates,
+            "queued_reconciles": queued_reconciles,
+            "manual": manual,
+            "safe_count": len(category_repairs) + len(reconcile_candidates),
+        }
+
+    def _safe_category_selection(self, app: str, torrent_hashes: list[str]) -> dict:
+        if app not in self.arr:
+            raise ValueError(f"Unsupported application: {app}")
+        normalized_hashes = sorted({
+            value.casefold() for value in torrent_hashes if isinstance(value, str) and value
+        })
+        if not normalized_hashes:
+            raise ValueError("Select at least one safe category repair")
+        audit = self.sync_audit(app)
+        available = {
+            row["hash"].casefold(): {
+                "hash": row["hash"],
+                "torrent_name": row["torrent_name"],
+                "item_title": row.get("item_title"),
+                "pool": row.get("qbit_pool"),
+                "current_category": row.get("category") or "",
+                "category": row["expected_category"],
+            }
+            for row in audit["rows"]
+            if (
+                row["status"] == "category-unconfigured"
+                and row.get("category_repairable") is True
+            )
+        }
+        missing = [value for value in normalized_hashes if value not in available]
+        if missing:
+            raise RuntimeError(
+                "The audit changed or one or more category repairs are no longer safe; "
+                "build a new safe repair plan"
+            )
+        return {
+            "app": app,
+            "category_repairs": [available[value] for value in normalized_hashes],
+        }
+
+    def issue_safe_category_confirmation(
+        self, app: str, torrent_hashes: list[str]
+    ) -> dict:
+        """Authorize one exact, freshly generated safe category repair batch."""
+        write_enabled = self.config.apply
+        if not write_enabled:
+            raise RuntimeError("Safe category repair is unavailable in dry-run mode")
+        self._require_write_ready()
+        plan = self._safe_category_selection(app, torrent_hashes)
+        payload = {"torrentHashes": [item["hash"] for item in plan["category_repairs"]]}
+        token = secrets.token_urlsafe(32)
+        expires_at = int(time.time()) + 600
+        fingerprint = self._operation_fingerprint("safe-category", plan, payload)
+        confirmation_fingerprint = self._confirmation_fingerprint(
+            fingerprint, write_enabled
+        )
+        self.store.create_confirmation(
+            token, "safe-category", app, confirmation_fingerprint, expires_at
+        )
+        return {
+            "token": token,
+            "expires_at": expires_at,
+            "kind": "safe-category",
+            "app": app,
+            "plan": plan,
+            "payload": payload,
+            "execution_mode": "write",
+        }
+
+    def _sync_category_repair_context(
+        self, app: str, torrent_hash: str
+    ) -> dict:
+        if app not in self.arr:
+            raise ValueError(f"Unsupported application: {app}")
+        torrent = self.qbit.torrent(torrent_hash)
+        if not torrent:
+            raise ValueError("Torrent not found in qBittorrent")
+        pool = self.config.pool_for_path(torrent.get("save_path", ""))
+        if not pool:
+            raise RuntimeError("The qBittorrent save path is outside configured pools")
+        save_path = Path(str(torrent.get("save_path") or ""))
+        if not any(
+            save_path == root or save_path.is_relative_to(root)
+            for root in pool.download_roots
+        ):
+            raise RuntimeError(
+                "Automatic category repair is limited to torrents below a configured download root"
+            )
+        current_category = str(torrent.get("category") or "")
+        current_route = self.config.pool_for_category(current_category)
+        expected_category = (
+            pool.radarr_category if app == "radarr" else pool.sonarr_category
+        )
+        if current_category != expected_category and current_route:
+            raise RuntimeError(
+                "The current category is already a configured route; resolve this route conflict manually"
+            )
+        history = self.arr[app].history_for_downloads({torrent_hash.casefold()})
+        if torrent_hash.casefold() not in history:
+            raise RuntimeError(
+                f"{app.capitalize()} does not associate this exact qBittorrent hash with an item"
+            )
+        category = self.qbit.categories().get(expected_category)
+        category_path = str((category or {}).get("savePath") or "")
+        if not category or Path(category_path) not in pool.download_roots:
+            raise RuntimeError(
+                f'qBittorrent category "{expected_category}" is missing or does not point '
+                f"to a configured {pool.name} download root"
+            )
+        return {
+            "app": app,
+            "hash": torrent_hash,
+            "pool": pool.name,
+            "previous_category": current_category,
+            "category": expected_category,
+            "changed": current_category != expected_category,
+        }
+
+    def _apply_sync_category_context(self, context: dict) -> dict:
+        if context["changed"]:
+            self.qbit.set_category(context["hash"], context["category"])
+            self.store.security_event(
+                "sync-category-repaired",
+                "admin",
+                "",
+                {
+                    "app": context["app"],
+                    "torrent_hash": context["hash"].casefold(),
+                    "pool": context["pool"],
+                    "previous_category": context["previous_category"],
+                    "category": context["category"],
+                },
+            )
+        return dict(context)
+
+    def apply_safe_category_repairs(
+        self, token: str, app: str, torrent_hashes: list[str]
+    ) -> dict:
+        """Consume an exact batch confirmation and apply only freshly safe repairs."""
+        if not self.config.apply:
+            raise RuntimeError("Safe category repair is unavailable in dry-run mode")
+        self._require_write_ready()
+        if self.store.has_active_queue_work():
+            raise RuntimeError(
+                "Wait for the active Move/Reconcile queue to finish before changing categories"
+            )
+        if not self._move_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "Wait for the active Move/Reconcile operation to finish before changing categories"
+            )
+        try:
+            if not self.config.apply:
+                raise RuntimeError("Write mode was disabled before the repair began")
+            self._require_write_ready()
+            if self.store.has_active_queue_work():
+                raise RuntimeError(
+                    "A Move/Reconcile job started before the category repair; build a new plan later"
+                )
+            plan = self._safe_category_selection(app, torrent_hashes)
+            payload = {
+                "torrentHashes": [item["hash"] for item in plan["category_repairs"]]
+            }
+            fingerprint = self._operation_fingerprint("safe-category", plan, payload)
+            confirmation_fingerprint = self._confirmation_fingerprint(fingerprint, True)
+            self.store.consume_confirmation(
+                token, "safe-category", app, confirmation_fingerprint
+            )
+            contexts = [
+                self._sync_category_repair_context(app, item["hash"])
+                for item in plan["category_repairs"]
+            ]
+            results = [
+                self._apply_sync_category_context(context) for context in contexts
+            ]
+            return {
+                "app": app,
+                "changed": sum(item["changed"] for item in results),
+                "results": results,
+            }
+        finally:
+            self._move_lock.release()
+
     def repair_sync_category(self, app: str, torrent_hash: str) -> dict:
         """Assign the configured pool category after revalidating history, path, and route."""
         if app not in self.arr:
@@ -2733,69 +3005,8 @@ class Stowarr:
         if not self._move_lock.acquire(blocking=False):
             raise RuntimeError("Wait for the active Move/Reconcile operation to finish before changing a category")
         try:
-            torrent = self.qbit.torrent(torrent_hash)
-            if not torrent:
-                raise ValueError("Torrent not found in qBittorrent")
-            pool = self.config.pool_for_path(torrent.get("save_path", ""))
-            if not pool:
-                raise RuntimeError("The qBittorrent save path is outside configured pools")
-            save_path = Path(str(torrent.get("save_path") or ""))
-            if not any(
-                save_path == root or save_path.is_relative_to(root)
-                for root in pool.download_roots
-            ):
-                raise RuntimeError(
-                    "Automatic category repair is limited to torrents below a configured download root"
-                )
-            current_category = str(torrent.get("category") or "")
-            current_route = self.config.pool_for_category(current_category)
-            expected_category = pool.radarr_category if app == "radarr" else pool.sonarr_category
-            if current_category == expected_category:
-                return {
-                    "changed": False,
-                    "hash": torrent_hash,
-                    "app": app,
-                    "pool": pool.name,
-                    "previous_category": current_category,
-                    "category": expected_category,
-                }
-            if current_route:
-                raise RuntimeError(
-                    "The current category is already a configured route; resolve this route conflict manually"
-                )
-            history = self.arr[app].history_for_downloads({torrent_hash.casefold()})
-            if torrent_hash.casefold() not in history:
-                raise RuntimeError(
-                    f"{app.capitalize()} does not associate this exact qBittorrent hash with an item"
-                )
-            category = self.qbit.categories().get(expected_category)
-            category_path = str((category or {}).get("savePath") or "")
-            if not category or Path(category_path) not in pool.download_roots:
-                raise RuntimeError(
-                    f'qBittorrent category "{expected_category}" is missing or does not point '
-                    f"to a configured {pool.name} download root"
-                )
-            self.qbit.set_category(torrent_hash, expected_category)
-            self.store.security_event(
-                "sync-category-repaired",
-                "admin",
-                "",
-                {
-                    "app": app,
-                    "torrent_hash": torrent_hash.casefold(),
-                    "pool": pool.name,
-                    "previous_category": current_category,
-                    "category": expected_category,
-                },
-            )
-            return {
-                "changed": True,
-                "hash": torrent_hash,
-                "app": app,
-                "pool": pool.name,
-                "previous_category": current_category,
-                "category": expected_category,
-            }
+            context = self._sync_category_repair_context(app, torrent_hash)
+            return self._apply_sync_category_context(context)
         finally:
             self._move_lock.release()
 

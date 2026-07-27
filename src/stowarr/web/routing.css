@@ -1170,7 +1170,7 @@
 
 .sync-filters:not(:empty) {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: 10px;
   padding: 10px 15px;
@@ -1213,6 +1213,96 @@
   background: #1d3448;
   color: var(--text);
   opacity: 1;
+}
+
+.sync-safe-plan {
+  background: #1b252d;
+  border-bottom: 1px solid #3b3e43;
+  border-left: 3px solid var(--blue);
+  padding: 16px 18px;
+}
+
+.sync-safe-plan > header {
+  align-items: flex-start;
+  display: flex;
+  gap: 20px;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+.sync-safe-plan h3,
+.sync-safe-plan h4,
+.sync-safe-plan p {
+  margin: 0;
+}
+
+.sync-safe-plan > header p,
+.sync-safe-columns small,
+.sync-safe-columns p {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.sync-safe-plan > header > span {
+  background: #245c38;
+  border-radius: 3px;
+  color: #b9ecc7;
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 5px 8px;
+  text-transform: uppercase;
+}
+
+.sync-safe-columns {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.sync-safe-columns article {
+  background: #24282c;
+  border: 1px solid #42474d;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 13px;
+}
+
+.sync-safe-columns h4 {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.sync-safe-columns ul {
+  list-style: none;
+  margin: 12px 0;
+  max-height: 190px;
+  overflow: auto;
+  padding: 0;
+}
+
+.sync-safe-columns li {
+  border-top: 1px solid #353a3f;
+  display: flex;
+  flex-direction: column;
+  padding: 7px 0;
+}
+
+.sync-safe-columns li:first-child {
+  border-top: 0;
+}
+
+.sync-safe-columns strong,
+.sync-safe-columns small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sync-safe-columns article > button {
+  align-self: flex-start;
+  margin-top: auto;
 }
 
 .sync-status-filter .badge {
@@ -1640,6 +1730,14 @@
 }
 
 @media (max-width: 900px) {
+  .sync-safe-columns {
+    grid-template-columns: 1fr;
+  }
+
+  .sync-filters:not(:empty) {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
   .hash-grid {
     grid-template-columns: 1fr;
   }

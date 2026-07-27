@@ -1456,6 +1456,107 @@ class EngineTest(unittest.TestCase):
         manager.qbit.torrent.assert_not_called()
         manager.qbit.set_category.assert_not_called()
 
+    def test_safe_sync_plan_only_promotes_fresh_ready_reconciles(self):
+        rows = [
+            {
+                "hash": "CATEGORY", "torrent_name": "Category Example",
+                "item_title": "Category Example", "status": "category-unconfigured",
+                "category_repairable": True, "qbit_pool": "p3", "category": "",
+                "expected_category": "radarr-pool3", "reason": "unconfigured",
+                "issues": [],
+            },
+            {
+                "hash": "READY", "torrent_name": "Ready Example",
+                "item_title": "Ready Example", "status": "root-mismatch",
+                "reason": "wrong root", "issues": [],
+            },
+            {
+                "hash": "BLOCKED", "torrent_name": "Blocked Example",
+                "item_title": "Blocked Example", "status": "root-mismatch",
+                "reason": "wrong root", "issues": [],
+            },
+            {
+                "hash": "DUPLICATE", "torrent_name": "Duplicate Example",
+                "item_title": "Duplicate Example", "status": "multiple-torrents",
+                "reason": "ambiguous", "issues": [{"code": "DUPLICATE"}],
+            },
+        ]
+        ready = Plan(
+            "READY", "Ready Example", "radarr", "p3", 1, "Ready Example",
+            "/p1/movies/Ready", "/p3/movies/Ready", [], "ready",
+            auxiliary_files=[
+                AuxiliaryFile(
+                    "/p1/movies/Ready/subtitle.srt",
+                    "/p3/movies/Ready/subtitle.srt",
+                    10, "missing-target", "library", "copy", "subtitle",
+                ),
+                AuxiliaryFile(
+                    "/p1/movies/Ready/conflict.jpg",
+                    "/p3/movies/Ready/conflict.jpg",
+                    10, "target-conflict", "library", "copy", "artwork",
+                ),
+            ],
+        )
+        blocked = Plan(
+            "BLOCKED", "Blocked Example", "radarr", "p3", 2,
+            "Blocked Example", "/p1/movies/Blocked", "/p3/movies/Blocked",
+            [], "blocked", "Ambiguous mapping", "AMBIGUOUS",
+        )
+        manager = Stowarr.__new__(Stowarr)
+        manager.sync_audit = Mock(return_value={
+            "app": "radarr", "scanned": 4, "issues": 4, "rows": rows,
+        })
+        manager.plan = Mock(side_effect=lambda value: ready if value == "READY" else blocked)
+        manager.store = SimpleNamespace(reconcile_queue=lambda: [])
+
+        result = manager.safe_sync_plan("radarr")
+
+        self.assertEqual(result["safe_count"], 2)
+        self.assertEqual(
+            result["category_repairs"][0]["hash"], "CATEGORY"
+        )
+        self.assertEqual(
+            result["reconcile_candidates"][0]["auxiliary_files"],
+            ["/p1/movies/Ready/subtitle.srt"],
+        )
+        self.assertEqual(
+            {item["hash"] for item in result["manual"]},
+            {"BLOCKED", "DUPLICATE"},
+        )
+
+    def test_safe_category_batch_validates_every_item_before_mutating(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=True)
+        manager._require_write_ready = Mock()
+        manager._move_lock = threading.RLock()
+        manager.store = SimpleNamespace(
+            has_active_queue_work=lambda: False,
+            consume_confirmation=Mock(),
+        )
+        manager._safe_category_selection = Mock(return_value={
+            "app": "radarr",
+            "category_repairs": [
+                {"hash": "FIRST"},
+                {"hash": "SECOND"},
+            ],
+        })
+        manager._sync_category_repair_context = Mock(side_effect=[
+            {
+                "app": "radarr", "hash": "FIRST", "pool": "p3",
+                "previous_category": "", "category": "radarr-pool3",
+                "changed": True,
+            },
+            RuntimeError("Second item is no longer safe"),
+        ])
+        manager._apply_sync_category_context = Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "no longer safe"):
+            manager.apply_safe_category_repairs(
+                "token", "radarr", ["FIRST", "SECOND"]
+            )
+
+        manager._apply_sync_category_context.assert_not_called()
+
     def test_qbittorrent_search_does_not_consult_arr(self):
         manager = Stowarr.__new__(Stowarr)
         manager.qbit = SimpleNamespace(torrents=lambda: [
