@@ -116,10 +116,14 @@
       </section>
 
       <section id="queue" class="page">
-        <div class="page-title"><div><h1>Move queue</h1><p>Confirmed Move transactions run one at a time in FIFO order</p></div></div>
+        <div class="page-title"><div><h1>Job queues</h1><p>Confirmed Move and Reconcile jobs run in separate FIFO queues</p></div></div>
         <article class="panel">
-          <div class="panel-head"><div><h2>Transactions</h2><p>Queued work persists across page changes and service restarts</p></div><button id="refresh-queue" class="primary compact" type="button">Refresh queue</button></div>
-          <div class="table-wrap"><table><thead><tr><th>Position</th><th>Torrent</th><th>Route</th><th>State</th><th>Operation</th><th>Updated</th><th></th></tr></thead><tbody id="queue-rows"><tr><td colspan="7" class="empty">The Move queue is empty</td></tr></tbody></table></div>
+          <div class="panel-head"><div><h2>Move queue</h2><p>Storage relocation transactions; processed independently from repairs</p></div><button id="refresh-queue" class="primary compact" type="button">Refresh queues</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Job / position</th><th>Torrent</th><th>Route</th><th>State</th><th>Operation</th><th>Updated</th><th></th></tr></thead><tbody id="queue-rows"><tr><td colspan="7" class="empty">The Move queue is empty</td></tr></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><h2>Reconcile queue</h2><p>Library verification and repair jobs; processed independently from moves</p></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Job / position</th><th>Torrent</th><th>Pool</th><th>State</th><th>Operation</th><th>Updated</th><th></th></tr></thead><tbody id="reconcile-queue-rows"><tr><td colspan="7" class="empty">The Reconcile queue is empty</td></tr></tbody></table></div>
         </article>
       </section>
 

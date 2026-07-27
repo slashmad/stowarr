@@ -68,6 +68,7 @@ class MoveQueueWorker:
                 job["target_pool"],
                 payload["additionalFiles"],
                 wait_for_slot=True,
+                public_id=job["public_id"],
             )
             operation_id = result.get("operation_id")
             state = result.get("state")
@@ -85,3 +86,76 @@ class MoveQueueWorker:
                     operation_id = latest["id"]
             self.manager.store.finish_move(job["id"], "FAILED", operation_id, str(error))
             print(f"stowarr queue id={job['id']} state=FAILED error={error}", flush=True)
+
+
+class ReconcileQueueWorker:
+    """Run confirmed Reconcile jobs serially in their own persistent queue."""
+
+    def __init__(self, manager):
+        self.manager = manager
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="stowarr-reconcile-queue", daemon=True
+        )
+
+    def start(self) -> None:
+        self.manager.store.interrupt_running_reconciles()
+        self.manager.reconcile_queue_worker = self
+        self._thread.start()
+
+    def stop(self) -> bool:
+        self._stop.set()
+        self._wake.set()
+        self._thread.join(timeout=5)
+        return not self._thread.is_alive()
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if not self.manager.connections_ready or not self.manager.config.apply:
+                self._wake.wait(2)
+                self._wake.clear()
+                continue
+            job = self.manager.store.claim_next_reconcile()
+            if not job:
+                self._wake.wait(2)
+                self._wake.clear()
+                continue
+            self._process(job)
+
+    def _process(self, job: dict) -> None:
+        operation_id = None
+        previous = self.manager.store.latest_operation(job["torrent_hash"], "reconcile")
+        previous_id = previous["id"] if previous else 0
+        try:
+            payload = job["payload"]
+            plan = self.manager.plan(job["torrent_hash"]).json()
+            fingerprint = self.manager._operation_fingerprint("reconcile", plan, payload)
+            if fingerprint != job["fingerprint"]:
+                raise RuntimeError(
+                    "The Reconcile plan changed after it was queued. Review it and queue it again."
+                )
+            self.manager._move_lock.acquire()
+            try:
+                result = self.manager.reconcile(
+                    job["torrent_hash"],
+                    set(payload["auxiliaryFiles"]),
+                    public_id=job["public_id"],
+                )
+            finally:
+                self.manager._move_lock.release()
+            operation_id = result.get("operation_id")
+            if result.get("state") != "COMPLETE":
+                raise RuntimeError(f"Queued Reconcile ended in state {result.get('state')}")
+            self.manager.store.finish_reconcile(job["id"], "COMPLETE", operation_id)
+        except Exception as error:
+            if operation_id is None:
+                latest = self.manager.store.latest_operation(job["torrent_hash"], "reconcile")
+                if latest and latest["id"] > previous_id:
+                    operation_id = latest["id"]
+            self.manager.store.finish_reconcile(
+                job["id"], "FAILED", operation_id, str(error)
+            )

@@ -5,10 +5,13 @@ import hashlib
 import sqlite3
 import threading
 import time
+import secrets
 from pathlib import Path
 
 
 class Store:
+    JOB_ID_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -23,6 +26,8 @@ class Store:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(operations)")}
         if "kind" not in columns:
             self.db.execute("ALTER TABLE operations ADD COLUMN kind TEXT NOT NULL DEFAULT 'reconcile'")
+        if "public_id" not in columns:
+            self.db.execute("ALTER TABLE operations ADD COLUMN public_id TEXT")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)"
         )
@@ -63,10 +68,67 @@ class Store:
             started_at INTEGER, finished_at INTEGER)"""
         )
         self.db.execute(
+            """CREATE TABLE IF NOT EXISTS reconcile_queue (
+            id INTEGER PRIMARY KEY, public_id TEXT NOT NULL UNIQUE,
+            torrent_hash TEXT NOT NULL, payload TEXT NOT NULL,
+            fingerprint TEXT NOT NULL, detail TEXT NOT NULL,
+            state TEXT NOT NULL, operation_id INTEGER, error TEXT,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            started_at INTEGER, finished_at INTEGER)"""
+        )
+        queue_columns = {row[1] for row in self.db.execute("PRAGMA table_info(move_queue)")}
+        if "public_id" not in queue_columns:
+            self.db.execute("ALTER TABLE move_queue ADD COLUMN public_id TEXT")
+        self._backfill_public_ids()
+        self.db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS operations_public_id ON operations(public_id)"
+        )
+        self.db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS move_queue_public_id ON move_queue(public_id)"
+        )
+        self.db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS move_queue_active_torrent "
             "ON move_queue(torrent_hash) WHERE state IN ('QUEUED','RUNNING')"
         )
+        self.db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS reconcile_queue_active_torrent "
+            "ON reconcile_queue(torrent_hash) WHERE state IN ('QUEUED','RUNNING')"
+        )
         self.db.commit()
+
+    def _new_public_id(self) -> str:
+        """Return a short id unique across operation history and queued work."""
+        for _ in range(100):
+            value = "".join(secrets.choice(self.JOB_ID_ALPHABET) for _ in range(5))
+            if value.isalpha() or value.isdigit():
+                continue
+            exists = self.db.execute(
+                """SELECT 1 FROM operations WHERE public_id=?
+                UNION ALL SELECT 1 FROM move_queue WHERE public_id=?
+                UNION ALL SELECT 1 FROM reconcile_queue WHERE public_id=? LIMIT 1""",
+                (value, value, value),
+            ).fetchone()
+            if not exists:
+                return value
+        raise RuntimeError("Could not allocate a unique job ID")
+
+    def _backfill_public_ids(self) -> None:
+        for row in self.db.execute(
+            "SELECT id FROM operations WHERE public_id IS NULL OR public_id=''"
+        ).fetchall():
+            self.db.execute(
+                "UPDATE operations SET public_id=? WHERE id=?",
+                (self._new_public_id(), row["id"]),
+            )
+        for row in self.db.execute(
+            """SELECT q.id, o.public_id AS operation_public_id
+            FROM move_queue q LEFT JOIN operations o ON o.id=q.operation_id
+            WHERE q.public_id IS NULL OR q.public_id=''"""
+        ).fetchall():
+            self.db.execute(
+                "UPDATE move_queue SET public_id=? WHERE id=?",
+                (row["operation_public_id"] or self._new_public_id(), row["id"]),
+            )
 
     @staticmethod
     def _event_detail(detail: dict) -> dict:
@@ -192,17 +254,26 @@ class Store:
         if cursor.rowcount != 1:
             raise PermissionError("Confirmation is invalid, expired, already used, or belongs to a stale plan")
 
-    def record(self, torrent_hash: str, app: str, state: str, detail: dict, kind: str = "reconcile") -> int:
+    def record(
+        self, torrent_hash: str, app: str, state: str, detail: dict,
+        kind: str = "reconcile", public_id: str | None = None,
+    ) -> int:
         with self.lock:
             now = int(time.time())
+            public_id = public_id or self._new_public_id()
             cursor = self.db.execute(
-                "INSERT INTO operations(torrent_hash,app,kind,state,detail,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (torrent_hash, app, kind, state, json.dumps(detail), now, now),
+                """INSERT INTO operations(
+                torrent_hash,app,kind,state,detail,created_at,updated_at,public_id
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+                (torrent_hash, app, kind, state, json.dumps(detail), now, now, public_id),
             )
             operation_id = int(cursor.lastrowid)
             self._record_event(operation_id, state, detail, now)
             self.db.commit()
-        print(f"stowarr operation id={operation_id} kind={kind} state={state}", flush=True)
+        print(
+            f"stowarr job={public_id} operation_id={operation_id} kind={kind} state={state}",
+            flush=True,
+        )
         return operation_id
 
     def update(self, operation_id: int, state: str, detail: dict) -> None:
@@ -278,6 +349,10 @@ class Store:
                 f"UPDATE move_queue SET operation_id=NULL WHERE operation_id IN ({placeholders})",
                 selected,
             )
+            self.db.execute(
+                f"UPDATE reconcile_queue SET operation_id=NULL WHERE operation_id IN ({placeholders})",
+                selected,
+            )
             self.db.execute(f"DELETE FROM operation_events WHERE operation_id IN ({placeholders})", selected)
             cursor = self.db.execute(f"DELETE FROM operations WHERE id IN ({placeholders})", selected)
             self.db.commit()
@@ -307,13 +382,14 @@ class Store:
         now = int(time.time())
         try:
             with self.lock:
+                public_id = self._new_public_id()
                 cursor = self.db.execute(
                     """INSERT INTO move_queue(
-                    torrent_hash,target_pool,payload,fingerprint,detail,state,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,'QUEUED',?,?)""",
+                    torrent_hash,target_pool,payload,fingerprint,detail,state,created_at,updated_at,public_id
+                    ) VALUES(?,?,?,?,?,'QUEUED',?,?,?)""",
                     (
                         torrent_hash.casefold(), target_pool, json.dumps(payload, sort_keys=True),
-                        fingerprint, json.dumps(detail), now, now,
+                        fingerprint, json.dumps(detail), now, now, public_id,
                     ),
                 )
                 self.db.commit()
@@ -379,6 +455,112 @@ class Store:
             )
             self.db.commit()
             return cursor.rowcount == 1
+
+    def cancel_queued_move_by_public_id(self, public_id: str) -> bool:
+        now = int(time.time())
+        with self.lock:
+            cursor = self.db.execute(
+                """UPDATE move_queue SET state='CANCELLED',error='Cancelled before execution',
+                updated_at=?,finished_at=? WHERE public_id=? AND state='QUEUED'""",
+                (now, now, public_id.upper()),
+            )
+            self.db.commit()
+            return cursor.rowcount == 1
+
+    def enqueue_reconcile(
+        self, torrent_hash: str, payload: dict, fingerprint: str, detail: dict
+    ) -> dict:
+        now = int(time.time())
+        try:
+            with self.lock:
+                public_id = self._new_public_id()
+                cursor = self.db.execute(
+                    """INSERT INTO reconcile_queue(
+                    public_id,torrent_hash,payload,fingerprint,detail,state,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,'QUEUED',?,?)""",
+                    (
+                        public_id, torrent_hash.casefold(), json.dumps(payload, sort_keys=True),
+                        fingerprint, json.dumps(detail), now, now,
+                    ),
+                )
+                self.db.commit()
+                row = self.db.execute(
+                    "SELECT * FROM reconcile_queue WHERE id=?", (cursor.lastrowid,)
+                ).fetchone()
+        except sqlite3.IntegrityError as error:
+            with self.lock:
+                self.db.rollback()
+            raise ValueError("This torrent already has an active queued Reconcile") from error
+        return self._queue_row(row)
+
+    def reconcile_queue(self, limit: int = 200) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                """SELECT * FROM reconcile_queue
+                ORDER BY CASE state WHEN 'RUNNING' THEN 0 WHEN 'QUEUED' THEN 1 ELSE 2 END,
+                CASE WHEN state IN ('RUNNING','QUEUED') THEN id END ASC,
+                CASE WHEN state NOT IN ('RUNNING','QUEUED') THEN id END DESC LIMIT ?""",
+                (max(1, min(limit, 1000)),),
+            ).fetchall()
+        return [self._queue_row(row) for row in rows]
+
+    def claim_next_reconcile(self) -> dict | None:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM reconcile_queue WHERE state='QUEUED' ORDER BY id LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            now = int(time.time())
+            cursor = self.db.execute(
+                """UPDATE reconcile_queue SET state='RUNNING',started_at=?,updated_at=?
+                WHERE id=? AND state='QUEUED'""",
+                (now, now, row["id"]),
+            )
+            self.db.commit()
+            if cursor.rowcount != 1:
+                return None
+            return self._queue_row(
+                self.db.execute("SELECT * FROM reconcile_queue WHERE id=?", (row["id"],)).fetchone()
+            )
+
+    def finish_reconcile(
+        self, queue_id: int, state: str, operation_id: int | None = None, error: str = ""
+    ) -> None:
+        if state not in {"COMPLETE", "FAILED", "CANCELLED", "INTERRUPTED"}:
+            raise ValueError("Invalid terminal queue state")
+        now = int(time.time())
+        with self.lock:
+            self.db.execute(
+                """UPDATE reconcile_queue SET state=?,operation_id=?,error=?,
+                updated_at=?,finished_at=? WHERE id=?""",
+                (state, operation_id, error, now, now, queue_id),
+            )
+            self.db.commit()
+
+    def cancel_queued_reconcile_by_public_id(self, public_id: str) -> bool:
+        now = int(time.time())
+        with self.lock:
+            cursor = self.db.execute(
+                """UPDATE reconcile_queue SET state='CANCELLED',
+                error='Cancelled before execution',updated_at=?,finished_at=?
+                WHERE public_id=? AND state='QUEUED'""",
+                (now, now, public_id.upper()),
+            )
+            self.db.commit()
+            return cursor.rowcount == 1
+
+    def interrupt_running_reconciles(self) -> int:
+        now = int(time.time())
+        with self.lock:
+            cursor = self.db.execute(
+                """UPDATE reconcile_queue SET state='INTERRUPTED',
+                error='Stowarr restarted while this Reconcile was running. Inspect the library before retrying.',
+                updated_at=?,finished_at=? WHERE state='RUNNING'""",
+                (now, now),
+            )
+            self.db.commit()
+            return cursor.rowcount
 
     def interrupt_running_moves(self) -> int:
         now = int(time.time())
