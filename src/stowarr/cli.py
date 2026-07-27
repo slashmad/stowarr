@@ -27,8 +27,19 @@ def main() -> None:
     elif args.command == "plan":
         print(json.dumps(manager.plan(args.torrent_hash).json(), indent=2))
     elif args.command == "reconcile":
-        manager.consume_confirmation(args.confirmation_token, "reconcile", args.torrent_hash, {"auxiliaryFiles": []})
-        print(json.dumps(manager.reconcile(args.torrent_hash), indent=2))
+        write_enabled = manager.config.apply
+        authorized = manager.consume_confirmation(
+            args.confirmation_token,
+            "reconcile",
+            args.torrent_hash,
+            {"auxiliaryFiles": []},
+            write_enabled,
+        )
+        print(json.dumps(manager.reconcile(
+            args.torrent_hash,
+            set(authorized["payload"]["auxiliaryFiles"]),
+            write_enabled=write_enabled,
+        ), indent=2))
     else:
         import secrets
         password = args.password or secrets.token_urlsafe(18)
