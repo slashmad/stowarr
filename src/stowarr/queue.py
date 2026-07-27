@@ -48,6 +48,7 @@ class OperationQueueWorker:
                 not self.manager.connections_ready
                 or not self.manager.config.apply
                 or self.manager.store.has_recovery_required()
+                or not self.manager._ensure_write_paths_validated()
             ):
                 self._wait()
                 continue

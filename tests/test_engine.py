@@ -1289,6 +1289,61 @@ class EngineTest(unittest.TestCase):
         self.assertIn("Write mode was disabled", manager.connection_error)
         store.set_setting.assert_called_once_with("runtime", {"apply": False})
 
+    def test_startup_preserves_write_mode_when_recovery_defers_validation(self):
+        pool = Pool(
+            "p1", Path("/p1"), (Path("/p1/download"),),
+            Path("/p1/movies"), Path("/p1/series"),
+            "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+        )
+        config = Config(
+            pools=(pool,),
+            qbittorrent=Service(""),
+            radarr=Service(""),
+            sonarr=Service(""),
+            database=Path("/state/test.db"),
+            apply=True,
+            listen="127.0.0.1",
+            port=8787,
+            api_token="existing-token",
+            api_only=False,
+            auth_method="forms",
+            external_user_header="X-Forwarded-User",
+        )
+        store = Mock()
+        store.setting.return_value = None
+        store.has_recovery_required.return_value = True
+
+        with (
+            patch("stowarr.engine.Store", return_value=store),
+            patch("stowarr.engine.AuthManager"),
+            patch.object(Stowarr, "_activate_connections", return_value={}),
+            patch.object(Stowarr, "_validate_write_paths") as validate,
+        ):
+            manager = Stowarr(config)
+
+        self.assertTrue(manager.config.apply)
+        self.assertFalse(manager._write_paths_validated)
+        self.assertIn("deferred until Recovery", manager.connection_error)
+        validate.assert_not_called()
+        store.set_setting.assert_not_called()
+
+    def test_deferred_write_path_validation_resumes_after_recovery(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=True)
+        manager.store = Mock()
+        manager.store.has_recovery_required.return_value = False
+        manager._write_paths_validated = False
+        manager.connection_error = (
+            "Write-path validation is deferred until Recovery is resolved"
+        )
+
+        with patch.object(manager, "_validate_write_paths") as validate:
+            self.assertTrue(manager._ensure_write_paths_validated())
+
+        validate.assert_called_once_with()
+        self.assertTrue(manager._write_paths_validated)
+        self.assertIsNone(manager.connection_error)
+
     def test_sonarr_audit_accepts_anime_root_and_multiple_episode_torrents(self):
         p3 = Pool(
             "p3", Path("/p3"), (Path("/p3/download"),),

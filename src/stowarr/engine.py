@@ -21,7 +21,11 @@ from .archive import (
 from .auth import AuthManager
 from .clients import ArrClient, QBittorrentClient
 from .config import Config, Pool, Service
-from .mutations import ExternalMutationGuard, GuardedFilesystem
+from .mutations import (
+    ExternalMutationGuard,
+    GuardedFilesystem,
+    RecoveryBlockedError,
+)
 from .store import Store
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
@@ -247,6 +251,7 @@ class Stowarr:
         self.qbit = None
         self.arr = {}
         self.connection_error = None
+        self._write_paths_validated = False
         self.archive_extractor = ArchiveExtractor()
         self._move_lock = threading.RLock()
         self.queue_worker = None
@@ -256,12 +261,7 @@ class Stowarr:
         except Exception as error:
             self.connection_error = str(error)
         if self.config.apply:
-            try:
-                self._validate_write_paths()
-            except Exception as error:
-                self.config = replace(self.config, apply=False)
-                self.store.set_setting("runtime", {"apply": False})
-                self.connection_error = f"Write mode was disabled during startup: {error}"
+            self._ensure_write_paths_validated()
 
     @property
     def connections_ready(self) -> bool:
@@ -503,6 +503,8 @@ class Stowarr:
         if apply:
             self._require_recovery_clear()
             self._validate_write_paths()
+        else:
+            self._write_paths_validated = False
         self.store.set_setting("runtime", {"apply": apply})
         self.config = replace(self.config, apply=apply)
         return self.runtime_settings()
@@ -531,6 +533,47 @@ class Stowarr:
 
     def _require_recovery_clear(self) -> None:
         self._mutation_guard().require_allowed()
+
+    def _ensure_write_paths_validated(self) -> bool:
+        """Validate deferred write roots before allowing persisted Write mode to resume."""
+        if not self.config.apply:
+            return False
+        if getattr(self, "_write_paths_validated", True):
+            return True
+        if self._recovery_is_required():
+            if not self.connection_error:
+                self.connection_error = (
+                    "Write-path validation is deferred until Recovery is resolved"
+                )
+            return False
+        try:
+            self._validate_write_paths()
+        except RecoveryBlockedError:
+            if not self.connection_error:
+                self.connection_error = (
+                    "Write-path validation is deferred until Recovery is resolved"
+                )
+            return False
+        except Exception as error:
+            self.config = replace(self.config, apply=False)
+            self.store.set_setting("runtime", {"apply": False})
+            self.connection_error = (
+                f"Write mode was disabled because write paths could not be validated: {error}"
+            )
+            return False
+        self._write_paths_validated = True
+        if self.connection_error == (
+            "Write-path validation is deferred until Recovery is resolved"
+        ):
+            self.connection_error = None
+        return True
+
+    def _require_write_ready(self) -> None:
+        self._require_recovery_clear()
+        if not self._ensure_write_paths_validated():
+            raise RuntimeError(
+                self.connection_error or "Write paths have not been validated"
+            )
 
     @staticmethod
     def _recovery_path_fact(value: str | None) -> dict | None:
@@ -835,7 +878,7 @@ class Stowarr:
     def issue_confirmation(self, kind: str, torrent_hash: str, payload: dict) -> dict:
         write_enabled = self.config.apply
         if write_enabled:
-            self._require_recovery_clear()
+            self._require_write_ready()
         if kind == "reconcile":
             sources = payload.get("auxiliaryFiles", [])
             if not isinstance(sources, list) or not all(isinstance(item, str) for item in sources):
@@ -885,7 +928,7 @@ class Stowarr:
         write_enabled: bool,
     ) -> dict:
         if write_enabled:
-            self._require_recovery_clear()
+            self._require_write_ready()
         if not token:
             raise PermissionError("A confirmation token is required")
         if kind == "reconcile":
@@ -908,7 +951,7 @@ class Stowarr:
         submission_apply = self.config.apply
         if not submission_apply:
             raise RuntimeError("Move queue is unavailable in dry-run mode")
-        self._require_recovery_clear()
+        self._require_write_ready()
         authorized = self.consume_confirmation(
             token, "move", torrent_hash, payload, submission_apply
         )
@@ -936,7 +979,7 @@ class Stowarr:
         submission_apply = self.config.apply
         if not submission_apply:
             raise RuntimeError("Reconcile queue is unavailable in dry-run mode")
-        self._require_recovery_clear()
+        self._require_write_ready()
         authorized = self.consume_confirmation(
             token, "reconcile", torrent_hash, payload, submission_apply
         )
@@ -962,7 +1005,7 @@ class Stowarr:
         """Record dry runs directly; serialize or queue confirmed write operations."""
         submission_apply = self.config.apply
         if submission_apply:
-            self._require_recovery_clear()
+            self._require_write_ready()
         authorized = self.consume_confirmation(
             token, "move", torrent_hash, payload, submission_apply
         )
@@ -1013,7 +1056,7 @@ class Stowarr:
         """Record dry runs directly; serialize or queue confirmed write operations."""
         submission_apply = self.config.apply
         if submission_apply:
-            self._require_recovery_clear()
+            self._require_write_ready()
         authorized = self.consume_confirmation(
             token, "reconcile", torrent_hash, payload, submission_apply
         )
@@ -1147,6 +1190,7 @@ class Stowarr:
         return tuple(dict.fromkeys(paths))
 
     def _validate_write_paths(self) -> None:
+        self._write_paths_validated = False
         for pool in self.config.pools:
             for root in self._pool_media_paths(pool, strict_discovery=True):
                 probe = root / f".stowarr-write-test-{secrets.token_hex(6)}"
@@ -1160,6 +1204,7 @@ class Stowarr:
                     raise PermissionError(
                         f"Required media path is not writable inside the API container: {root}"
                     ) from error
+        self._write_paths_validated = True
 
     def _library_root_for_path(
         self, app: str, pool: Pool, path: str | Path,
@@ -2682,7 +2727,7 @@ class Stowarr:
             raise ValueError(f"Unsupported application: {app}")
         if not self.config.apply:
             raise RuntimeError("Category repair is unavailable in dry-run mode")
-        self._require_recovery_clear()
+        self._require_write_ready()
         if self.store.has_active_queue_work():
             raise RuntimeError("Wait for the active Move/Reconcile queue to finish before changing a category")
         if not self._move_lock.acquire(blocking=False):

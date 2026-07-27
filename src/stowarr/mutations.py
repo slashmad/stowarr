@@ -12,6 +12,10 @@ RECOVERY_BLOCKED_MESSAGE = (
 )
 
 
+class RecoveryBlockedError(RuntimeError):
+    """Raised when recovery intentionally blocks an external mutation."""
+
+
 class ExternalMutationGuard:
     """Single enforcement point for writes outside Stowarr's SQLite state."""
 
@@ -20,7 +24,7 @@ class ExternalMutationGuard:
 
     def require_allowed(self) -> None:
         if self._recovery_required():
-            raise RuntimeError(RECOVERY_BLOCKED_MESSAGE)
+            raise RecoveryBlockedError(RECOVERY_BLOCKED_MESSAGE)
 
     def execute(
         self,
