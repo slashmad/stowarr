@@ -1318,6 +1318,18 @@
   gap: 8px;
 }
 
+.queue-position {
+  align-items: baseline;
+  display: inline-flex;
+  gap: 10px;
+  white-space: nowrap;
+}
+
+.queue-position small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 @media (max-width: 720px) {
   .sync-filters:not(:empty) {
     grid-template-columns: 1fr;
