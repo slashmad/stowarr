@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from stowarr.archive import ArchiveMember, ExtractedFile
-from stowarr.config import Pool
+from stowarr.config import Config, Pool, Service
 from stowarr.engine import (
     AuxiliaryFile,
     FilePair,
@@ -951,6 +951,61 @@ class EngineTest(unittest.TestCase):
             manager._library_root_for_path("sonarr", p3, "/p3/anime/Dr. STONE"),
             Path("/p3/anime"),
         )
+
+    def test_write_mode_validates_and_reports_discovered_sonarr_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "p1"
+            download = prefix / "download"
+            movies = prefix / "movies"
+            series = prefix / "series"
+            anime = prefix / "anime"
+            for path in (download, movies, series, anime):
+                path.mkdir(parents=True, exist_ok=True)
+            pool = Pool(
+                "p1", prefix, (download,), movies, series,
+                "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+            )
+            manager = Stowarr.__new__(Stowarr)
+            manager.config = Config(
+                pools=(pool,),
+                qbittorrent=Service(""),
+                radarr=Service(""),
+                sonarr=Service(""),
+                database=Path(directory) / "state.db",
+                apply=False,
+                listen="127.0.0.1",
+                port=8787,
+                api_token="",
+                api_only=False,
+                auth_method="forms",
+                external_user_header="X-Forwarded-User",
+            )
+            manager.arr = {"sonarr": SimpleNamespace(root_folders=lambda: [
+                {"path": str(anime)},
+                {"path": str(series)},
+            ])}
+            manager.store = SimpleNamespace(set_setting=lambda *args: None)
+
+            report = manager.runtime_settings()
+            reported_paths = {
+                item["path"]
+                for item in report["deployment"]["pool_mounts"][0]["paths"]
+            }
+
+            self.assertIn(str(anime), reported_paths)
+            original_write_bytes = Path.write_bytes
+
+            def reject_anime(path, data):
+                if path.parent == anime:
+                    raise PermissionError("read-only anime root")
+                return original_write_bytes(path, data)
+
+            with patch.object(Path, "write_bytes", reject_anime):
+                with self.assertRaisesRegex(
+                    PermissionError, "Required media path is not writable"
+                ):
+                    manager.update_runtime_settings({"apply": True})
+            self.assertFalse(manager.config.apply)
 
     def test_sonarr_audit_accepts_anime_root_and_multiple_episode_torrents(self):
         p3 = Pool(

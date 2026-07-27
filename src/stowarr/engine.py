@@ -413,6 +413,23 @@ class Stowarr:
         return {"qbit_categories": qbit_categories, "services": services}
 
     def runtime_settings(self) -> dict:
+        pool_mounts = []
+        for pool in self.config.pools:
+            paths = self._pool_media_paths(pool)
+            pool_mounts.append({
+                "name": pool.name,
+                "prefix": str(pool.prefix),
+                "writable": all(
+                    path.exists() and os.access(path, os.W_OK) for path in paths
+                ),
+                "paths": [
+                    {
+                        "path": str(path),
+                        "writable": path.exists() and os.access(path, os.W_OK),
+                    }
+                    for path in paths
+                ],
+            })
         return {
             "apply": self.config.apply,
             "deployment": {
@@ -431,21 +448,7 @@ class Stowarr:
                 "process_gid": os.getgid(),
                 "umask": os.getenv("UMASK", "not set"),
                 "running_as_root": os.getuid() == 0,
-                "pool_mounts": [
-                    {
-                        "name": pool.name,
-                        "prefix": str(pool.prefix),
-                        "writable": all(
-                            path.exists() and os.access(path, os.W_OK)
-                            for path in (*pool.download_roots, pool.radarr_root, pool.sonarr_root)
-                        ),
-                        "paths": [
-                            {"path": str(path), "writable": path.exists() and os.access(path, os.W_OK)}
-                            for path in (*pool.download_roots, pool.radarr_root, pool.sonarr_root)
-                        ],
-                    }
-                    for pool in self.config.pools
-                ],
+                "pool_mounts": pool_mounts,
             },
         }
 
@@ -455,7 +458,7 @@ class Stowarr:
             raise ValueError("apply must be a boolean")
         if apply:
             for pool in self.config.pools:
-                for root in (*pool.download_roots, pool.radarr_root, pool.sonarr_root):
+                for root in self._pool_media_paths(pool, strict_discovery=True):
                     probe = root / f".stowarr-write-test-{secrets.token_hex(6)}"
                     try:
                         probe.write_bytes(b"")
@@ -737,7 +740,9 @@ class Stowarr:
     def _library_files(mapping: dict) -> list[tuple[Path, int]]:
         return [(Path(record["path"]), int(record["size"])) for record in mapping.get("files", [])]
 
-    def _pool_library_roots(self, app: str, pool: Pool) -> tuple[Path, ...]:
+    def _pool_library_roots(
+        self, app: str, pool: Pool, strict: bool = False,
+    ) -> tuple[Path, ...]:
         """Return live *Arr roots below a pool, retaining the configured fallback."""
         configured = pool.radarr_root if app == "radarr" else pool.sonarr_root
         roots = {configured}
@@ -755,10 +760,24 @@ class Stowarr:
                     for record in root_folders()
                     if record.get("path") and contains(Path(str(record["path"])))
                 )
-            except Exception:
+            except Exception as error:
+                if strict:
+                    raise RuntimeError(
+                        f"Unable to discover {app.capitalize()} root folders"
+                    ) from error
                 # Never infer additional writable roots when live discovery fails.
                 pass
         return tuple(sorted(roots, key=lambda root: (len(root.parts), str(root))))
+
+    def _pool_media_paths(
+        self, pool: Pool, strict_discovery: bool = False,
+    ) -> tuple[Path, ...]:
+        paths = (
+            *pool.download_roots,
+            pool.radarr_root,
+            *self._pool_library_roots("sonarr", pool, strict=strict_discovery),
+        )
+        return tuple(dict.fromkeys(paths))
 
     def _library_root_for_path(
         self, app: str, pool: Pool, path: str | Path,
