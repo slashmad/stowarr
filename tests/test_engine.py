@@ -4,7 +4,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from stowarr.archive import ArchiveMember, ExtractedFile
 from stowarr.config import Config, Pool, Service
@@ -1006,6 +1006,130 @@ class EngineTest(unittest.TestCase):
                 ):
                     manager.update_runtime_settings({"apply": True})
             self.assertFalse(manager.config.apply)
+
+    def test_write_mode_rejects_missing_sonarr_discovery(self):
+        pool = Pool(
+            "p1", Path("/p1"), (Path("/p1/download"),),
+            Path("/p1/movies"), Path("/p1/series"),
+            "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+        )
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(pools=(pool,), apply=False)
+        manager.arr = {}
+        manager.store = SimpleNamespace(set_setting=lambda *args: None)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Sonarr must be configured"
+        ):
+            manager.update_runtime_settings({"apply": True})
+
+        self.assertFalse(manager.config.apply)
+
+    def test_connection_update_rolls_back_when_new_sonarr_roots_are_not_writable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "p1"
+            download = prefix / "download"
+            movies = prefix / "movies"
+            series = prefix / "series"
+            anime = prefix / "anime"
+            for path in (download, movies, series, anime):
+                path.mkdir(parents=True, exist_ok=True)
+            pool = Pool(
+                "p1", prefix, (download,), movies, series,
+                "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+            )
+            service = Service("http://old", api_key="key")
+            manager = Stowarr.__new__(Stowarr)
+            manager.config = Config(
+                pools=(pool,),
+                qbittorrent=service,
+                radarr=service,
+                sonarr=service,
+                database=Path(directory) / "state.db",
+                apply=True,
+                listen="127.0.0.1",
+                port=8787,
+                api_token="",
+                api_only=False,
+                auth_method="forms",
+                external_user_header="X-Forwarded-User",
+            )
+            previous_qbit = object()
+            previous_arr = {"radarr": object(), "sonarr": object()}
+            manager.qbit = previous_qbit
+            manager.arr = previous_arr
+            manager.connection_error = None
+            manager.store = Mock()
+
+            def activate(*args, **kwargs):
+                manager.qbit = object()
+                manager.arr = {
+                    "radarr": object(),
+                    "sonarr": SimpleNamespace(root_folders=lambda: [
+                        {"path": str(series)},
+                        {"path": str(anime)},
+                    ]),
+                }
+                return {"qbittorrent": "connected", "sonarr": "connected"}
+
+            original_write_bytes = Path.write_bytes
+
+            def reject_anime(path, data):
+                if path.parent == anime:
+                    raise PermissionError("read-only anime root")
+                return original_write_bytes(path, data)
+
+            payload = {"services": {
+                "qbittorrent": {"url": "http://new-qbit", "api_key": "key"},
+                "radarr": {"url": "http://new-radarr", "api_key": "key"},
+                "sonarr": {"url": "http://new-sonarr", "api_key": "key"},
+            }}
+            with (
+                patch.object(manager, "_activate_connections", side_effect=activate),
+                patch.object(Path, "write_bytes", reject_anime),
+                self.assertRaisesRegex(
+                    PermissionError, "Required media path is not writable"
+                ),
+            ):
+                manager.update_connections(payload)
+
+            self.assertIs(manager.qbit, previous_qbit)
+            self.assertIs(manager.arr, previous_arr)
+            manager.store.set_setting.assert_not_called()
+
+    def test_startup_disables_persisted_write_mode_when_roots_cannot_be_validated(self):
+        pool = Pool(
+            "p1", Path("/p1"), (Path("/p1/download"),),
+            Path("/p1/movies"), Path("/p1/series"),
+            "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+        )
+        config = Config(
+            pools=(pool,),
+            qbittorrent=Service(""),
+            radarr=Service(""),
+            sonarr=Service(""),
+            database=Path("/state/test.db"),
+            apply=True,
+            listen="127.0.0.1",
+            port=8787,
+            api_token="existing-token",
+            api_only=False,
+            auth_method="forms",
+            external_user_header="X-Forwarded-User",
+        )
+        store = Mock()
+        store.setting.return_value = None
+
+        with (
+            patch("stowarr.engine.Store", return_value=store),
+            patch("stowarr.engine.AuthManager"),
+            patch.object(Stowarr, "_activate_connections", return_value={}),
+        ):
+            manager = Stowarr(config)
+
+        self.assertFalse(manager.config.apply)
+        self.assertIn("Write mode was disabled", manager.connection_error)
+        store.set_setting.assert_called_once_with("runtime", {"apply": False})
 
     def test_sonarr_audit_accepts_anime_root_and_multiple_episode_torrents(self):
         p3 = Pool(
