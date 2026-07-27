@@ -125,6 +125,10 @@ def handler(manager: Stowarr):
                             "download_roots": [str(root) for root in pool.download_roots],
                             "radarr_root": str(pool.radarr_root),
                             "sonarr_root": str(pool.sonarr_root),
+                            "sonarr_roots": [
+                                str(root)
+                                for root in manager._pool_library_roots("sonarr", pool)
+                            ],
                             "radarr_category": pool.radarr_category,
                             "sonarr_category": pool.sonarr_category,
                             "radarr_tag": pool.radarr_tag,
