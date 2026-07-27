@@ -27,7 +27,7 @@ class EngineTest(unittest.TestCase):
         manager.config = SimpleNamespace(apply=True)
         manager._move_lock = threading.RLock()
         manager.store = SimpleNamespace(has_active_queue_work=lambda: True)
-        manager.consume_confirmation = lambda token, kind, torrent_hash, payload: {
+        manager.consume_confirmation = lambda token, kind, torrent_hash, payload, write_enabled: {
             "plan": {"torrent_name": "Example"},
             "payload": payload,
             "fingerprint": f"{kind}-fingerprint",
@@ -71,7 +71,7 @@ class EngineTest(unittest.TestCase):
                 "Dry-run submissions must bypass persistent queue state"
             )
         )
-        manager.consume_confirmation = lambda token, kind, torrent_hash, payload: {
+        manager.consume_confirmation = lambda token, kind, torrent_hash, payload, write_enabled: {
             "plan": {"torrent_name": "Example"},
             "payload": payload,
             "fingerprint": f"{kind}-fingerprint",
@@ -114,7 +114,7 @@ class EngineTest(unittest.TestCase):
             )
         )
         confirmed = threading.Event()
-        manager.consume_confirmation = lambda token, kind, torrent_hash, payload: (
+        manager.consume_confirmation = lambda token, kind, torrent_hash, payload, write_enabled: (
             confirmed.set() or {
                 "plan": {"torrent_name": "Example"},
                 "payload": payload,
@@ -164,6 +164,48 @@ class EngineTest(unittest.TestCase):
         reconcile_thread.join(timeout=1)
         self.assertFalse(reconcile_thread.is_alive())
 
+        self.assertEqual(observed, [("move", False), ("reconcile", False)])
+
+    def test_dry_run_mode_is_captured_before_confirmation_is_consumed(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=False)
+        manager._move_lock = threading.RLock()
+        manager.store = SimpleNamespace(
+            has_active_queue_work=lambda: self.fail(
+                "A submission that began in dry-run must never enter queue handling"
+            )
+        )
+
+        def consume_confirmation(token, kind, torrent_hash, payload, write_enabled):
+            manager.config = SimpleNamespace(apply=True)
+            return {
+                "plan": {"torrent_name": "Example"},
+                "payload": payload,
+                "fingerprint": f"{kind}-fingerprint",
+            }
+
+        manager.consume_confirmation = consume_confirmation
+        observed = []
+        manager._run_move = lambda *args, **kwargs: (
+            observed.append(("move", kwargs.get("write_enabled"))) or
+            {"operation_id": 11, "state": "DRY_RUN"}
+        )
+        manager.reconcile = lambda *args, **kwargs: (
+            observed.append(("reconcile", kwargs.get("write_enabled"))) or
+            {"operation_id": 12, "state": "DRY_RUN"}
+        )
+
+        move = manager.submit_move(
+            "move-token", "move-hash",
+            {"targetPool": "p1", "additionalFiles": {}},
+        )
+        manager.config = SimpleNamespace(apply=False)
+        reconcile = manager.submit_reconcile(
+            "reconcile-token", "reconcile-hash", {"auxiliaryFiles": []},
+        )
+
+        self.assertEqual(move["state"], "DRY_RUN")
+        self.assertEqual(reconcile["state"], "DRY_RUN")
         self.assertEqual(observed, [("move", False), ("reconcile", False)])
 
     def test_explicit_dry_run_mode_controls_move_and_reconcile_write_gates(self):
@@ -362,6 +404,18 @@ class EngineTest(unittest.TestCase):
         self.assertNotEqual(
             Stowarr._operation_fingerprint("move", first, payload),
             Stowarr._operation_fingerprint("move", second, payload),
+        )
+
+    def test_confirmation_fingerprint_is_bound_to_execution_mode(self):
+        operation = Stowarr._operation_fingerprint(
+            "reconcile",
+            {"status": "ready", "torrent_hash": "abc"},
+            {"auxiliaryFiles": []},
+        )
+
+        self.assertNotEqual(
+            Stowarr._confirmation_fingerprint(operation, False),
+            Stowarr._confirmation_fingerprint(operation, True),
         )
 
     def test_title_match_rejects_unrelated_release(self):
@@ -864,6 +918,89 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(by_hash["C"]["status"], "category-unconfigured")
         self.assertEqual(by_hash["C"]["expected_category"], "radarr-pool3")
         self.assertTrue(by_hash["C"]["category_repairable"])
+
+    def test_sonarr_roots_preserve_anime_family_between_pools(self):
+        p1 = Pool(
+            "p1", Path("/p1"), (Path("/p1/download"),),
+            Path("/p1/movies"), Path("/p1/series"),
+            "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+        )
+        p3 = Pool(
+            "p3", Path("/p3"), (Path("/p3/download"),),
+            Path("/p3/movies"), Path("/p3/series"),
+            "radarr-p3", "sonarr-p3", "radarr-p3", "sonarr-p3",
+        )
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(
+            pools=(p1, p3),
+            pool_for_path=lambda path: p1 if str(path).startswith("/p1/") else p3,
+        )
+        manager.arr = {"sonarr": SimpleNamespace(root_folders=lambda: [
+            {"path": "/p1/anime"},
+            {"path": "/p1/series"},
+            {"path": "/p3/anime"},
+            {"path": "/p3/series"},
+        ])}
+
+        target = manager._target_item_path(
+            {"path": "/p3/anime/Dr. STONE"}, p1, "sonarr",
+        )
+
+        self.assertEqual(target, Path("/p1/anime/Dr. STONE"))
+        self.assertEqual(
+            manager._library_root_for_path("sonarr", p3, "/p3/anime/Dr. STONE"),
+            Path("/p3/anime"),
+        )
+
+    def test_sonarr_audit_accepts_anime_root_and_multiple_episode_torrents(self):
+        p3 = Pool(
+            "p3", Path("/p3"), (Path("/p3/download"),),
+            Path("/p3/movies"), Path("/p3/series"),
+            "radarr-p3", "sonarr-p3", "radarr-p3", "sonarr-p3",
+        )
+        torrents = [
+            {
+                "hash": "EP1", "name": "Dr.Stone.S04E01",
+                "category": "sonarr-p3", "save_path": "/p3/download/Dr.Stone.S04E01",
+            },
+            {
+                "hash": "EP2", "name": "Dr.Stone.S04E02",
+                "category": "sonarr-p3", "save_path": "/p3/download/Dr.Stone.S04E02",
+            },
+        ]
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(
+            pools=(p3,),
+            pool_for_path=lambda path: p3,
+            pool_for_category=lambda category: (
+                (p3, "sonarr") if category == "sonarr-p3" else None
+            ),
+        )
+        manager.qbit = SimpleNamespace(
+            torrents=lambda: torrents,
+            categories=lambda: {"sonarr-p3": {"savePath": "/p3/download"}},
+        )
+        manager.arr = {"sonarr": SimpleNamespace(
+            root_folders=lambda: [
+                {"path": "/p3/anime"},
+                {"path": "/p3/series"},
+            ],
+            history_for_downloads=lambda hashes: {"ep1": 42, "ep2": 42},
+            all_items=lambda: [{
+                "id": 42, "title": "Dr. STONE",
+                "path": "/p3/anime/Dr. STONE", "seriesType": "anime",
+            }],
+        )}
+
+        audit = manager.sync_audit("sonarr")
+
+        self.assertEqual(audit["in_sync"], 2)
+        self.assertEqual(audit["issues"], 0)
+        self.assertEqual({row["status"] for row in audit["rows"]}, {"in-sync"})
+        self.assertEqual(
+            {row["expected_root"] for row in audit["rows"]},
+            {"/p3/anime"},
+        )
 
     def test_sync_category_repair_revalidates_route_and_history(self):
         pool = Pool(

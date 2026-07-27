@@ -480,7 +480,13 @@ class Stowarr:
         )
         return hashlib.sha256(canonical.encode()).hexdigest()
 
+    @staticmethod
+    def _confirmation_fingerprint(operation_fingerprint: str, write_enabled: bool) -> str:
+        mode = "write" if write_enabled else "dry-run"
+        return hashlib.sha256(f"{operation_fingerprint}:{mode}".encode()).hexdigest()
+
     def issue_confirmation(self, kind: str, torrent_hash: str, payload: dict) -> dict:
+        write_enabled = self.config.apply
         if kind == "reconcile":
             sources = payload.get("auxiliaryFiles", [])
             if not isinstance(sources, list) or not all(isinstance(item, str) for item in sources):
@@ -509,10 +515,26 @@ class Stowarr:
         token = secrets.token_urlsafe(32)
         expires_at = int(time.time()) + 600
         fingerprint = self._operation_fingerprint(kind, plan, normalized)
-        self.store.create_confirmation(token, kind, torrent_hash, fingerprint, expires_at)
-        return {"token": token, "expires_at": expires_at, "kind": kind, "torrent_hash": torrent_hash, "plan": plan, "payload": normalized}
+        confirmation_fingerprint = self._confirmation_fingerprint(
+            fingerprint, write_enabled
+        )
+        self.store.create_confirmation(
+            token, kind, torrent_hash, confirmation_fingerprint, expires_at
+        )
+        return {
+            "token": token,
+            "expires_at": expires_at,
+            "kind": kind,
+            "torrent_hash": torrent_hash,
+            "plan": plan,
+            "payload": normalized,
+            "execution_mode": "write" if write_enabled else "dry-run",
+        }
 
-    def consume_confirmation(self, token: str, kind: str, torrent_hash: str, payload: dict) -> dict:
+    def consume_confirmation(
+        self, token: str, kind: str, torrent_hash: str, payload: dict,
+        write_enabled: bool,
+    ) -> dict:
         if not token:
             raise PermissionError("A confirmation token is required")
         if kind == "reconcile":
@@ -523,13 +545,21 @@ class Stowarr:
             normalized = {"targetPool": payload.get("targetPool"), "additionalFiles": dict(sorted(actions.items()))}
             plan = self.move_plan(torrent_hash, normalized["targetPool"]).json()
         fingerprint = self._operation_fingerprint(kind, plan, normalized)
-        self.store.consume_confirmation(token, kind, torrent_hash, fingerprint)
+        confirmation_fingerprint = self._confirmation_fingerprint(
+            fingerprint, write_enabled
+        )
+        self.store.consume_confirmation(
+            token, kind, torrent_hash, confirmation_fingerprint
+        )
         return {"plan": plan, "payload": normalized, "fingerprint": fingerprint}
 
     def enqueue_move(self, token: str, torrent_hash: str, payload: dict) -> dict:
-        if not self.config.apply:
+        submission_apply = self.config.apply
+        if not submission_apply:
             raise RuntimeError("Move queue is unavailable in dry-run mode")
-        authorized = self.consume_confirmation(token, "move", torrent_hash, payload)
+        authorized = self.consume_confirmation(
+            token, "move", torrent_hash, payload, submission_apply
+        )
         return self._enqueue_authorized_move(torrent_hash, authorized)
 
     def _enqueue_authorized_move(self, torrent_hash: str, authorized: dict) -> dict:
@@ -551,9 +581,12 @@ class Stowarr:
         return queued
 
     def enqueue_reconcile(self, token: str, torrent_hash: str, payload: dict) -> dict:
-        if not self.config.apply:
+        submission_apply = self.config.apply
+        if not submission_apply:
             raise RuntimeError("Reconcile queue is unavailable in dry-run mode")
-        authorized = self.consume_confirmation(token, "reconcile", torrent_hash, payload)
+        authorized = self.consume_confirmation(
+            token, "reconcile", torrent_hash, payload, submission_apply
+        )
         return self._enqueue_authorized_reconcile(torrent_hash, authorized)
 
     def _enqueue_authorized_reconcile(self, torrent_hash: str, authorized: dict) -> dict:
@@ -574,8 +607,10 @@ class Stowarr:
 
     def submit_move(self, token: str, torrent_hash: str, payload: dict) -> dict:
         """Record dry runs directly; serialize or queue confirmed write operations."""
-        authorized = self.consume_confirmation(token, "move", torrent_hash, payload)
         submission_apply = self.config.apply
+        authorized = self.consume_confirmation(
+            token, "move", torrent_hash, payload, submission_apply
+        )
         if not submission_apply:
             with self._move_lock:
                 return {
@@ -621,8 +656,10 @@ class Stowarr:
 
     def submit_reconcile(self, token: str, torrent_hash: str, payload: dict) -> dict:
         """Record dry runs directly; serialize or queue confirmed write operations."""
-        authorized = self.consume_confirmation(token, "reconcile", torrent_hash, payload)
         submission_apply = self.config.apply
+        authorized = self.consume_confirmation(
+            token, "reconcile", torrent_hash, payload, submission_apply
+        )
         if not submission_apply:
             return {
                 **self.reconcile(
@@ -700,10 +737,75 @@ class Stowarr:
     def _library_files(mapping: dict) -> list[tuple[Path, int]]:
         return [(Path(record["path"]), int(record["size"])) for record in mapping.get("files", [])]
 
-    @staticmethod
-    def _target_item_path(item: dict, pool: Pool, app: str) -> Path:
-        root = pool.radarr_root if app == "radarr" else pool.sonarr_root
-        return root / Path(item["path"]).name
+    def _pool_library_roots(self, app: str, pool: Pool) -> tuple[Path, ...]:
+        """Return live *Arr roots below a pool, retaining the configured fallback."""
+        configured = pool.radarr_root if app == "radarr" else pool.sonarr_root
+        roots = {configured}
+        client = getattr(self, "arr", {}).get(app)
+        root_folders = getattr(client, "root_folders", None)
+        if root_folders:
+            try:
+                contains = getattr(
+                    pool,
+                    "contains",
+                    lambda path: Path(path) == pool.prefix or Path(path).is_relative_to(pool.prefix),
+                )
+                roots.update(
+                    Path(str(record["path"]))
+                    for record in root_folders()
+                    if record.get("path") and contains(Path(str(record["path"])))
+                )
+            except Exception:
+                # Never infer additional writable roots when live discovery fails.
+                pass
+        return tuple(sorted(roots, key=lambda root: (len(root.parts), str(root))))
+
+    def _library_root_for_path(
+        self, app: str, pool: Pool, path: str | Path,
+        roots: tuple[Path, ...] | None = None,
+    ) -> Path | None:
+        candidate = Path(path)
+        matches = [
+            root for root in (roots or self._pool_library_roots(app, pool))
+            if candidate == root or candidate.is_relative_to(root)
+        ]
+        return max(matches, key=lambda root: len(root.parts), default=None)
+
+    def _library_app_for_path(self, pool: Pool, path: str | Path) -> str | None:
+        candidate = Path(path)
+        if candidate == pool.radarr_root or candidate.is_relative_to(pool.radarr_root):
+            return "radarr"
+        if self._library_root_for_path("sonarr", pool, candidate):
+            return "sonarr"
+        return None
+
+    def _target_item_path(self, item: dict, pool: Pool, app: str) -> Path:
+        current_item = Path(item["path"])
+        if app == "radarr":
+            return pool.radarr_root / current_item.name
+
+        current_pool = self.config.pool_for_path(current_item)
+        if not current_pool:
+            raise RuntimeError(
+                f'Sonarr path "{current_item}" is outside every configured Stowarr pool'
+            )
+        current_root = self._library_root_for_path("sonarr", current_pool, current_item)
+        if not current_root:
+            raise RuntimeError(
+                f'Sonarr path "{current_item}" is not below a discovered Sonarr root folder'
+            )
+        relative_root = current_root.relative_to(current_pool.prefix)
+        matching_roots = [
+            root for root in self._pool_library_roots("sonarr", pool)
+            if root.relative_to(pool.prefix) == relative_root
+        ]
+        if len(matching_roots) != 1:
+            expected = pool.prefix / relative_root
+            raise RuntimeError(
+                f'Sonarr root family "{relative_root}" has no unique destination root '
+                f'on {pool.name}; expected "{expected}"'
+            )
+        return matching_roots[0] / current_item.name
 
     @staticmethod
     def _target_download_path(current_pool: Pool, target_pool: Pool, save_path: Path) -> Path:
@@ -740,7 +842,11 @@ class Stowarr:
             return Path(torrent["save_path"]) / next(iter(first_parts))
         return None
 
-    def _move_inventory(self, torrent: dict, torrent_files: list[dict], mapping: dict, target_pool: Pool, target_save: Path, app: str) -> tuple[list[dict], list[dict]]:
+    def _move_inventory(
+        self, torrent: dict, torrent_files: list[dict], mapping: dict,
+        target_pool: Pool, target_save: Path, app: str,
+        target_item: Path | None = None,
+    ) -> tuple[list[dict], list[dict]]:
         save_path = Path(torrent["save_path"])
         tracked_paths = {
             save_path / record["name"]
@@ -773,7 +879,7 @@ class Stowarr:
                     status = "target-conflict" if target.exists() and sha256(source) != sha256(target) else "available"
                     additional.append(self._move_file_record(source, target, "download", status))
         if item:
-            target_item = self._target_item_path(item, target_pool, app)
+            target_item = target_item or self._target_item_path(item, target_pool, app)
             managed = {Path(record["path"]) for record in mapping.get("files", [])}
             if current_item.exists() and current_item != target_item:
                 scan_root = content_root if content_is_library else current_item
@@ -925,10 +1031,7 @@ class Stowarr:
         save_path = Path(str(torrent.get("save_path") or ""))
         library_app = None
         if current_pool:
-            if save_path == current_pool.radarr_root or save_path.is_relative_to(current_pool.radarr_root):
-                library_app = "radarr"
-            elif save_path == current_pool.sonarr_root or save_path.is_relative_to(current_pool.sonarr_root):
-                library_app = "sonarr"
+            library_app = self._library_app_for_path(current_pool, save_path)
         app = category_match[1] if category_match else library_app or (
             "sonarr" if "sonarr" in torrent.get("category", "").casefold() else "radarr"
         )
@@ -1073,10 +1176,30 @@ class Stowarr:
         additional_files = []
         target_item = None
         if item and mapping:
-            target_item = self._target_item_path(item, target_pool, app)
-            for record in mapping.get("files", []):
-                managed_files.append({**record, "targetPath": str(target_item / record["relativePath"])})
-            tracked_files, additional_files = self._move_inventory(torrent, torrent_files, mapping, target_pool, target_save, app)
+            try:
+                target_item = self._target_item_path(item, target_pool, app)
+            except RuntimeError as error:
+                status = "blocked"
+                reason = str(error)
+                error_code = "SONARR_ROOT_ROUTE_UNAVAILABLE"
+                error_details = {
+                    "current_path": item.get("path"),
+                    "target_pool": target_pool.name,
+                    "action": (
+                        "Ensure Sonarr has matching root folders below both pool prefixes, "
+                        "for example /media/anime on each pool, then rebuild the Move plan."
+                    ),
+                }
+            if target_item:
+                for record in mapping.get("files", []):
+                    managed_files.append({
+                        **record,
+                        "targetPath": str(target_item / record["relativePath"]),
+                    })
+                tracked_files, additional_files = self._move_inventory(
+                    torrent, torrent_files, mapping, target_pool, target_save, app,
+                    target_item=target_item,
+                )
         content_root = self._torrent_content_root(torrent, torrent_files)
         subtitle_files = self._subtitle_inventory(torrent, torrent_files, archive_members)
         warnings = []
@@ -1577,11 +1700,7 @@ class Stowarr:
         if not pool:
             return Plan(torrent_hash, torrent["name"], "unknown", "", None, None, None, None, [], "blocked", "Save path is outside configured pools")
         save_path = Path(str(torrent.get("save_path") or ""))
-        library_app = None
-        if save_path == pool.radarr_root or save_path.is_relative_to(pool.radarr_root):
-            library_app = "radarr"
-        elif save_path == pool.sonarr_root or save_path.is_relative_to(pool.sonarr_root):
-            library_app = "sonarr"
+        library_app = self._library_app_for_path(pool, save_path)
         app = app_hint or (category_match[1] if category_match else library_app or (
             "sonarr" if torrent.get("category", "").startswith("sonarr") else "radarr"
         ))
@@ -1694,7 +1813,7 @@ class Stowarr:
                 },
             )
         history_for_downloads = getattr(self.arr[app], "history_for_downloads", None)
-        if not mapping_hint and history_for_downloads:
+        if app == "radarr" and not mapping_hint and history_for_downloads:
             item_by_hash = history_for_downloads({
                 str(candidate.get("hash") or "").casefold() for candidate in torrents
                 if candidate.get("hash")
@@ -1746,7 +1865,27 @@ class Stowarr:
                     "action": "Refresh or rescan the series in Sonarr, then analyze the torrent again.",
                 },
             )
-        target_item = self._target_item_path(item, pool, app)
+        try:
+            target_item = self._target_item_path(item, pool, app)
+        except RuntimeError as error:
+            return Plan(
+                torrent_hash, torrent["name"], app, pool.name, item["id"], item.get("title"),
+                item.get("path"), None, [], "blocked", str(error),
+                "SONARR_ROOT_ROUTE_UNAVAILABLE",
+                {
+                    "issues": [{
+                        "code": "SONARR_ROOT_ROUTE_UNAVAILABLE",
+                        "summary": str(error),
+                        "action": (
+                            "Ensure Sonarr exposes the current root folder and the corresponding "
+                            "root below this pool, then rebuild the Reconcile plan."
+                        ),
+                    }],
+                    "action": (
+                        "Verify Sonarr root folders for both Anime and Series, then rerun the audit."
+                    ),
+                },
+            )
         torrent_files = self._torrent_paths(torrent, torrent_records)
         library_files = self._library_files(mapping)
         if not title_matches(item.get("title", ""), Path(item["path"]).name):
@@ -1948,6 +2087,10 @@ class Stowarr:
             or str(torrent.get("hash") or "").casefold() in history
         ]
         items = {int(item["id"]): item for item in self.arr[app].all_items()}
+        roots_by_pool = {
+            pool.name: self._pool_library_roots(app, pool)
+            for pool in self.config.pools
+        }
         rows = []
         for torrent in torrents:
             torrent_hash = torrent["hash"].casefold()
@@ -1957,10 +2100,21 @@ class Stowarr:
             item_id = history.get(torrent_hash)
             item = items.get(item_id) if item_id else None
             expected_root = None
+            expected_roots: tuple[Path, ...] = ()
             expected_category = None
             category_repairable = False
             if pool:
-                expected_root = pool.radarr_root if app == "radarr" else pool.sonarr_root
+                expected_roots = roots_by_pool[pool.name]
+                item_path = Path(str((item or {}).get("path") or ""))
+                expected_root = next(
+                    (
+                        root for root in sorted(
+                            expected_roots, key=lambda candidate: len(candidate.parts), reverse=True
+                        )
+                        if item_path == root or item_path.is_relative_to(root)
+                    ),
+                    pool.radarr_root if app == "radarr" else pool.sonarr_root,
+                )
                 expected_category = pool.radarr_category if app == "radarr" else pool.sonarr_category
             issues = []
             if not item_id:
@@ -2027,7 +2181,11 @@ class Stowarr:
                         f"to {category_pool[0].name}; make the route match before retrying."
                     ),
                 })
-            elif not Path(item.get("path", "")).is_relative_to(expected_root):
+            elif not any(
+                Path(item.get("path", "")) == root
+                or Path(item.get("path", "")).is_relative_to(root)
+                for root in expected_roots
+            ):
                 status, reason = "root-mismatch", f"*Arr path is not below the {pool.name} root"
                 issues.append({
                     "code": "ARR_ROOT_MISMATCH",
@@ -2052,6 +2210,7 @@ class Stowarr:
                 "item_title": item.get("title") if item else None,
                 "arr_path": item.get("path") if item else None,
                 "expected_root": str(expected_root) if expected_root else None,
+                "expected_roots": [str(root) for root in expected_roots],
                 "expected_category": expected_category,
                 "category_repairable": category_repairable,
                 "status": status,
@@ -2059,37 +2218,38 @@ class Stowarr:
                 "issues": issues,
                 "action": issues[0]["action"] if issues else None,
             })
-        rows_by_item: dict[int, list[dict]] = {}
-        for row in rows:
-            if row["item_id"] and row["item_title"]:
-                rows_by_item.setdefault(int(row["item_id"]), []).append(row)
-        for related in rows_by_item.values():
-            if len(related) < 2:
-                continue
-            torrent_evidence = [{
-                "hash": row["hash"],
-                "name": row["torrent_name"],
-                "category": row["category"],
-                "save_path": row["save_path"],
-            } for row in related]
-            for row in related:
-                issue = {
-                    "code": "ARR_ITEM_HAS_MULTIPLE_TORRENTS",
-                    "summary": (
-                        f'{len(related)} qBittorrent torrents map to the same {service} item '
-                        f'"{row["item_title"]}".'
-                    ),
-                    "action": (
-                        "Keep seeding if required, but do not Reconcile yet. When allowed, retain "
-                        "the intended release and remove or disassociate the unwanted torrent(s); "
-                        "then verify its category and rerun the audit."
-                    ),
-                }
-                row["status"] = "multiple-torrents"
-                row["reason"] = issue["summary"]
-                row["issues"].insert(0, issue)
-                row["action"] = issue["action"]
-                row["related_torrents"] = torrent_evidence
+        if app == "radarr":
+            rows_by_item: dict[int, list[dict]] = {}
+            for row in rows:
+                if row["item_id"] and row["item_title"]:
+                    rows_by_item.setdefault(int(row["item_id"]), []).append(row)
+            for related in rows_by_item.values():
+                if len(related) < 2:
+                    continue
+                torrent_evidence = [{
+                    "hash": row["hash"],
+                    "name": row["torrent_name"],
+                    "category": row["category"],
+                    "save_path": row["save_path"],
+                } for row in related]
+                for row in related:
+                    issue = {
+                        "code": "ARR_ITEM_HAS_MULTIPLE_TORRENTS",
+                        "summary": (
+                            f'{len(related)} qBittorrent torrents map to the same {service} item '
+                            f'"{row["item_title"]}".'
+                        ),
+                        "action": (
+                            "Keep seeding if required, but do not Reconcile yet. When allowed, retain "
+                            "the intended release and remove or disassociate the unwanted torrent(s); "
+                            "then verify its category and rerun the audit."
+                        ),
+                    }
+                    row["status"] = "multiple-torrents"
+                    row["reason"] = issue["summary"]
+                    row["issues"].insert(0, issue)
+                    row["action"] = issue["action"]
+                    row["related_torrents"] = torrent_evidence
         rows.sort(key=lambda row: (row["status"] == "in-sync", row["torrent_name"].casefold()))
         return {
             "app": app,
@@ -2210,14 +2370,21 @@ class Stowarr:
         """Group torrents by configured *Arr category routes, then by actual save path."""
         routes = []
         route_by_category = {}
+        roots_by_route = {
+            (app, pool.name): self._pool_library_roots(app, pool)
+            for app in ("radarr", "sonarr")
+            for pool in self.config.pools
+        }
         for app in ("radarr", "sonarr"):
             for pool in self.config.pools:
                 category = pool.radarr_category if app == "radarr" else pool.sonarr_category
                 tag = pool.radarr_tag if app == "radarr" else pool.sonarr_tag
-                root = pool.radarr_root if app == "radarr" else pool.sonarr_root
+                roots = roots_by_route[(app, pool.name)]
+                configured_root = pool.radarr_root if app == "radarr" else pool.sonarr_root
                 route = {
                     "app": app, "pool": pool.name, "category": category,
-                    "tag": tag, "root": str(root), "paths": {},
+                    "tag": tag, "root": str(configured_root),
+                    "roots": [str(root) for root in roots], "paths": {},
                 }
                 routes.append(route)
                 route_by_category[category] = route
@@ -2248,20 +2415,29 @@ class Stowarr:
                 route["paths"].setdefault(save_path or "<empty save path>", []).append(row)
             else:
                 library_app = None
+                library_root = None
                 if pool:
                     candidate = Path(save_path)
                     if candidate == pool.radarr_root or candidate.is_relative_to(pool.radarr_root):
                         library_app = "radarr"
-                    elif candidate == pool.sonarr_root or candidate.is_relative_to(pool.sonarr_root):
-                        library_app = "sonarr"
+                        library_root = pool.radarr_root
+                    else:
+                        sonarr_root = self._library_root_for_path(
+                            "sonarr", pool, candidate,
+                            roots=roots_by_route[("sonarr", pool.name)],
+                        )
+                        if sonarr_root:
+                            library_app = "sonarr"
+                            library_root = sonarr_root
                 if library_app:
                     row["route_status"] = "library-seeded"
                     row["library_app"] = library_app
-                    key = (library_app, pool.name)
+                    key = (library_app, pool.name, str(library_root))
                     group = library_groups.setdefault(key, {
-                        "app": library_app, "pool": pool.name, "root": str(
-                            pool.radarr_root if library_app == "radarr" else pool.sonarr_root
-                        ), "paths": {},
+                        "app": library_app, "pool": pool.name,
+                        "root": str(library_root),
+                        "root_family": str(library_root.relative_to(pool.prefix)),
+                        "paths": {},
                     })
                     group["paths"].setdefault(save_path or "<empty save path>", []).append(row)
                     continue
@@ -2609,7 +2785,9 @@ class Stowarr:
             if not mapping:
                 raise RuntimeError("The *Arr download mapping disappeared during reconciliation")
             item = mapping["item"]
-            root = pool.radarr_root if plan.app == "radarr" else pool.sonarr_root
+            root = Path(plan.target_item_path or "").parent
+            if not plan.target_item_path:
+                raise RuntimeError("The reconciliation plan has no verified target library path")
             tag = pool.radarr_tag if plan.app == "radarr" else pool.sonarr_tag
             pool_tags = [
                 candidate.radarr_tag if plan.app == "radarr" else candidate.sonarr_tag

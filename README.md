@@ -176,8 +176,13 @@ Each pool defines:
 
 - one or more qBittorrent download roots;
 - a Radarr library root and category;
-- a Sonarr library root and category;
+- a primary Sonarr library root and category;
 - Radarr and Sonarr selection tags.
+
+Stowarr also discovers every Sonarr root folder below each configured pool
+prefix. Matching relative root families are preserved across pools, so a series
+under `p1/anime` moves to `p3/anime`, while `p1/series` moves to `p3/series`.
+The configured `sonarr_root` remains the fallback and must be a real Sonarr root.
 
 The routing chain is:
 
