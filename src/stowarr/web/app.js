@@ -265,6 +265,27 @@ async function trackOperationByPublicId(publicId,kind,startHidden=false){
   const queueContext={publicId,kind:kind||'move'};
   return startOperationTracking(operations=>operations.find(item=>item.public_id===queueContext.publicId&&item.kind===queueContext.kind),queueContext.kind,queueContext,startHidden);
 }
+function watchOperationRegistration(torrentHash,kind,afterId=0){
+  let active=true;
+  let timer=null;
+  const update=async()=>{
+    if(!active)return;
+    await refreshOperations();
+    if(!active)return;
+    const operation=state.operations.find(item=>item.id>afterId&&item.torrent_hash.toLowerCase()===torrentHash.toLowerCase()&&item.kind===kind);
+    if(operation){
+      active=false;
+      startOperationTracking(operations=>operations.find(item=>item.id===operation.id),kind,null,true);
+      return;
+    }
+    timer=setTimeout(update,250);
+  };
+  update();
+  return ()=>{
+    active=false;
+    clearTimeout(timer);
+  };
+}
 function hideOperationTracking(){if(!state.operationTracking||terminalOperation(state.currentOperation))return finishOperationTracking();state.operationHidden=true;const dialog=$('#operation-dialog');if(dialog.open)dialog.close();renderOperationMinimized()}
 function showOperationTracking(){if(!state.operationTracking)return;state.operationHidden=false;renderOperationDialog(state.currentOperation,state.currentOperation?.state==='WAITING');const dialog=$('#operation-dialog');if(!dialog.open)dialog.showModal()}
 function finishOperationTracking(){state.operationTrackingGeneration++;clearInterval(state.operationTimer);state.operationTimer=null;state.operationTracking=false;state.operationHidden=false;state.currentOperation=null;renderOperationMinimized();const dialog=$('#operation-dialog');if(dialog.open)dialog.close()}
@@ -315,17 +336,21 @@ async function applyPlan(){
   button.disabled=true;
   button.textContent='Authorizing…';
   const afterId=Math.max(0,...state.operations.map(item=>item.id));
-  const trackSubmission=shouldTrackDirectSubmission();
+  const showSubmissionTracker=shouldShowSubmissionTracker();
   let trackingGeneration=null;
+  let stopRegistrationWatcher=null;
   try{
     const confirmation=await api('/api/confirmations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'reconcile',torrentHash:plan.torrent_hash,payload:{auxiliaryFiles}})});
     button.textContent='Reconciling…';
-    if(trackSubmission){
+    if(showSubmissionTracker){
       trackOperation(plan.torrent_hash,'reconcile',afterId);
       trackingGeneration=state.operationTrackingGeneration;
+    }else{
+      stopRegistrationWatcher=watchOperationRegistration(plan.torrent_hash,'reconcile',afterId);
     }
     const result=await api(`/api/reconcile/${encodeURIComponent(plan.torrent_hash)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auxiliaryFiles,confirmationToken:confirmation.token})});
     if(result.disposition==='queued'){
+      stopRegistrationWatcher?.();
       if(trackingGeneration===state.operationTrackingGeneration)finishOperationTracking();
       await refreshQueue();
       navigate('queue');
@@ -337,8 +362,9 @@ async function applyPlan(){
     await inspect(plan.torrent_hash);
     await load();
   }catch(e){
+    stopRegistrationWatcher?.();
     await refreshOperations();
-    if(trackSubmission)rejectOperationTracking(plan.torrent_hash,'reconcile',e.message,afterId);
+    if(showSubmissionTracker)rejectOperationTracking(plan.torrent_hash,'reconcile',e.message,afterId);
     toast(`Reconcile failed: ${e.message}`);
     button.disabled=false;
     button.textContent='Reconcile & remove verified duplicate';
@@ -433,7 +459,7 @@ function automaticallyTrackRunningQueue(){
   trackOperationByPublicId(running.public_id,runningMove?'move':'reconcile',true);
 }
 
-function shouldTrackDirectSubmission(){
+function shouldShowSubmissionTracker(){
   const activeQueueWork=[...(state.queue||[]),...(state.reconcileQueue||[])].some(item=>['QUEUED','RUNNING'].includes(item.state));
   const activeOperationTracking=state.operationTracking&&!terminalOperation(state.currentOperation);
   return !activeQueueWork&&!activeOperationTracking;
@@ -515,17 +541,21 @@ async function applyMove(){
   button.textContent='Authorizing…';
   const payload={targetPool:plan.target_pool,additionalFiles};
   const afterId=Math.max(0,...state.operations.map(item=>item.id));
-  const trackSubmission=shouldTrackDirectSubmission();
+  const showSubmissionTracker=shouldShowSubmissionTracker();
   let trackingGeneration=null;
+  let stopRegistrationWatcher=null;
   try{
     const confirmation=await api('/api/confirmations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'move',torrentHash:plan.torrent_hash,payload})});
     button.textContent='Moving and verifying…';
-    if(trackSubmission){
+    if(showSubmissionTracker){
       trackOperation(plan.torrent_hash,'move',afterId);
       trackingGeneration=state.operationTrackingGeneration;
+    }else{
+      stopRegistrationWatcher=watchOperationRegistration(plan.torrent_hash,'move',afterId);
     }
     const result=await api(`/api/move/apply/${encodeURIComponent(plan.torrent_hash)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...payload,confirmationToken:confirmation.token})});
     if(result.disposition==='queued'){
+      stopRegistrationWatcher?.();
       if(trackingGeneration===state.operationTrackingGeneration)finishOperationTracking();
       await refreshQueue();
       navigate('queue');
@@ -539,8 +569,9 @@ async function applyMove(){
     await loadQbitCatalog(true);
     await load();
   }catch(e){
+    stopRegistrationWatcher?.();
     await refreshOperations();
-    if(trackSubmission)rejectOperationTracking(plan.torrent_hash,'move',e.message,afterId);
+    if(showSubmissionTracker)rejectOperationTracking(plan.torrent_hash,'move',e.message,afterId);
     toast(`Move failed: ${e.message}`);
     button.disabled=false;
     button.textContent=`Review & move to ${plan.target_pool}`;
