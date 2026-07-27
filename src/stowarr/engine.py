@@ -8,6 +8,7 @@ import secrets
 import json
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -170,9 +171,43 @@ class MovePlan:
         return asdict(self)
 
 
+_DIGEST_CACHE_MAX_ENTRIES = 4096
+_DIGEST_CACHE: OrderedDict[tuple[int, int, int, int, int], str] = OrderedDict()
+_DIGEST_CACHE_LOCK = threading.RLock()
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.stat()
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def clear_digest_cache() -> None:
+    """Clear reusable file proofs; primarily useful for lifecycle and tests."""
+    with _DIGEST_CACHE_LOCK:
+        _DIGEST_CACHE.clear()
+
+
 def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024, progress=None) -> str:
+    identity = _file_identity(path)
+    with _DIGEST_CACHE_LOCK:
+        cached = _DIGEST_CACHE.get(identity)
+        if cached is not None:
+            _DIGEST_CACHE.move_to_end(identity)
+    if cached is not None:
+        if _file_identity(path) != identity:
+            raise RuntimeError(f"File changed while a cached hash proof was being checked: {path}")
+        if progress:
+            progress(identity[2], identity[2])
+        return cached
+
     digest = hashlib.sha256()
-    total = path.stat().st_size
+    total = identity[2]
     completed = 0
     with path.open("rb") as handle:
         while chunk := handle.read(chunk_size):
@@ -180,7 +215,15 @@ def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024, progress=None) -> str:
             completed += len(chunk)
             if progress:
                 progress(completed, total)
-    return digest.hexdigest()
+    if _file_identity(path) != identity:
+        raise RuntimeError(f"File changed while it was being hash-verified: {path}")
+    value = digest.hexdigest()
+    with _DIGEST_CACHE_LOCK:
+        _DIGEST_CACHE[identity] = value
+        _DIGEST_CACHE.move_to_end(identity)
+        while len(_DIGEST_CACHE) > _DIGEST_CACHE_MAX_ENTRIES:
+            _DIGEST_CACHE.popitem(last=False)
+    return value
 
 
 def sidecar_kind(path: Path) -> str:
@@ -227,6 +270,8 @@ class Stowarr:
         self.arr = {}
         self.connection_error = None
         self.archive_extractor = ArchiveExtractor()
+        self._archive_proof_cache = OrderedDict()
+        self._archive_proof_lock = threading.RLock()
         self._move_lock = threading.RLock()
         self.queue_worker = None
         self.reconcile_queue_worker = None
@@ -960,14 +1005,48 @@ class Stowarr:
             if int(record.get("priority", 1)) > 0 and is_archive(Path(record.get("name", "")))
         ]
 
+    def _verified_archive_entries(
+        self, paths: list[Path],
+    ) -> list[tuple[Path, list[ArchiveMember]]]:
+        """Reuse archive proofs only while every volume has identical file metadata."""
+        ordered_paths = sorted(set(paths), key=lambda path: str(path).casefold())
+        identity = tuple(
+            (str(path), *_file_identity(path))
+            for path in ordered_paths
+        )
+        lock = getattr(self, "_archive_proof_lock", None)
+        if lock is None:
+            lock = self._archive_proof_lock = threading.RLock()
+        cache = getattr(self, "_archive_proof_cache", None)
+        if cache is None:
+            cache = self._archive_proof_cache = OrderedDict()
+        with lock:
+            cached = cache.get(identity)
+            if cached is not None:
+                cache.move_to_end(identity)
+                if tuple((str(path), *_file_identity(path)) for path in ordered_paths) != identity:
+                    raise RuntimeError("Archive files changed while a cached integrity proof was being checked")
+                return [(entry, list(members)) for entry, members in cached]
+
+        verified: list[tuple[Path, list[ArchiveMember]]] = []
+        for entry in select_archive_entries(ordered_paths):
+            self.archive_extractor.test(entry)
+            verified.append((entry, self.archive_extractor.members(entry)))
+        if tuple((str(path), *_file_identity(path)) for path in ordered_paths) != identity:
+            raise RuntimeError("Archive files changed while their integrity was being verified")
+        with lock:
+            cache[identity] = tuple((entry, tuple(members)) for entry, members in verified)
+            cache.move_to_end(identity)
+            while len(cache) > 128:
+                cache.popitem(last=False)
+        return verified
+
     def _verify_archive_sets(self, torrent_hash: str, progress=None) -> list[dict]:
-        entries = select_archive_entries(self._archive_paths(torrent_hash))
+        entries = self._verified_archive_entries(self._archive_paths(torrent_hash))
         verified: list[dict] = []
-        for index, entry in enumerate(entries):
+        for index, (entry, members) in enumerate(entries):
             if progress:
                 progress(index / len(entries) * 100, entry, index + 1, len(entries))
-            self.archive_extractor.test(entry)
-            members = self.archive_extractor.members(entry)
             verified.append({"path": str(entry), "members": len(members)})
             if progress:
                 progress((index + 1) / len(entries) * 100, entry, index + 1, len(entries))
@@ -1213,13 +1292,11 @@ class Stowarr:
         archive_members: list[tuple[Path, ArchiveMember]] = []
         if status == "ready" and extraction_files:
             try:
-                entries = select_archive_entries([
+                entries = self._verified_archive_entries([
                     Path(torrent["save_path"]) / record["name"] for record in torrent_files
                     if int(record.get("priority", 1)) > 0 and is_archive(Path(record.get("name", "")))
                 ])
-                for entry in entries:
-                    self.archive_extractor.test(entry)
-                    members = self.archive_extractor.members(entry)
+                for entry, members in entries:
                     archive_entries.append({"path": str(entry), "members": len(members)})
                     archive_members.extend((entry, member) for member in members)
                 archive_verified = True
