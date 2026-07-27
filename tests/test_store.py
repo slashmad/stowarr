@@ -239,6 +239,43 @@ class StoreTest(unittest.TestCase):
             )
             self.assertEqual(reopened.reconcile_queue()[0]["state"], "CANCELLED")
 
+    def test_move_and_reconcile_share_one_global_fifo_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            first = store.enqueue_move("move-one", "p1", {}, "move-one", {})
+            second = store.enqueue_reconcile(
+                "repair-one", {"auxiliaryFiles": []}, "repair-one", {}
+            )
+            third = store.enqueue_move("move-two", "p3", {}, "move-two", {})
+
+            move_entries = {
+                item["public_id"]: item for item in store.move_queue()
+            }
+            reconcile_entries = {
+                item["public_id"]: item for item in store.reconcile_queue()
+            }
+            self.assertEqual(move_entries[first["public_id"]]["position"], 1)
+            self.assertEqual(reconcile_entries[second["public_id"]]["position"], 2)
+            self.assertEqual(move_entries[third["public_id"]]["position"], 3)
+
+            claimed_first = store.claim_next_operation()
+            self.assertEqual(
+                (claimed_first["kind"], claimed_first["public_id"]),
+                ("move", first["public_id"]),
+            )
+            store.finish_move(claimed_first["id"], "COMPLETE")
+            claimed_second = store.claim_next_operation()
+            self.assertEqual(
+                (claimed_second["kind"], claimed_second["public_id"]),
+                ("reconcile", second["public_id"]),
+            )
+            store.finish_reconcile(claimed_second["id"], "COMPLETE")
+            claimed_third = store.claim_next_operation()
+            self.assertEqual(
+                (claimed_third["kind"], claimed_third["public_id"]),
+                ("move", third["public_id"]),
+            )
+
     def test_queue_cleanup_keeps_running_work_and_history(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory) / "state.db")

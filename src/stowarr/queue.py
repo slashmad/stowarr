@@ -3,6 +3,61 @@ from __future__ import annotations
 import threading
 
 
+class OperationQueueWorker:
+    """Run Move and Reconcile jobs through one shared, globally ordered slot."""
+
+    def __init__(self, manager):
+        self.manager = manager
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="stowarr-operation-queue", daemon=True
+        )
+        self._move_processor = MoveQueueWorker(manager)
+        self._reconcile_processor = ReconcileQueueWorker(manager)
+
+    def start(self) -> None:
+        interrupted_moves = self.manager.store.interrupt_running_moves()
+        interrupted_reconciles = self.manager.store.interrupt_running_reconciles()
+        interrupted = interrupted_moves + interrupted_reconciles
+        if interrupted:
+            print(
+                f"stowarr queue interrupted={interrupted}; manual recovery required before retry",
+                flush=True,
+            )
+        self.manager.queue_worker = self
+        self.manager.reconcile_queue_worker = self
+        self._thread.start()
+
+    def stop(self) -> bool:
+        self._stop.set()
+        self._wake.set()
+        self._thread.join(timeout=5)
+        return not self._thread.is_alive()
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    def _wait(self, seconds: float = 2) -> None:
+        self._wake.wait(seconds)
+        self._wake.clear()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if not self.manager.connections_ready or not self.manager.config.apply:
+                self._wait()
+                continue
+            with self.manager._move_lock:
+                job = self.manager.store.claim_next_operation()
+                if job:
+                    if job["kind"] == "move":
+                        self._move_processor._process(job)
+                    else:
+                        self._reconcile_processor._process(job)
+            if not job:
+                self._wait()
+
+
 class MoveQueueWorker:
     """Run confirmed Move transactions serially without replaying interrupted work."""
 

@@ -9,7 +9,7 @@ from importlib.resources import files
 from urllib.parse import parse_qs, urlparse
 
 from .engine import Stowarr
-from .queue import MoveQueueWorker, ReconcileQueueWorker
+from .queue import OperationQueueWorker
 from . import __version__
 
 
@@ -277,8 +277,12 @@ def handler(manager: Stowarr):
                     if not isinstance(raw_sources, list) or not all(isinstance(item, str) for item in raw_sources):
                         raise ValueError("auxiliaryFiles must be a list of paths")
                     torrent_hash = path.rsplit("/", 1)[-1]
-                    manager.consume_confirmation(body.get("confirmationToken", ""), "reconcile", torrent_hash, {"auxiliaryFiles": raw_sources})
-                    self.send_json(200, manager.reconcile(torrent_hash, set(raw_sources)))
+                    result = manager.submit_reconcile(
+                        body.get("confirmationToken", ""),
+                        torrent_hash,
+                        {"auxiliaryFiles": raw_sources},
+                    )
+                    self.send_json(202 if result.get("disposition") == "queued" else 200, result)
                 except Exception as error:
                     self.log_operation_error("reconcile", error)
                     self.send_json(409, {"error": str(error)})
@@ -293,8 +297,10 @@ def handler(manager: Stowarr):
                         raise ValueError("additionalFiles must be an object of source paths and actions")
                     torrent_hash = path.rsplit("/", 1)[-1]
                     payload = {"targetPool": target_pool, "additionalFiles": additional_files}
-                    manager.consume_confirmation(body.get("confirmationToken", ""), "move", torrent_hash, payload)
-                    self.send_json(200, manager.move(torrent_hash, target_pool, additional_files))
+                    result = manager.submit_move(
+                        body.get("confirmationToken", ""), torrent_hash, payload
+                    )
+                    self.send_json(202 if result.get("disposition") == "queued" else 200, result)
                 except Exception as error:
                     self.log_operation_error("move", error)
                     self.send_json(409, {"error": str(error)})
@@ -421,10 +427,8 @@ def print_startup_credentials(manager: Stowarr) -> None:
 
 def serve(manager: Stowarr) -> None:
     server = ThreadingHTTPServer((manager.config.listen, manager.config.port), handler(manager))
-    queue_worker = MoveQueueWorker(manager)
-    reconcile_queue_worker = ReconcileQueueWorker(manager)
+    queue_worker = OperationQueueWorker(manager)
     queue_worker.start()
-    reconcile_queue_worker.start()
     print_startup_credentials(manager)
     print(f"stowarr listening on {manager.config.listen}:{manager.config.port}; apply={manager.config.apply}", flush=True)
     try:
@@ -432,9 +436,7 @@ def serve(manager: Stowarr) -> None:
     finally:
         if not queue_worker.stop():
             print(
-                "stowarr queue worker is still finishing an active Move during shutdown",
+                "stowarr queue worker is still finishing an active operation during shutdown",
                 flush=True,
             )
-        if not reconcile_queue_worker.stop():
-            print("stowarr reconcile queue worker is still finishing during shutdown", flush=True)
         server.server_close()
