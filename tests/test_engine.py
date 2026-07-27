@@ -15,7 +15,6 @@ from stowarr.engine import (
     MovePlan,
     Plan,
     Stowarr,
-    clear_digest_cache,
     is_archive,
     release_folder_warning,
     sha256,
@@ -435,26 +434,22 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(source.stat().st_nlink, 2)
             self.assertEqual(sha256(source), sha256(library))
 
-    def test_sha256_reuses_unchanged_file_identity(self):
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "movie.mkv"
-            source.write_bytes(b"verified media")
-            clear_digest_cache()
-
-            with patch("stowarr.engine.hashlib.sha256", wraps=hashlib.sha256) as factory:
-                first = sha256(source)
-                second = sha256(source)
-
-            self.assertEqual(first, second)
-            self.assertEqual(factory.call_count, 1)
-
-    def test_sha256_invalidates_cache_after_same_size_change(self):
+    def test_sha256_never_trusts_metadata_identity_as_content_proof(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "movie.mkv"
             source.write_bytes(b"release-a")
-            clear_digest_cache()
+            unchanged_identity = (
+                source.stat().st_dev,
+                source.stat().st_ino,
+                source.stat().st_size,
+                1,
+                1,
+            )
 
-            with patch("stowarr.engine.hashlib.sha256", wraps=hashlib.sha256) as factory:
+            with (
+                patch("stowarr.engine._file_identity", return_value=unchanged_identity),
+                patch("stowarr.engine.hashlib.sha256", wraps=hashlib.sha256) as factory,
+            ):
                 first = sha256(source)
                 source.write_bytes(b"release-b")
                 second = sha256(source)
@@ -466,8 +461,15 @@ class EngineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "movie.mkv"
             source.write_bytes(b"abcdefgh")
-            clear_digest_cache()
             changed = False
+            original = (
+                source.stat().st_dev,
+                source.stat().st_ino,
+                source.stat().st_size,
+                1,
+                1,
+            )
+            changed_identity = (*original[:3], 2, 2)
 
             def mutate_after_first_chunk(completed, total):
                 nonlocal changed
@@ -475,7 +477,10 @@ class EngineTest(unittest.TestCase):
                     changed = True
                     source.write_bytes(b"ijklmnop")
 
-            with self.assertRaisesRegex(RuntimeError, "changed while"):
+            with (
+                patch("stowarr.engine._file_identity", side_effect=[original, changed_identity]),
+                self.assertRaisesRegex(RuntimeError, "changed while"),
+            ):
                 sha256(source, chunk_size=4, progress=mutate_after_first_chunk)
 
     def test_release_identity_accepts_exact_hardlink(self):
@@ -559,7 +564,7 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(is_archive(Path("movie.7z")))
         self.assertFalse(is_archive(Path("movie.mkv")))
 
-    def test_archive_integrity_proof_is_reused_only_while_volumes_are_unchanged(self):
+    def test_archive_integrity_is_never_skipped_from_metadata_alone(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory) / "release.rar"
             archive.write_bytes(b"archive-a")
@@ -567,29 +572,15 @@ class EngineTest(unittest.TestCase):
             extractor.members.return_value = [ArchiveMember("movie.mkv", 100)]
             manager = Stowarr.__new__(Stowarr)
             manager.archive_extractor = extractor
+            manager._archive_paths = lambda torrent_hash: [archive]
 
-            first = manager._verified_archive_entries([archive])
-            second = manager._verified_archive_entries([archive])
+            first = manager._verify_archive_sets("hash")
             archive.write_bytes(b"archive-b")
-            third = manager._verified_archive_entries([archive])
+            second = manager._verify_archive_sets("hash")
 
             self.assertEqual(first, second)
-            self.assertEqual(first, third)
             self.assertEqual(extractor.test.call_count, 2)
             self.assertEqual(extractor.members.call_count, 2)
-
-    def test_archive_integrity_rejects_volume_changed_during_test(self):
-        with tempfile.TemporaryDirectory() as directory:
-            archive = Path(directory) / "release.rar"
-            archive.write_bytes(b"archive-a")
-            extractor = Mock()
-            extractor.test.side_effect = lambda entry: archive.write_bytes(b"archive-b")
-            extractor.members.return_value = [ArchiveMember("movie.mkv", 100)]
-            manager = Stowarr.__new__(Stowarr)
-            manager.archive_extractor = extractor
-
-            with self.assertRaisesRegex(RuntimeError, "changed while"):
-                manager._verified_archive_entries([archive])
 
     def test_subtitle_inventory_distinguishes_subfolders_and_archives(self):
         torrent = {"save_path": "/downloads", "content_path": "/downloads/Release"}
