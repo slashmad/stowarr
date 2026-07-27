@@ -11,6 +11,7 @@ from pathlib import Path
 
 class Store:
     JOB_ID_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    TERMINAL_OPERATION_STATES = ("COMPLETE", "FAILED", "BLOCKED", "DRY_RUN")
 
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -354,6 +355,14 @@ class Store:
             rows = self.db.execute("SELECT * FROM operations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [{**dict(row), "detail": json.loads(row["detail"])} for row in rows]
 
+    def operation_by_public_id(self, public_id: str) -> dict | None:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM operations WHERE public_id=?",
+                (public_id.upper(),),
+            ).fetchone()
+        return {**dict(row), "detail": json.loads(row["detail"])} if row else None
+
     def operation_events(self, operation_id: int) -> list[dict]:
         with self.lock:
             rows = self.db.execute(
@@ -385,7 +394,7 @@ class Store:
 
     def delete_operations(self, operation_ids: list[int] | None = None) -> int:
         with self.lock:
-            terminal = ("COMPLETE", "FAILED", "BLOCKED", "DRY_RUN")
+            terminal = self.TERMINAL_OPERATION_STATES
             if operation_ids is None:
                 rows = self.db.execute(
                     "SELECT id FROM operations WHERE state IN (?,?,?,?)", terminal
@@ -428,7 +437,7 @@ class Store:
             return int(cursor.rowcount)
 
     def active(self, torrent_hash: str, kind: str | None = None) -> list[dict]:
-        terminal = ("COMPLETE", "FAILED", "BLOCKED", "DRY_RUN")
+        terminal = self.TERMINAL_OPERATION_STATES
         query = "SELECT * FROM operations WHERE torrent_hash=? AND state NOT IN (?,?,?,?)"
         values: list = [torrent_hash, *terminal]
         if kind:
@@ -520,6 +529,8 @@ class Store:
 
     def claim_next_move(self) -> dict | None:
         with self.lock:
+            if self._has_recovery_required_unlocked():
+                return None
             row = self.db.execute(
                 "SELECT * FROM move_queue WHERE state='QUEUED' ORDER BY id LIMIT 1"
             ).fetchone()
@@ -620,6 +631,8 @@ class Store:
 
     def claim_next_reconcile(self) -> dict | None:
         with self.lock:
+            if self._has_recovery_required_unlocked():
+                return None
             row = self.db.execute(
                 "SELECT * FROM reconcile_queue WHERE state='QUEUED' ORDER BY id LIMIT 1"
             ).fetchone()
@@ -651,6 +664,8 @@ class Store:
     def claim_next_operation(self) -> dict | None:
         """Claim the oldest waiting Move or Reconcile from the shared execution queue."""
         with self.lock:
+            if self._has_recovery_required_unlocked():
+                return None
             row = self.db.execute(
                 """SELECT kind,id,queue_order FROM (
                 SELECT 'move' AS kind,id,queue_order FROM move_queue WHERE state='QUEUED'
@@ -705,28 +720,233 @@ class Store:
             return cursor.rowcount == 1
 
     def interrupt_running_reconciles(self) -> int:
-        now = int(time.time())
-        with self.lock:
-            cursor = self.db.execute(
-                """UPDATE reconcile_queue SET state='INTERRUPTED',
-                error='Stowarr restarted while this Reconcile was running. Inspect the library before retrying.',
-                updated_at=?,finished_at=? WHERE state='RUNNING'""",
-                (now, now),
-            )
-            self.db.commit()
-            return cursor.rowcount
+        return self.recover_interrupted_operations(kinds={"reconcile"})["queue_count"]
 
     def interrupt_running_moves(self) -> int:
+        return self.recover_interrupted_operations(kinds={"move"})["queue_count"]
+
+    def recover_interrupted_operations(
+        self, kinds: set[str] | None = None
+    ) -> dict:
+        """Atomically stop interrupted work and make manual recovery explicit.
+
+        A process loss can happen between any two external side effects. Queue
+        rows and History operations therefore have to transition together, and
+        no later work may run until every uncertain operation is acknowledged.
+        """
+        now = int(time.time())
+        selected_kinds = kinds or {"move", "reconcile"}
+        unknown = selected_kinds - {"move", "reconcile"}
+        if unknown:
+            raise ValueError(f"Unknown operation kinds: {', '.join(sorted(unknown))}")
+        interrupted: list[dict] = []
+        with self.lock:
+            for kind in sorted(selected_kinds):
+                table = "move_queue" if kind == "move" else "reconcile_queue"
+                # The table is selected from the allowlist above.
+                rows = self.db.execute(
+                    f"SELECT * FROM {table} WHERE state='RUNNING' ORDER BY id"  # nosec
+                ).fetchall()
+                reason = (
+                    f"Stowarr restarted while this {kind.capitalize()} was running. "
+                    "The next queued operation is paused until recovery is reviewed."
+                )
+                for row in rows:
+                    operation_id = row["operation_id"]
+                    recovery = {
+                        "required": True,
+                        "reason": reason,
+                        "detected_at": now,
+                        "queue_kind": kind,
+                        "queue_id": int(row["id"]),
+                        "public_id": row["public_id"],
+                    }
+                    if operation_id:
+                        operation = self.db.execute(
+                            "SELECT * FROM operations WHERE id=?", (operation_id,)
+                        ).fetchone()
+                    else:
+                        operation = None
+                    if (
+                        operation is not None
+                        and operation["state"] in self.TERMINAL_OPERATION_STATES
+                    ):
+                        queue_state = (
+                            "COMPLETE"
+                            if operation["state"] == "COMPLETE"
+                            else "FAILED"
+                        )
+                        terminal_message = (
+                            "Recovered queue bookkeeping from the linked terminal "
+                            f"History state {operation['state']}."
+                        )
+                        self.db.execute(
+                            f"""UPDATE {table} SET state=?,operation_id=?,error=?,
+                            updated_at=?,finished_at=? WHERE id=?"""  # nosec
+                            ,
+                            (
+                                queue_state,
+                                operation_id,
+                                terminal_message,
+                                now,
+                                now,
+                                row["id"],
+                            ),
+                        )
+                        continue
+                    if operation is None:
+                        queue_detail = json.loads(row["detail"])
+                        detail = {
+                            **queue_detail,
+                            "torrent_hash": row["torrent_hash"],
+                            "recovery": recovery,
+                            "failed_after": "QUEUE_RUNNING_BEFORE_OPERATION_REGISTRATION",
+                        }
+                        cursor = self.db.execute(
+                            """INSERT INTO operations(
+                            torrent_hash,app,kind,state,detail,created_at,updated_at,public_id
+                            ) VALUES(?,?,?,'RECOVERY_REQUIRED',?,?,?,?)""",
+                            (
+                                row["torrent_hash"],
+                                str(queue_detail.get("app") or ""),
+                                kind,
+                                json.dumps(detail),
+                                row["started_at"] or row["created_at"],
+                                now,
+                                row["public_id"],
+                            ),
+                        )
+                        if cursor.lastrowid is None:
+                            raise RuntimeError("Interrupted operation was not recorded")
+                        operation_id = int(cursor.lastrowid)
+                        self._record_event(
+                            operation_id, "RECOVERY_REQUIRED", detail, now
+                        )
+                    interrupted.append(
+                        {
+                            "kind": kind,
+                            "queue_id": int(row["id"]),
+                            "operation_id": int(operation_id),
+                            "public_id": row["public_id"],
+                        }
+                    )
+                    self.db.execute(
+                        f"""UPDATE {table} SET state='INTERRUPTED',operation_id=?,
+                        error=?,updated_at=?,finished_at=? WHERE id=?"""  # nosec
+                        ,
+                        (operation_id, reason, now, now, row["id"]),
+                    )
+
+            placeholders = ",".join("?" for _ in self.TERMINAL_OPERATION_STATES)
+            active = self.db.execute(
+                f"""SELECT * FROM operations
+                WHERE state NOT IN ({placeholders},'RECOVERY_REQUIRED')"""  # nosec
+                ,
+                self.TERMINAL_OPERATION_STATES,
+            ).fetchall()
+            for row in active:
+                if row["kind"] not in selected_kinds:
+                    continue
+                detail = json.loads(row["detail"])
+                previous_state = row["state"]
+                recovery = {
+                    **(detail.get("recovery") or {}),
+                    "required": True,
+                    "reason": (
+                        "Stowarr restarted before this operation reached a terminal state. "
+                        "External state must be inspected before more writes are allowed."
+                    ),
+                    "detected_at": now,
+                    "previous_state": previous_state,
+                    "public_id": row["public_id"],
+                }
+                detail = {
+                    **detail,
+                    "recovery": recovery,
+                    "failed_after": detail.get("failed_after") or previous_state,
+                }
+                self.db.execute(
+                    """UPDATE operations SET state='RECOVERY_REQUIRED',detail=?,updated_at=?
+                    WHERE id=?""",
+                    (json.dumps(detail), now, row["id"]),
+                )
+                self._record_event(
+                    int(row["id"]), "RECOVERY_REQUIRED", detail, now
+                )
+                if not any(
+                    item["operation_id"] == int(row["id"]) for item in interrupted
+                ):
+                    interrupted.append(
+                        {
+                            "kind": row["kind"],
+                            "queue_id": None,
+                            "operation_id": int(row["id"]),
+                            "public_id": row["public_id"],
+                        }
+                    )
+            self.db.commit()
+        return {
+            "queue_count": sum(
+                1 for item in interrupted if item["queue_id"] is not None
+            ),
+            "operation_count": len(interrupted),
+            "operations": interrupted,
+        }
+
+    def recovery_required(self) -> list[dict]:
+        with self.lock:
+            rows = self.db.execute(
+                """SELECT * FROM operations WHERE state='RECOVERY_REQUIRED'
+                ORDER BY updated_at,id"""
+            ).fetchall()
+        return [{**dict(row), "detail": json.loads(row["detail"])} for row in rows]
+
+    def has_recovery_required(self) -> bool:
+        with self.lock:
+            return self._has_recovery_required_unlocked()
+
+    def _has_recovery_required_unlocked(self) -> bool:
+        row = self.db.execute(
+            "SELECT 1 FROM operations WHERE state='RECOVERY_REQUIRED' LIMIT 1"
+        ).fetchone()
+        return row is not None
+
+    def resolve_recovery(self, public_id: str, note: str) -> dict:
+        """Acknowledge a manually inspected operation without replaying it."""
+        note = note.strip()
+        if len(note) < 3:
+            raise ValueError("A recovery inspection note is required")
         now = int(time.time())
         with self.lock:
-            cursor = self.db.execute(
-                """UPDATE move_queue SET state='INTERRUPTED',
-                error='Stowarr restarted while this Move was running. Inspect qBittorrent and recover manually; it was not replayed.',
-                updated_at=?,finished_at=? WHERE state='RUNNING'""",
-                (now, now),
+            row = self.db.execute(
+                """SELECT * FROM operations
+                WHERE public_id=? AND state='RECOVERY_REQUIRED'""",
+                (public_id.upper(),),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Recovery operation {public_id} was not found")
+            detail = json.loads(row["detail"])
+            detail["recovery"] = {
+                **(detail.get("recovery") or {}),
+                "required": False,
+                "resolved_at": now,
+                "resolution": "manual_acknowledgement",
+                "note": note,
+            }
+            detail["error"] = (
+                "Interrupted by a Stowarr restart; external state was manually reviewed."
             )
+            self.db.execute(
+                """UPDATE operations SET state='FAILED',detail=?,updated_at=?
+                WHERE id=? AND state='RECOVERY_REQUIRED'""",
+                (json.dumps(detail), now, row["id"]),
+            )
+            self._record_event(int(row["id"]), "FAILED", detail, now)
             self.db.commit()
-            return cursor.rowcount
+            resolved = self.db.execute(
+                "SELECT * FROM operations WHERE id=?", (row["id"],)
+            ).fetchone()
+        return {**dict(resolved), "detail": json.loads(resolved["detail"])}
 
     def latest_operation(self, torrent_hash: str, kind: str = "move") -> dict | None:
         with self.lock:

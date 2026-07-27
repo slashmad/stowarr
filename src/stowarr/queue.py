@@ -17,12 +17,12 @@ class OperationQueueWorker:
         self._reconcile_processor = ReconcileQueueWorker(manager)
 
     def start(self) -> None:
-        interrupted_moves = self.manager.store.interrupt_running_moves()
-        interrupted_reconciles = self.manager.store.interrupt_running_reconciles()
-        interrupted = interrupted_moves + interrupted_reconciles
-        if interrupted:
+        recovery = self.manager.store.recover_interrupted_operations()
+        if recovery["operation_count"]:
             print(
-                f"stowarr queue interrupted={interrupted}; manual recovery required before retry",
+                "stowarr recovery_required="
+                f"{recovery['operation_count']} queue_interrupted={recovery['queue_count']}; "
+                "all writes are paused until recovery is reviewed",
                 flush=True,
             )
         self.manager.queue_worker = self
@@ -44,7 +44,11 @@ class OperationQueueWorker:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            if not self.manager.connections_ready or not self.manager.config.apply:
+            if (
+                not self.manager.connections_ready
+                or not self.manager.config.apply
+                or self.manager.store.has_recovery_required()
+            ):
                 self._wait()
                 continue
             with self.manager._move_lock:
@@ -92,7 +96,11 @@ class MoveQueueWorker:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            if not self.manager.connections_ready or not self.manager.config.apply:
+            if (
+                not self.manager.connections_ready
+                or not self.manager.config.apply
+                or self.manager.store.has_recovery_required()
+            ):
                 self._wait()
                 continue
             job = self.manager.store.claim_next_move()
@@ -170,7 +178,11 @@ class ReconcileQueueWorker:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            if not self.manager.connections_ready or not self.manager.config.apply:
+            if (
+                not self.manager.connections_ready
+                or not self.manager.config.apply
+                or self.manager.store.has_recovery_required()
+            ):
                 self._wake.wait(2)
                 self._wake.clear()
                 continue

@@ -295,3 +295,143 @@ class StoreTest(unittest.TestCase):
             self.assertEqual([item["public_id"] for item in remaining], [running["public_id"]])
             self.assertNotEqual(remaining[0]["public_id"], queued["public_id"])
             self.assertEqual(store.recent()[0]["id"], operation_id)
+
+    def test_restart_marks_queue_and_history_and_pauses_later_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            running = store.enqueue_move(
+                "moving", "p3", {}, "moving-fingerprint",
+                {"torrent_name": "Moving title", "app": "radarr"},
+            )
+            waiting = store.enqueue_reconcile(
+                "waiting", {"auxiliaryFiles": []}, "waiting-fingerprint",
+                {"torrent_name": "Waiting title", "app": "radarr"},
+            )
+            claimed = store.claim_next_operation()
+            operation_id = store.record(
+                "moving",
+                "radarr",
+                "MOVE_RELOCATING",
+                {
+                    "torrent_name": "Moving title",
+                    "current_save_path": "/source",
+                    "target_save_path": "/target",
+                },
+                kind="move",
+                public_id=running["public_id"],
+            )
+            store.update(
+                operation_id,
+                "MOVE_RECHECKING",
+                {
+                    "torrent_name": "Moving title",
+                    "current_save_path": "/source",
+                    "target_save_path": "/target",
+                },
+            )
+
+            recovered = store.recover_interrupted_operations()
+
+            self.assertEqual(claimed["public_id"], running["public_id"])
+            self.assertEqual(recovered["queue_count"], 1)
+            self.assertEqual(recovered["operation_count"], 1)
+            interrupted = next(
+                item for item in store.move_queue()
+                if item["public_id"] == running["public_id"]
+            )
+            self.assertEqual(interrupted["state"], "INTERRUPTED")
+            operation = store.operation_by_public_id(running["public_id"])
+            self.assertEqual(operation["state"], "RECOVERY_REQUIRED")
+            self.assertEqual(
+                operation["detail"]["recovery"]["previous_state"],
+                "MOVE_RECHECKING",
+            )
+            self.assertTrue(store.has_recovery_required())
+            self.assertIsNone(store.claim_next_operation())
+            queued = next(
+                item for item in store.reconcile_queue()
+                if item["public_id"] == waiting["public_id"]
+            )
+            self.assertEqual(queued["state"], "QUEUED")
+
+            resolved = store.resolve_recovery(
+                running["public_id"],
+                "qBittorrent recheck and Radarr target inspected",
+            )
+            self.assertEqual(resolved["state"], "FAILED")
+            self.assertFalse(store.has_recovery_required())
+            self.assertEqual(
+                store.claim_next_operation()["public_id"],
+                waiting["public_id"],
+            )
+
+    def test_restart_records_recovery_when_queue_job_has_no_history_yet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            queued = store.enqueue_reconcile(
+                "repair", {"auxiliaryFiles": []}, "fingerprint",
+                {"torrent_name": "Repair title", "app": "sonarr"},
+            )
+            store.claim_next_operation()
+
+            recovered = store.recover_interrupted_operations()
+
+            self.assertEqual(recovered["operation_count"], 1)
+            operation = store.operation_by_public_id(queued["public_id"])
+            self.assertEqual(operation["state"], "RECOVERY_REQUIRED")
+            self.assertEqual(operation["kind"], "reconcile")
+            self.assertEqual(
+                operation["detail"]["failed_after"],
+                "QUEUE_RUNNING_BEFORE_OPERATION_REGISTRATION",
+            )
+
+    def test_restart_repairs_queue_bookkeeping_for_terminal_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            queued = store.enqueue_move(
+                "finished", "p3", {}, "fingerprint",
+                {"torrent_name": "Finished title", "app": "radarr"},
+            )
+            store.claim_next_operation()
+            store.record(
+                "finished",
+                "radarr",
+                "COMPLETE",
+                {"torrent_name": "Finished title"},
+                kind="move",
+                public_id=queued["public_id"],
+            )
+
+            recovered = store.recover_interrupted_operations()
+
+            self.assertEqual(recovered["operation_count"], 0)
+            self.assertFalse(store.has_recovery_required())
+            queue_item = next(
+                item for item in store.move_queue()
+                if item["public_id"] == queued["public_id"]
+            )
+            self.assertEqual(queue_item["state"], "COMPLETE")
+
+    def test_restart_marks_direct_nonterminal_operation_for_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            operation_id = store.record(
+                "direct",
+                "sonarr",
+                "ARR_RESCANNING",
+                {"torrent_name": "Direct title"},
+                kind="reconcile",
+            )
+
+            recovered = store.recover_interrupted_operations()
+
+            self.assertEqual(recovered["queue_count"], 0)
+            self.assertEqual(recovered["operation_count"], 1)
+            operation = next(
+                item for item in store.recovery_required()
+                if item["id"] == operation_id
+            )
+            self.assertEqual(
+                operation["detail"]["recovery"]["previous_state"],
+                "ARR_RESCANNING",
+            )

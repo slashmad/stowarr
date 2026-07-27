@@ -471,6 +471,7 @@ class Stowarr:
             })
         return {
             "apply": self.config.apply,
+            "recovery_required": self._recovery_is_required(),
             "deployment": {
                 "config_path": os.getenv("STOWARR_CONFIG", "/config/config.json"),
                 "listen": self.config.listen,
@@ -501,6 +502,299 @@ class Stowarr:
         self.config = replace(self.config, apply=apply)
         return self.runtime_settings()
 
+    def _recovery_is_required(self) -> bool:
+        check = getattr(self.store, "has_recovery_required", None)
+        return bool(check()) if callable(check) else False
+
+    def _require_recovery_clear(self) -> None:
+        if self._recovery_is_required():
+            raise RuntimeError(
+                "A previous operation was interrupted. Review Recovery in Queue "
+                "before starting or queuing more write operations."
+            )
+
+    @staticmethod
+    def _recovery_path_fact(value: str | None) -> dict | None:
+        if not value:
+            return None
+        path = Path(value)
+        try:
+            stat = path.stat()
+            return {
+                "path": str(path),
+                "exists": True,
+                "kind": "directory" if path.is_dir() else "file",
+                "size": stat.st_size,
+            }
+        except FileNotFoundError:
+            return {"path": str(path), "exists": False}
+        except OSError as error:
+            return {"path": str(path), "exists": None, "error": str(error)}
+
+    def recovery_status(self) -> dict:
+        operations = self.store.recovery_required()
+        return {
+            "required": bool(operations),
+            "queue_paused": bool(operations),
+            "count": len(operations),
+            "operations": operations,
+        }
+
+    def diagnose_recovery(self, public_id: str) -> dict:
+        """Inspect external state without changing qBit, *Arr, or the filesystem."""
+        operation = self.store.operation_by_public_id(public_id)
+        if not operation or operation["state"] != "RECOVERY_REQUIRED":
+            raise KeyError(f"Recovery operation {public_id} was not found")
+        detail = operation["detail"]
+        torrent_hash = operation["torrent_hash"]
+        facts: dict = {
+            "checked_at": int(time.time()),
+            "read_only": True,
+            "operation_state": (detail.get("recovery") or {}).get("previous_state")
+            or detail.get("failed_after"),
+        }
+
+        torrent = None
+        torrent_files: list[dict] = []
+        if self.qbit is None:
+            facts["qbittorrent"] = {
+                "available": False,
+                "error": "qBittorrent is not configured",
+            }
+        else:
+            try:
+                torrent = self.qbit.torrent(torrent_hash)
+                if torrent:
+                    torrent_files = self.qbit.files(torrent_hash)
+                    save_path = Path(str(torrent.get("save_path") or ""))
+                    disk_files = []
+                    for record in torrent_files:
+                        path = save_path / str(record.get("name") or "")
+                        expected_size = int(record.get("size") or 0)
+                        try:
+                            safe_root = save_path.resolve(strict=False)
+                            safe_path = path.resolve(strict=False)
+                            safe = safe_path.is_relative_to(safe_root)
+                        except OSError:
+                            safe_path = path
+                            safe = False
+                        if not safe:
+                            actual_size = None
+                            exists = False
+                        else:
+                            try:
+                                actual_size = safe_path.stat().st_size
+                                exists = True
+                            except OSError:
+                                actual_size = None
+                                exists = False
+                        disk_files.append(
+                            {
+                                "path": str(safe_path),
+                                "safe_path": safe,
+                                "exists": exists,
+                                "expected_size": expected_size,
+                                "actual_size": actual_size,
+                                "size_matches": (
+                                    actual_size == expected_size
+                                    if actual_size is not None
+                                    else False
+                                ),
+                                "progress": record.get("progress"),
+                            }
+                        )
+                    facts["qbittorrent"] = {
+                        "available": True,
+                        "found": True,
+                        "name": torrent.get("name"),
+                        "save_path": str(save_path),
+                        "category": torrent.get("category"),
+                        "state": torrent.get("state"),
+                        "progress": torrent.get("progress"),
+                        "files": {
+                            "count": len(disk_files),
+                            "visible": sum(
+                                item["exists"] for item in disk_files
+                            ),
+                            "size_matches": sum(
+                                item["size_matches"] for item in disk_files
+                            ),
+                            "all_visible_and_sized": bool(disk_files)
+                            and all(
+                                item["safe_path"]
+                                and item["exists"]
+                                and item["size_matches"]
+                                for item in disk_files
+                            ),
+                        },
+                    }
+                else:
+                    facts["qbittorrent"] = {
+                        "available": True,
+                        "found": False,
+                    }
+            except Exception as error:
+                facts["qbittorrent"] = {
+                    "available": False,
+                    "error": str(error),
+                }
+
+        path_values = dict.fromkeys(
+            str(value)
+            for value in (
+                detail.get("current_save_path"),
+                detail.get("target_save_path"),
+                detail.get("current_item_path"),
+                detail.get("target_item_path"),
+                *(
+                    pair.get(key)
+                    for pair in detail.get("pairs", [])
+                    for key in ("source_library", "target_library", "torrent_file")
+                ),
+            )
+            if value
+        )
+        facts["filesystem"] = {
+            "paths": [
+                fact
+                for value in path_values
+                if (fact := self._recovery_path_fact(value)) is not None
+            ]
+        }
+
+        app = operation.get("app")
+        client = self.arr.get(app)
+        if client is None:
+            facts["arr"] = {
+                "available": False,
+                "app": app,
+                "error": f"{str(app).capitalize()} is not configured",
+            }
+        else:
+            try:
+                mapping = client.download_mapping(torrent_hash)
+                if not mapping:
+                    managed_paths = [
+                        str(record.get("path") or "")
+                        for record in detail.get("managed_files", [])
+                        if record.get("path")
+                    ]
+                    if managed_paths:
+                        mapping = client.library_mapping(managed_paths)
+                item = (mapping or {}).get("item") or {}
+                files = (mapping or {}).get("files") or []
+                facts["arr"] = {
+                    "available": True,
+                    "app": app,
+                    "mapping_found": bool(mapping),
+                    "item_id": item.get("id"),
+                    "item_path": item.get("path"),
+                    "files": {
+                        "count": len(files),
+                        "visible": sum(
+                            Path(str(record.get("path") or "")).exists()
+                            for record in files
+                        ),
+                    },
+                }
+            except Exception as error:
+                facts["arr"] = {
+                    "available": False,
+                    "app": app,
+                    "error": str(error),
+                }
+
+        qbit = facts["qbittorrent"]
+        arr = facts["arr"]
+        target_save = str(detail.get("target_save_path") or "")
+        current_save = str(detail.get("current_save_path") or "")
+        actual_save = str(qbit.get("save_path") or "")
+        target_item = str(detail.get("target_item_path") or "")
+        current_item = str(detail.get("current_item_path") or "")
+        arr_path = str(arr.get("item_path") or "")
+        fs_paths = {
+            record["path"]: record for record in facts["filesystem"]["paths"]
+        }
+        target_exists = bool(
+            target_item and fs_paths.get(target_item, {}).get("exists")
+        )
+        current_exists = bool(
+            current_item and fs_paths.get(current_item, {}).get("exists")
+        )
+
+        if not qbit.get("found"):
+            recommendation = {
+                "code": "MANUAL_QBIT_MISSING",
+                "safe_action": "manual",
+                "summary": (
+                    "qBittorrent does not expose the torrent. Do not replay or "
+                    "delete files automatically."
+                ),
+            }
+        elif not qbit.get("files", {}).get("all_visible_and_sized"):
+            recommendation = {
+                "code": "MANUAL_QBIT_DATA_INCOMPLETE",
+                "safe_action": "manual",
+                "summary": (
+                    "qBittorrent-owned files are missing or changed in size. "
+                    "Repair qBittorrent data and force a recheck first."
+                ),
+            }
+        elif operation["kind"] == "move" and target_save and actual_save == target_save:
+            recommendation = {
+                "code": "CONTINUE_FORWARD_CANDIDATE",
+                "safe_action": "inspect_then_fresh_plan",
+                "summary": (
+                    "qBittorrent reached the target pool. Recheck it, verify the "
+                    "*Arr target and then create a fresh reconciliation plan; do "
+                    "not move it backward blindly."
+                ),
+            }
+        elif (
+            operation["kind"] == "move"
+            and current_save
+            and actual_save == current_save
+            and not target_exists
+            and (not arr_path or arr_path == current_item)
+        ):
+            recommendation = {
+                "code": "FRESH_MOVE_PLAN_CANDIDATE",
+                "safe_action": "inspect_then_fresh_plan",
+                "summary": (
+                    "qBittorrent and the library appear to remain at the source. "
+                    "After a qBittorrent recheck, acknowledge this interruption and "
+                    "create a fresh Move plan."
+                ),
+            }
+        elif (
+            operation["kind"] == "reconcile"
+            and current_exists
+            and not target_exists
+        ):
+            recommendation = {
+                "code": "FRESH_RECONCILE_PLAN_CANDIDATE",
+                "safe_action": "inspect_then_fresh_plan",
+                "summary": (
+                    "The original library source remains and the target is absent. "
+                    "After rechecking qBittorrent, create a fresh Reconcile plan."
+                ),
+            }
+        else:
+            recommendation = {
+                "code": "MANUAL_MIXED_STATE",
+                "safe_action": "manual",
+                "summary": (
+                    "External systems show a mixed state. Keep the queue paused "
+                    "until qBittorrent, *Arr paths and filesystem contents have "
+                    "been reconciled manually."
+                ),
+            }
+        diagnosis = {**facts, "recommendation": recommendation}
+        return {
+            "operation": operation,
+            "diagnosis": diagnosis,
+        }
+
     @staticmethod
     def _operation_fingerprint(kind: str, plan: dict, payload: dict) -> str:
         # Free space is advisory and may change between issuing and consuming a
@@ -521,6 +815,8 @@ class Stowarr:
 
     def issue_confirmation(self, kind: str, torrent_hash: str, payload: dict) -> dict:
         write_enabled = self.config.apply
+        if write_enabled:
+            self._require_recovery_clear()
         if kind == "reconcile":
             sources = payload.get("auxiliaryFiles", [])
             if not isinstance(sources, list) or not all(isinstance(item, str) for item in sources):
@@ -569,6 +865,8 @@ class Stowarr:
         self, token: str, kind: str, torrent_hash: str, payload: dict,
         write_enabled: bool,
     ) -> dict:
+        if write_enabled:
+            self._require_recovery_clear()
         if not token:
             raise PermissionError("A confirmation token is required")
         if kind == "reconcile":
@@ -591,6 +889,7 @@ class Stowarr:
         submission_apply = self.config.apply
         if not submission_apply:
             raise RuntimeError("Move queue is unavailable in dry-run mode")
+        self._require_recovery_clear()
         authorized = self.consume_confirmation(
             token, "move", torrent_hash, payload, submission_apply
         )
@@ -618,6 +917,7 @@ class Stowarr:
         submission_apply = self.config.apply
         if not submission_apply:
             raise RuntimeError("Reconcile queue is unavailable in dry-run mode")
+        self._require_recovery_clear()
         authorized = self.consume_confirmation(
             token, "reconcile", torrent_hash, payload, submission_apply
         )
@@ -642,6 +942,8 @@ class Stowarr:
     def submit_move(self, token: str, torrent_hash: str, payload: dict) -> dict:
         """Record dry runs directly; serialize or queue confirmed write operations."""
         submission_apply = self.config.apply
+        if submission_apply:
+            self._require_recovery_clear()
         authorized = self.consume_confirmation(
             token, "move", torrent_hash, payload, submission_apply
         )
@@ -691,6 +993,8 @@ class Stowarr:
     def submit_reconcile(self, token: str, torrent_hash: str, payload: dict) -> dict:
         """Record dry runs directly; serialize or queue confirmed write operations."""
         submission_apply = self.config.apply
+        if submission_apply:
+            self._require_recovery_clear()
         authorized = self.consume_confirmation(
             token, "reconcile", torrent_hash, payload, submission_apply
         )

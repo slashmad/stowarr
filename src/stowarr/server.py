@@ -101,6 +101,7 @@ def handler(manager: Stowarr):
                 self.send_json(200, {
                     "status": "ok" if manager.connections_ready else "setup-required",
                     "apply": manager.config.apply,
+                    "recovery_required": manager.store.has_recovery_required(),
                     "version": __version__,
                 })
             elif path == "/api/auth/status":
@@ -155,6 +156,8 @@ def handler(manager: Stowarr):
                 self.send_json(200, manager.store.move_queue())
             elif path == "/api/reconcile-queue":
                 self.send_json(200, manager.store.reconcile_queue())
+            elif path == "/api/recovery":
+                self.send_json(200, manager.recovery_status())
             elif path.startswith("/api/operations/") and path.endswith("/events"):
                 try:
                     operation_id = int(path.split("/")[3])
@@ -258,6 +261,46 @@ def handler(manager: Stowarr):
                         raise ValueError("Only a waiting queued Reconcile can be cancelled")
                     self.send_json(200, {"public_id": public_id, "state": "CANCELLED"})
                 except (ValueError, IndexError) as error:
+                    self.send_json(409, {"error": str(error)})
+            elif path.startswith("/api/recovery/") and path.endswith("/diagnose"):
+                try:
+                    public_id = path.split("/")[3].upper()
+                    self.send_json(200, manager.diagnose_recovery(public_id))
+                except KeyError as error:
+                    self.send_json(404, {"error": str(error)})
+                except Exception as error:
+                    self.send_json(409, {"error": str(error)})
+            elif path.startswith("/api/recovery/") and path.endswith("/resolve"):
+                try:
+                    public_id = path.split("/")[3].upper()
+                    body = self.read_json()
+                    if body.get("confirm") is not True:
+                        raise ValueError(
+                            "confirm must be true after external state has been reviewed"
+                        )
+                    note = str(body.get("note") or "").strip()
+                    if len(note) < 3:
+                        raise ValueError(
+                            "Describe what was inspected or repaired before resuming the queue"
+                        )
+                    operation = manager.store.resolve_recovery(public_id, note)
+                    manager.store.security_event(
+                        "recovery-resolved",
+                        client=self.client_identity(),
+                        detail={"public_id": public_id, "note": note},
+                    )
+                    if manager.queue_worker:
+                        manager.queue_worker.wake()
+                    self.send_json(
+                        200,
+                        {
+                            "operation": operation,
+                            "recovery": manager.recovery_status(),
+                        },
+                    )
+                except KeyError as error:
+                    self.send_json(404, {"error": str(error)})
+                except ValueError as error:
                     self.send_json(409, {"error": str(error)})
             elif not manager.connections_ready:
                 self.send_json(503, {"error": "Configure qBittorrent, Radarr, and Sonarr in Settings first"})

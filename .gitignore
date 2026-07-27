@@ -26,6 +26,7 @@ build/
 
 # JavaScript development artifacts
 node_modules/
+.tools/
 
 # Editors and operating systems
 .idea/

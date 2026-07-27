@@ -23,6 +23,95 @@ from stowarr.engine import (
 
 
 class EngineTest(unittest.TestCase):
+    def test_write_submission_is_rejected_while_recovery_is_required(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=True)
+        manager.store = SimpleNamespace(has_recovery_required=lambda: True)
+        manager.consume_confirmation = Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "Recovery"):
+            manager.submit_move(
+                "token",
+                "hash",
+                {"targetPool": "p3", "additionalFiles": {}},
+            )
+        manager.consume_confirmation.assert_not_called()
+
+    def test_recovery_diagnosis_is_read_only_and_recommends_forward_inspection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target"
+            target.mkdir()
+            media = target / "movie.mkv"
+            media.write_bytes(b"verified-size")
+            operation = {
+                "id": 4,
+                "public_id": "R4COV",
+                "torrent_hash": "abc",
+                "app": "radarr",
+                "kind": "move",
+                "state": "RECOVERY_REQUIRED",
+                "detail": {
+                    "torrent_name": "Example",
+                    "current_save_path": str(Path(directory) / "source"),
+                    "target_save_path": str(target),
+                    "current_item_path": str(Path(directory) / "old-library"),
+                    "target_item_path": str(Path(directory) / "new-library"),
+                    "managed_files": [{"path": str(media), "size": media.stat().st_size}],
+                    "recovery": {"previous_state": "MOVE_RECHECKING"},
+                },
+            }
+            manager = Stowarr.__new__(Stowarr)
+            manager.store = SimpleNamespace(
+                operation_by_public_id=lambda public_id: operation
+                if public_id == "R4COV"
+                else None
+            )
+            manager.qbit = SimpleNamespace(
+                torrent=lambda torrent_hash: {
+                    "hash": torrent_hash,
+                    "name": "Example",
+                    "save_path": str(target),
+                    "category": "radarr-pool3",
+                    "state": "pausedUP",
+                    "progress": 1,
+                },
+                files=lambda torrent_hash: [
+                    {
+                        "name": media.name,
+                        "size": media.stat().st_size,
+                        "progress": 1,
+                    }
+                ],
+                pause=Mock(side_effect=AssertionError("diagnosis must not mutate qBit")),
+            )
+            manager.arr = {
+                "radarr": SimpleNamespace(
+                    download_mapping=lambda torrent_hash: {
+                        "item": {"id": 7, "path": operation["detail"]["target_item_path"]},
+                        "files": [{"path": str(media), "size": media.stat().st_size}],
+                    },
+                    library_mapping=Mock(
+                        side_effect=AssertionError(
+                            "exact download mapping should be sufficient"
+                        )
+                    ),
+                )
+            }
+
+            result = manager.diagnose_recovery("R4COV")
+
+            self.assertTrue(result["diagnosis"]["read_only"])
+            self.assertTrue(
+                result["diagnosis"]["qbittorrent"]["files"][
+                    "all_visible_and_sized"
+                ]
+            )
+            self.assertEqual(
+                result["diagnosis"]["recommendation"]["code"],
+                "CONTINUE_FORWARD_CANDIDATE",
+            )
+            manager.qbit.pause.assert_not_called()
+
     def test_manual_move_and_reconcile_queue_when_shared_queue_has_work(self):
         manager = Stowarr.__new__(Stowarr)
         manager.config = SimpleNamespace(apply=True)
@@ -250,7 +339,7 @@ class EngineTest(unittest.TestCase):
 
         result = manager.service_status()
 
-        self.assertEqual(result["version"], "1.0.0-beta.3")
+        self.assertEqual(result["version"], "1.0.0-beta.4")
         self.assertTrue(result["apply"])
         self.assertEqual(result["services"]["qbittorrent"]["version"], "5.2.1")
         self.assertEqual(result["services"]["radarr"]["status"], "connected")
