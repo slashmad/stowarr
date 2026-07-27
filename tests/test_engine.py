@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,46 @@ from stowarr.engine import (
 
 
 class EngineTest(unittest.TestCase):
+    def test_manual_move_and_reconcile_queue_when_shared_queue_has_work(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=True)
+        manager._move_lock = threading.RLock()
+        manager.store = SimpleNamespace(has_active_queue_work=lambda: True)
+        manager.consume_confirmation = lambda token, kind, torrent_hash, payload: {
+            "plan": {"torrent_name": "Example"},
+            "payload": payload,
+            "fingerprint": f"{kind}-fingerprint",
+        }
+        manager._enqueue_authorized_move = lambda torrent_hash, authorized: {
+            "public_id": "M2JOB", "state": "QUEUED",
+        }
+        manager._enqueue_authorized_reconcile = lambda torrent_hash, authorized: {
+            "public_id": "R2JOB", "state": "QUEUED",
+        }
+        manager._run_move = lambda *args, **kwargs: self.fail(
+            "Move must not run while shared queue work exists"
+        )
+        manager.reconcile = lambda *args, **kwargs: self.fail(
+            "Reconcile must not run while shared queue work exists"
+        )
+
+        move = manager.submit_move(
+            "move-token", "move-hash",
+            {"targetPool": "p1", "additionalFiles": {}},
+        )
+        reconcile = manager.submit_reconcile(
+            "reconcile-token", "reconcile-hash", {"auxiliaryFiles": []},
+        )
+
+        self.assertEqual(
+            (move["kind"], move["disposition"], move["public_id"]),
+            ("move", "queued", "M2JOB"),
+        )
+        self.assertEqual(
+            (reconcile["kind"], reconcile["disposition"], reconcile["public_id"]),
+            ("reconcile", "queued", "R2JOB"),
+        )
+
     def test_service_status_reports_live_versions_without_credentials(self):
         manager = Stowarr.__new__(Stowarr)
         manager.config = SimpleNamespace(apply=True)
@@ -561,6 +602,128 @@ class EngineTest(unittest.TestCase):
                 Stowarr._copy_verified(source, target, expected)
 
             self.assertFalse(target.exists())
+
+    def test_reconcile_plan_blocks_missing_history_and_reports_packed_media_and_category(self):
+        pool = Pool(
+            "p3", Path("/p3"), (Path("/p3/download"),),
+            Path("/p3/movies"), Path("/p3/series"),
+            "radarr-pool3", "sonarr-pool3", "radarr-pool3", "sonarr-pool3",
+        )
+        manager = Stowarr.__new__(Stowarr)
+        manager.qbit = SimpleNamespace(
+            torrents=lambda: [{
+                "hash": "click", "name": "Click.2006.2160p.UHD.BluRay",
+                "category": "radarr", "save_path": "/p3/download/Click",
+            }],
+            files=lambda torrent_hash: [{
+                "name": "Click.2006.2160p.UHD.BluRay/click.rar",
+                "size": 100, "priority": 1,
+            }],
+        )
+        manager.config = SimpleNamespace(
+            pools=(pool,),
+            pool_for_path=lambda path: pool,
+            pool_for_category=lambda category: None,
+        )
+        manager.arr = {"radarr": SimpleNamespace(
+            download_mapping=lambda torrent_hash: None,
+            all_items=lambda: [{"id": 7, "title": "Click", "path": "/p1/movies/Click (2006)"}],
+        )}
+
+        plan = manager.plan("click")
+
+        self.assertEqual(plan.status, "blocked")
+        self.assertEqual(plan.error_code, "ARR_DOWNLOAD_HISTORY_MISSING")
+        self.assertEqual(
+            [issue["code"] for issue in plan.error_details["issues"]],
+            [
+                "QBITTORRENT_CATEGORY_UNROUTED",
+                "ARR_DOWNLOAD_HISTORY_MISSING",
+                "PACKED_MEDIA_REQUIRES_IMPORT",
+            ],
+        )
+        self.assertTrue(plan.error_details["contains_archives"])
+        self.assertEqual(plan.error_details["candidates"][0]["title"], "Click")
+
+    def test_reconcile_plan_blocks_multiple_torrents_for_one_arr_item(self):
+        pool = Pool(
+            "p3", Path("/p3"), (Path("/p3/download"),),
+            Path("/p3/movies"), Path("/p3/series"),
+            "radarr-pool3", "sonarr-pool3", "radarr-pool3", "sonarr-pool3",
+        )
+        torrents = [
+            {
+                "hash": "beast-a", "name": "Beast.2026.2160p.GUACAMOLE",
+                "category": "radarr-pool3", "save_path": "/p3/download/Beast-A",
+            },
+            {
+                "hash": "beast-b", "name": "Beast.2026.2160p.FraMeSToR",
+                "category": "radarr-pool3", "save_path": "/p3/download/Beast-B",
+            },
+        ]
+        item = {"id": 42, "title": "Beast", "path": "/p1/movies/Beast (2026)"}
+        manager = Stowarr.__new__(Stowarr)
+        manager.qbit = SimpleNamespace(torrents=lambda: torrents, files=lambda torrent_hash: [])
+        manager.config = SimpleNamespace(
+            pools=(pool,),
+            pool_for_path=lambda path: pool,
+            pool_for_category=lambda category: (pool, "radarr"),
+        )
+        manager.arr = {"radarr": SimpleNamespace(
+            download_mapping=lambda torrent_hash: {"item": item, "files": []},
+            history_for_downloads=lambda hashes: {"beast-a": 42, "beast-b": 42},
+        )}
+
+        plan = manager.plan("beast-a")
+
+        self.assertEqual(plan.status, "blocked")
+        self.assertEqual(plan.error_code, "ARR_ITEM_HAS_MULTIPLE_TORRENTS")
+        self.assertEqual(len(plan.error_details["related_torrents"]), 2)
+        self.assertIn("seeding", plan.error_details["action"])
+
+    def test_sync_audit_reports_duplicate_and_unrouted_history_torrents(self):
+        p1 = Pool(
+            "p1", Path("/p1"), (Path("/p1/download"),),
+            Path("/p1/movies"), Path("/p1/series"),
+            "radarr-pool1", "sonarr-pool1", "radarr-pool1", "sonarr-pool1",
+        )
+        p3 = Pool(
+            "p3", Path("/p3"), (Path("/p3/download"),),
+            Path("/p3/movies"), Path("/p3/series"),
+            "radarr-pool3", "sonarr-pool3", "radarr-pool3", "sonarr-pool3",
+        )
+        torrents = [
+            {"hash": "A", "name": "Beast.A", "category": "radarr-pool3", "save_path": "/p3/download/A"},
+            {"hash": "B", "name": "Beast.B", "category": "radarr-pool3", "save_path": "/p3/download/B"},
+            {"hash": "C", "name": "How.To.Make.A.Killing", "category": "", "save_path": "/p3/download/C"},
+        ]
+        items = [
+            {"id": 42, "title": "Beast", "path": "/p1/movies/Beast (2026)"},
+            {"id": 43, "title": "How to Make a Killing", "path": "/p1/movies/How to Make a Killing (2026)"},
+        ]
+        manager = Stowarr.__new__(Stowarr)
+        manager.qbit = SimpleNamespace(torrents=lambda: torrents)
+        manager.config = SimpleNamespace(
+            pools=(p1, p3),
+            pool_for_path=lambda path: p3 if str(path).startswith("/p3") else p1,
+            pool_for_category=lambda category: (
+                (p3, "radarr") if category == "radarr-pool3" else None
+            ),
+        )
+        manager.arr = {"radarr": SimpleNamespace(
+            history_for_downloads=lambda hashes: {"a": 42, "b": 42, "c": 43},
+            all_items=lambda: items,
+        )}
+
+        audit = manager.sync_audit("radarr")
+        by_hash = {row["hash"]: row for row in audit["rows"]}
+
+        self.assertEqual(audit["scanned"], 3)
+        self.assertEqual(by_hash["A"]["status"], "multiple-torrents")
+        self.assertEqual(by_hash["B"]["status"], "multiple-torrents")
+        self.assertEqual(len(by_hash["A"]["related_torrents"]), 2)
+        self.assertEqual(by_hash["C"]["status"], "category-unconfigured")
+        self.assertEqual(by_hash["C"]["expected_category"], "radarr-pool3")
 
     def test_qbittorrent_search_does_not_consult_arr(self):
         manager = Stowarr.__new__(Stowarr)

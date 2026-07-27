@@ -65,7 +65,7 @@ class Store:
             payload TEXT NOT NULL, fingerprint TEXT NOT NULL, detail TEXT NOT NULL,
             state TEXT NOT NULL, operation_id INTEGER, error TEXT,
             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-            started_at INTEGER, finished_at INTEGER)"""
+            started_at INTEGER, finished_at INTEGER, queue_order INTEGER)"""
         )
         self.db.execute(
             """CREATE TABLE IF NOT EXISTS reconcile_queue (
@@ -74,12 +74,20 @@ class Store:
             fingerprint TEXT NOT NULL, detail TEXT NOT NULL,
             state TEXT NOT NULL, operation_id INTEGER, error TEXT,
             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-            started_at INTEGER, finished_at INTEGER)"""
+            started_at INTEGER, finished_at INTEGER, queue_order INTEGER)"""
         )
         queue_columns = {row[1] for row in self.db.execute("PRAGMA table_info(move_queue)")}
         if "public_id" not in queue_columns:
             self.db.execute("ALTER TABLE move_queue ADD COLUMN public_id TEXT")
+        if "queue_order" not in queue_columns:
+            self.db.execute("ALTER TABLE move_queue ADD COLUMN queue_order INTEGER")
+        reconcile_columns = {
+            row[1] for row in self.db.execute("PRAGMA table_info(reconcile_queue)")
+        }
+        if "queue_order" not in reconcile_columns:
+            self.db.execute("ALTER TABLE reconcile_queue ADD COLUMN queue_order INTEGER")
         self._backfill_public_ids()
+        self._backfill_queue_order()
         self.db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS operations_public_id ON operations(public_id)"
         )
@@ -129,6 +137,36 @@ class Store:
                 "UPDATE move_queue SET public_id=? WHERE id=?",
                 (row["operation_public_id"] or self._new_public_id(), row["id"]),
             )
+
+    def _backfill_queue_order(self) -> None:
+        current = self.db.execute(
+            """SELECT MAX(queue_order) AS value FROM (
+            SELECT queue_order FROM move_queue
+            UNION ALL SELECT queue_order FROM reconcile_queue
+            )"""
+        ).fetchone()["value"] or 0
+        rows = self.db.execute(
+            """SELECT 'move' AS kind,id,created_at FROM move_queue WHERE queue_order IS NULL
+            UNION ALL
+            SELECT 'reconcile' AS kind,id,created_at FROM reconcile_queue WHERE queue_order IS NULL
+            ORDER BY created_at,kind,id"""
+        ).fetchall()
+        for row in rows:
+            current += 1
+            table = "move_queue" if row["kind"] == "move" else "reconcile_queue"
+            self.db.execute(
+                f"UPDATE {table} SET queue_order=? WHERE id=?",
+                (current, row["id"]),
+            )
+
+    def _next_queue_order(self) -> int:
+        row = self.db.execute(
+            """SELECT MAX(queue_order) AS value FROM (
+            SELECT queue_order FROM move_queue
+            UNION ALL SELECT queue_order FROM reconcile_queue
+            )"""
+        ).fetchone()
+        return int(row["value"] or 0) + 1
 
     @staticmethod
     def _event_detail(detail: dict) -> dict:
@@ -396,6 +434,19 @@ class Store:
         result["detail"] = json.loads(result["detail"])
         return result
 
+    def _queue_positions(self) -> dict[tuple[str, int], int]:
+        rows = self.db.execute(
+            """SELECT kind,id FROM (
+            SELECT 'move' AS kind,id,queue_order FROM move_queue WHERE state='QUEUED'
+            UNION ALL
+            SELECT 'reconcile' AS kind,id,queue_order FROM reconcile_queue WHERE state='QUEUED'
+            ) ORDER BY queue_order"""
+        ).fetchall()
+        return {
+            (str(row["kind"]), int(row["id"])): index
+            for index, row in enumerate(rows, start=1)
+        }
+
     def enqueue_move(
         self, torrent_hash: str, target_pool: str, payload: dict, fingerprint: str, detail: dict
     ) -> dict:
@@ -403,13 +454,15 @@ class Store:
         try:
             with self.lock:
                 public_id = self._new_public_id()
+                queue_order = self._next_queue_order()
                 cursor = self.db.execute(
                     """INSERT INTO move_queue(
-                    torrent_hash,target_pool,payload,fingerprint,detail,state,created_at,updated_at,public_id
-                    ) VALUES(?,?,?,?,?,'QUEUED',?,?,?)""",
+                    torrent_hash,target_pool,payload,fingerprint,detail,state,
+                    created_at,updated_at,public_id,queue_order
+                    ) VALUES(?,?,?,?,?,'QUEUED',?,?,?,?)""",
                     (
                         torrent_hash.casefold(), target_pool, json.dumps(payload, sort_keys=True),
-                        fingerprint, json.dumps(detail), now, now, public_id,
+                        fingerprint, json.dumps(detail), now, now, public_id, queue_order,
                     ),
                 )
                 self.db.commit()
@@ -422,6 +475,7 @@ class Store:
 
     def move_queue(self, limit: int = 200) -> list[dict]:
         with self.lock:
+            positions = self._queue_positions()
             rows = self.db.execute(
                 """SELECT * FROM move_queue
                 ORDER BY CASE state WHEN 'RUNNING' THEN 0 WHEN 'QUEUED' THEN 1 ELSE 2 END,
@@ -431,7 +485,10 @@ class Store:
                 "LIMIT ?",
                 (max(1, min(limit, 1000)),),
             ).fetchall()
-        return [self._queue_row(row) for row in rows]
+        return [
+            {**self._queue_row(row), "position": positions.get(("move", int(row["id"])))}
+            for row in rows
+        ]
 
     def _clear_queue(self, table: str) -> int:
         if table not in {"move_queue", "reconcile_queue"}:
@@ -508,13 +565,15 @@ class Store:
         try:
             with self.lock:
                 public_id = self._new_public_id()
+                queue_order = self._next_queue_order()
                 cursor = self.db.execute(
                     """INSERT INTO reconcile_queue(
-                    public_id,torrent_hash,payload,fingerprint,detail,state,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,'QUEUED',?,?)""",
+                    public_id,torrent_hash,payload,fingerprint,detail,state,
+                    created_at,updated_at,queue_order
+                    ) VALUES(?,?,?,?,?,'QUEUED',?,?,?)""",
                     (
                         public_id, torrent_hash.casefold(), json.dumps(payload, sort_keys=True),
-                        fingerprint, json.dumps(detail), now, now,
+                        fingerprint, json.dumps(detail), now, now, queue_order,
                     ),
                 )
                 self.db.commit()
@@ -529,6 +588,7 @@ class Store:
 
     def reconcile_queue(self, limit: int = 200) -> list[dict]:
         with self.lock:
+            positions = self._queue_positions()
             rows = self.db.execute(
                 """SELECT * FROM reconcile_queue
                 ORDER BY CASE state WHEN 'RUNNING' THEN 0 WHEN 'QUEUED' THEN 1 ELSE 2 END,
@@ -536,7 +596,13 @@ class Store:
                 CASE WHEN state NOT IN ('RUNNING','QUEUED') THEN id END DESC LIMIT ?""",
                 (max(1, min(limit, 1000)),),
             ).fetchall()
-        return [self._queue_row(row) for row in rows]
+        return [
+            {
+                **self._queue_row(row),
+                "position": positions.get(("reconcile", int(row["id"]))),
+            }
+            for row in rows
+        ]
 
     def claim_next_reconcile(self) -> dict | None:
         with self.lock:
@@ -557,6 +623,43 @@ class Store:
             return self._queue_row(
                 self.db.execute("SELECT * FROM reconcile_queue WHERE id=?", (row["id"],)).fetchone()
             )
+
+    def has_active_queue_work(self) -> bool:
+        with self.lock:
+            row = self.db.execute(
+                """SELECT 1 FROM move_queue WHERE state IN ('QUEUED','RUNNING')
+                UNION ALL
+                SELECT 1 FROM reconcile_queue WHERE state IN ('QUEUED','RUNNING')
+                LIMIT 1"""
+            ).fetchone()
+        return row is not None
+
+    def claim_next_operation(self) -> dict | None:
+        """Claim the oldest waiting Move or Reconcile from the shared execution queue."""
+        with self.lock:
+            row = self.db.execute(
+                """SELECT kind,id,queue_order FROM (
+                SELECT 'move' AS kind,id,queue_order FROM move_queue WHERE state='QUEUED'
+                UNION ALL
+                SELECT 'reconcile' AS kind,id,queue_order FROM reconcile_queue WHERE state='QUEUED'
+                ) ORDER BY queue_order LIMIT 1"""
+            ).fetchone()
+            if not row:
+                return None
+            table = "move_queue" if row["kind"] == "move" else "reconcile_queue"
+            now = int(time.time())
+            cursor = self.db.execute(
+                f"""UPDATE {table} SET state='RUNNING',started_at=?,updated_at=?
+                WHERE id=? AND state='QUEUED'""",
+                (now, now, row["id"]),
+            )
+            self.db.commit()
+            if cursor.rowcount != 1:
+                return None
+            claimed = self.db.execute(
+                f"SELECT * FROM {table} WHERE id=?", (row["id"],)
+            ).fetchone()
+            return {**self._queue_row(claimed), "kind": row["kind"]}
 
     def finish_reconcile(
         self, queue_id: int, state: str, operation_id: int | None = None, error: str = ""

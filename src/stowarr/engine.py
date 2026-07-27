@@ -227,7 +227,7 @@ class Stowarr:
         self.arr = {}
         self.connection_error = None
         self.archive_extractor = ArchiveExtractor()
-        self._move_lock = threading.Lock()
+        self._move_lock = threading.RLock()
         self.queue_worker = None
         self.reconcile_queue_worker = None
         try:
@@ -530,6 +530,9 @@ class Stowarr:
         if not self.config.apply:
             raise RuntimeError("Move queue is unavailable in dry-run mode")
         authorized = self.consume_confirmation(token, "move", torrent_hash, payload)
+        return self._enqueue_authorized_move(torrent_hash, authorized)
+
+    def _enqueue_authorized_move(self, torrent_hash: str, authorized: dict) -> dict:
         plan = authorized["plan"]
         queued = self.store.enqueue_move(
             torrent_hash,
@@ -551,6 +554,9 @@ class Stowarr:
         if not self.config.apply:
             raise RuntimeError("Reconcile queue is unavailable in dry-run mode")
         authorized = self.consume_confirmation(token, "reconcile", torrent_hash, payload)
+        return self._enqueue_authorized_reconcile(torrent_hash, authorized)
+
+    def _enqueue_authorized_reconcile(self, torrent_hash: str, authorized: dict) -> dict:
         plan = authorized["plan"]
         queued = self.store.enqueue_reconcile(
             torrent_hash,
@@ -565,6 +571,77 @@ class Stowarr:
         if self.reconcile_queue_worker:
             self.reconcile_queue_worker.wake()
         return queued
+
+    def submit_move(self, token: str, torrent_hash: str, payload: dict) -> dict:
+        """Run immediately only when the shared slot and both queues are empty."""
+        if not self.config.apply:
+            raise RuntimeError("Move is unavailable in dry-run mode")
+        authorized = self.consume_confirmation(token, "move", torrent_hash, payload)
+        if self.store.has_active_queue_work():
+            return {
+                **self._enqueue_authorized_move(torrent_hash, authorized),
+                "kind": "move",
+                "disposition": "queued",
+            }
+        if not self._move_lock.acquire(blocking=False):
+            return {
+                **self._enqueue_authorized_move(torrent_hash, authorized),
+                "kind": "move",
+                "disposition": "queued",
+            }
+        try:
+            if self.store.has_active_queue_work():
+                return {
+                    **self._enqueue_authorized_move(torrent_hash, authorized),
+                    "kind": "move",
+                    "disposition": "queued",
+                }
+            return {
+                **self._run_move(
+                    torrent_hash,
+                    authorized["payload"]["targetPool"],
+                    authorized["payload"]["additionalFiles"],
+                ),
+                "kind": "move",
+                "disposition": "direct",
+            }
+        finally:
+            self._move_lock.release()
+
+    def submit_reconcile(self, token: str, torrent_hash: str, payload: dict) -> dict:
+        """Run immediately only when the shared slot and both queues are empty."""
+        if not self.config.apply:
+            raise RuntimeError("Reconcile is unavailable in dry-run mode")
+        authorized = self.consume_confirmation(token, "reconcile", torrent_hash, payload)
+        if self.store.has_active_queue_work():
+            return {
+                **self._enqueue_authorized_reconcile(torrent_hash, authorized),
+                "kind": "reconcile",
+                "disposition": "queued",
+            }
+        if not self._move_lock.acquire(blocking=False):
+            return {
+                **self._enqueue_authorized_reconcile(torrent_hash, authorized),
+                "kind": "reconcile",
+                "disposition": "queued",
+            }
+        try:
+            if self.store.has_active_queue_work():
+                return {
+                    **self._enqueue_authorized_reconcile(torrent_hash, authorized),
+                    "kind": "reconcile",
+                    "disposition": "queued",
+                }
+            return {
+                **self.reconcile(
+                    torrent_hash,
+                    set(authorized["payload"]["auxiliaryFiles"]),
+                ),
+                "kind": "reconcile",
+                "disposition": "direct",
+            }
+        finally:
+            self._move_lock.release()
 
     @staticmethod
     def _torrent_paths(torrent: dict, files: list[dict]) -> list[tuple[Path, int]]:
@@ -1469,7 +1546,8 @@ class Stowarr:
         app_hint: str | None = None,
     ) -> Plan:
         verified_derived_paths = verified_derived_paths or set()
-        torrent = next((t for t in self.qbit.torrents() if t["hash"].lower() == torrent_hash.lower()), None)
+        torrents = self.qbit.torrents()
+        torrent = next((t for t in torrents if t["hash"].lower() == torrent_hash.lower()), None)
         if not torrent:
             return Plan(torrent_hash, "", "unknown", "", None, None, None, None, [], "blocked", "Torrent not found")
         pool = self.config.pool_for_path(torrent["save_path"])
@@ -1485,10 +1563,154 @@ class Stowarr:
         app = app_hint or (category_match[1] if category_match else library_app or (
             "sonarr" if torrent.get("category", "").startswith("sonarr") else "radarr"
         ))
+        expected_category = pool.radarr_category if app == "radarr" else pool.sonarr_category
+        current_category = str(torrent.get("category") or "")
+        category_issue = None
+        if not mapping_hint and current_category != expected_category:
+            if category_match and category_match[1] != app:
+                category_reason = (
+                    f'qBittorrent category "{current_category}" belongs to '
+                    f'{category_match[1].capitalize()}, not {app.capitalize()}'
+                )
+            elif category_match and category_match[0].name != pool.name:
+                category_reason = (
+                    f'qBittorrent category "{current_category}" routes to '
+                    f'{category_match[0].name}, but its save path is on {pool.name}'
+                )
+            else:
+                category_reason = (
+                    f'qBittorrent category "{current_category or "none"}" is not the '
+                    f'configured {app.capitalize()} route for {pool.name}'
+                )
+            category_issue = {
+                "code": "QBITTORRENT_CATEGORY_UNROUTED",
+                "summary": category_reason,
+                "action": (
+                    f'After confirming the torrent data belongs on {pool.name}, assign '
+                    f'qBittorrent category "{expected_category}" and run the audit again.'
+                ),
+            }
+        torrent_records = self.qbit.files(torrent_hash)
+        has_archives = any(
+            int(record.get("priority", 1)) > 0 and is_archive(Path(record["name"]))
+            for record in torrent_records
+        )
         mapping = self.arr[app].download_mapping(torrent_hash) or mapping_hint
         if not mapping:
-            return Plan(torrent_hash, torrent["name"], app, pool.name, None, None, None, None, [], "blocked", "No matching *Arr history item")
+            all_items = getattr(self.arr[app], "all_items", lambda: [])()
+            candidates = [
+                {
+                    "id": item.get("id"),
+                    "title": item.get("title"),
+                    "path": item.get("path"),
+                }
+                for item in all_items
+                if title_matches(item.get("title", ""), torrent["name"])
+            ]
+            issues = []
+            if category_issue:
+                issues.append(category_issue)
+            issues.append({
+                "code": "ARR_DOWNLOAD_HISTORY_MISSING",
+                "summary": (
+                    f'{app.capitalize()} has no history record that associates this exact '
+                    "qBittorrent hash with a library item"
+                ),
+                "action": (
+                    f'Use {app.capitalize()} Manual Import to associate the intended release, '
+                    "then refresh/rescan the item and rerun the audit."
+                ),
+            })
+            if has_archives:
+                issues.append({
+                    "code": "PACKED_MEDIA_REQUIRES_IMPORT",
+                    "summary": (
+                        "The selected qBittorrent content contains archives, so Stowarr cannot "
+                        "compare an imported media file with a directly tracked torrent file"
+                    ),
+                    "action": (
+                        "Keep the qBittorrent archives intact. Extract/import the intended media "
+                        f"through the normal {app.capitalize()} import workflow on {pool.name}; "
+                        "do not manually delete the archive set."
+                    ),
+                })
+            candidate_note = (
+                f" Stowarr found {len(candidates)} title candidate"
+                f'{"s" if len(candidates) != 1 else ""}, but a title match is not safe proof of download identity.'
+                if candidates else ""
+            )
+            return Plan(
+                torrent_hash, torrent["name"], app, pool.name, None, None, None, None, [],
+                "blocked",
+                f"No matching {app.capitalize()} download history item.{candidate_note}",
+                "ARR_DOWNLOAD_HISTORY_MISSING",
+                {
+                    "issues": issues,
+                    "candidates": candidates,
+                    "torrent_category": current_category,
+                    "expected_category": expected_category,
+                    "save_path": torrent.get("save_path", ""),
+                    "contains_archives": has_archives,
+                    "action": (
+                        f"Resolve every prerequisite below in qBittorrent and {app.capitalize()}, "
+                        "then rerun the audit. Stowarr will not reconcile by title alone."
+                    ),
+                },
+            )
         item = mapping["item"]
+        if category_issue:
+            return Plan(
+                torrent_hash, torrent["name"], app, pool.name, item["id"], item.get("title"),
+                item.get("path"), None, [], "blocked", category_issue["summary"],
+                "QBITTORRENT_CATEGORY_UNROUTED",
+                {
+                    "issues": [category_issue],
+                    "torrent_category": current_category,
+                    "expected_category": expected_category,
+                    "save_path": torrent.get("save_path", ""),
+                    "action": category_issue["action"],
+                },
+            )
+        history_for_downloads = getattr(self.arr[app], "history_for_downloads", None)
+        if not mapping_hint and history_for_downloads:
+            item_by_hash = history_for_downloads({
+                str(candidate.get("hash") or "").casefold() for candidate in torrents
+                if candidate.get("hash")
+            })
+            related = [
+                {
+                    "hash": candidate.get("hash"),
+                    "name": candidate.get("name"),
+                    "category": candidate.get("category", ""),
+                    "save_path": candidate.get("save_path", ""),
+                }
+                for candidate in torrents
+                if item_by_hash.get(str(candidate.get("hash") or "").casefold()) == int(item["id"])
+            ]
+            if len(related) > 1:
+                service = app.capitalize()
+                issue = {
+                    "code": "ARR_ITEM_HAS_MULTIPLE_TORRENTS",
+                    "summary": (
+                        f"{len(related)} qBittorrent torrents are associated with the same "
+                        f'{service} item "{item.get("title", "")}"'
+                    ),
+                    "action": (
+                        "Wait for required seeding to finish, keep the intended release, and "
+                        f"remove or disassociate the unwanted torrent(s). Confirm the retained "
+                        f"torrent category and {service} path, then rerun the audit."
+                    ),
+                }
+                return Plan(
+                    torrent_hash, torrent["name"], app, pool.name, item["id"], item.get("title"),
+                    item.get("path"), None, [], "blocked", issue["summary"],
+                    "ARR_ITEM_HAS_MULTIPLE_TORRENTS",
+                    {
+                        "issues": [issue],
+                        "related_torrents": related,
+                        "action": issue["action"],
+                    },
+                )
         if app == "sonarr" and not mapping.get("mappingComplete"):
             return Plan(
                 torrent_hash, torrent["name"], app, pool.name, item["id"], item.get("title"),
@@ -1503,12 +1725,7 @@ class Stowarr:
                 },
             )
         target_item = self._target_item_path(item, pool, app)
-        torrent_records = self.qbit.files(torrent_hash)
         torrent_files = self._torrent_paths(torrent, torrent_records)
-        has_archives = any(
-            int(record.get("priority", 1)) > 0 and is_archive(Path(record["name"]))
-            for record in torrent_records
-        )
         library_files = self._library_files(mapping)
         if not title_matches(item.get("title", ""), Path(item["path"]).name):
             item_title = item.get("title") or "<unknown>"
@@ -1612,6 +1829,36 @@ class Stowarr:
                 "qBittorrent-owned archives with Stowarr's verified extractor"
             ),
         }
+        blocked_codes = {
+            "ambiguous": "MEDIA_MAPPING_AMBIGUOUS",
+            "missing-torrent-data": "QBITTORRENT_MEDIA_MISSING",
+            "missing-derived-media": "ARCHIVE_DERIVED_MEDIA_MISSING",
+            "unknown-hardlinks": "LIBRARY_FILE_HAS_UNKNOWN_HARDLINKS",
+            "reextract-required": "STANDALONE_ARCHIVE_REEXTRACTION_REQUIRED",
+        }
+        blocked_actions = {
+            "ambiguous": (
+                f"Use {app.capitalize()} Manual Import to select the intended release and make "
+                "its managed media file unambiguous, then refresh/rescan and build the plan again."
+            ),
+            "missing-torrent-data": (
+                "Force recheck the torrent in qBittorrent and restore any missing selected files "
+                "before building the plan again."
+            ),
+            "missing-derived-media": (
+                f"Keep the qBittorrent archive set, restore or manually import its media in "
+                f"{app.capitalize()}, then refresh/rescan and build the plan again."
+            ),
+            "unknown-hardlinks": (
+                "Inspect every hardlink to the old library file and remove only stale references. "
+                "Build the plan again after the file has only the expected ownership."
+            ),
+            "reextract-required": (
+                f"Standalone Reconcile cannot safely extract packed media. Keep the qBittorrent "
+                f"archives intact and complete a verified extraction/import into {app.capitalize()} "
+                f"on {pool.name}, then refresh/rescan and build the plan again."
+            ),
+        }
         source_videos = {path for path, _ in library_files}
         auxiliary_files = self._torrent_sidecars(torrent, torrent_records, target_item)
         torrent_targets = {Path(sidecar.target) for sidecar in auxiliary_files}
@@ -1641,6 +1888,18 @@ class Stowarr:
             torrent_name=torrent["name"], app=app, target_pool=pool.name,
             item_id=item["id"], item_title=item.get("title"), current_item_path=item["path"], target_item_path=str(target_item),
             pairs=pairs, status="blocked" if blocked else "ready", reason=blocked_reasons.get(blocked, ""),
+            error_code=blocked_codes.get(blocked),
+            error_details={
+                "issues": [{
+                    "code": blocked_codes[blocked],
+                    "summary": blocked_reasons[blocked],
+                    "action": blocked_actions[blocked],
+                }],
+                "affected_files": [
+                    asdict(pair) for pair in pairs if pair.status == blocked
+                ],
+                "action": blocked_actions[blocked],
+            } if blocked else None,
             auxiliary_files=auxiliary_files,
             managed_files=mapping.get("files", []),
         )
@@ -1648,53 +1907,152 @@ class Stowarr:
     def sync_audit(self, app: str) -> dict:
         if app not in self.arr:
             raise ValueError(f"Unsupported application: {app}")
+        service = app.capitalize()
         category_names = {
             pool.radarr_category if app == "radarr" else pool.sonarr_category
             for pool in self.config.pools
         }
+        all_torrents = self.qbit.torrents()
+        all_hashes = {
+            str(torrent.get("hash") or "").casefold()
+            for torrent in all_torrents if torrent.get("hash")
+        }
+        history = self.arr[app].history_for_downloads(all_hashes)
         torrents = [
-            torrent for torrent in self.qbit.torrents()
+            torrent for torrent in all_torrents
             if torrent.get("category", "") in category_names
             or app in torrent.get("category", "").casefold()
+            or str(torrent.get("hash") or "").casefold() in history
         ]
-        hashes = {torrent["hash"].casefold() for torrent in torrents}
-        history = self.arr[app].history_for_downloads(hashes)
         items = {int(item["id"]): item for item in self.arr[app].all_items()}
         rows = []
         for torrent in torrents:
             torrent_hash = torrent["hash"].casefold()
             pool = self.config.pool_for_path(torrent.get("save_path", ""))
             category_pool = self.config.pool_for_category(torrent.get("category", ""))
+            category = str(torrent.get("category") or "")
             item_id = history.get(torrent_hash)
             item = items.get(item_id) if item_id else None
             expected_root = None
+            expected_category = None
             if pool:
                 expected_root = pool.radarr_root if app == "radarr" else pool.sonarr_root
+                expected_category = pool.radarr_category if app == "radarr" else pool.sonarr_category
+            issues = []
             if not item_id:
                 status, reason = "missing-history", "Hash was not found in recent *Arr history"
+                issues.append({
+                    "code": "ARR_DOWNLOAD_HISTORY_MISSING",
+                    "summary": f"{service} does not associate this exact qBittorrent hash with an item.",
+                    "action": (
+                        f"Use {service} Manual Import for the intended release, then refresh/rescan "
+                        "the item. Stowarr will not infer identity from the title alone."
+                    ),
+                })
             elif not item:
                 status, reason = "missing-item", "History points to an item that no longer exists"
+                issues.append({
+                    "code": "ARR_HISTORY_ITEM_MISSING",
+                    "summary": f"{service} history points to an item that no longer exists.",
+                    "action": (
+                        f"Remove the stale association or restore the intended item in {service}, "
+                        "then manually import and rescan it."
+                    ),
+                })
             elif not pool:
                 status, reason = "outside-pool", "qBittorrent save path is outside configured pools"
-            elif category_pool and category_pool[0].name != pool.name:
+                issues.append({
+                    "code": "QBITTORRENT_PATH_OUTSIDE_POOLS",
+                    "summary": "The qBittorrent save path is outside every configured Stowarr pool.",
+                    "action": "Move the torrent through qBittorrent to a configured pool before retrying.",
+                })
+            elif not category_pool or category_pool[1] != app:
+                status, reason = "category-unconfigured", (
+                    f'qBittorrent category "{category or "none"}" is not a configured {service} pool route'
+                )
+                issues.append({
+                    "code": "QBITTORRENT_CATEGORY_UNROUTED",
+                    "summary": reason,
+                    "action": (
+                        f'After confirming the data belongs on {pool.name}, assign category '
+                        f'"{expected_category}" in qBittorrent.'
+                    ),
+                })
+            elif category_pool[0].name != pool.name:
                 status, reason = "category-mismatch", "qBittorrent category and save path select different pools"
+                issues.append({
+                    "code": "QBITTORRENT_CATEGORY_PATH_MISMATCH",
+                    "summary": (
+                        f'Category "{category}" routes to {category_pool[0].name}, while the '
+                        f"save path is on {pool.name}."
+                    ),
+                    "action": (
+                        f'Either assign category "{expected_category}" or move the torrent data '
+                        f"to {category_pool[0].name}; make the route match before retrying."
+                    ),
+                })
             elif not Path(item.get("path", "")).is_relative_to(expected_root):
                 status, reason = "root-mismatch", f"*Arr path is not below the {pool.name} root"
+                issues.append({
+                    "code": "ARR_ROOT_MISMATCH",
+                    "summary": (
+                        f'{service} stores "{item.get("title", "")}" at {item.get("path", "")}, '
+                        f"but qBittorrent makes {pool.name} authoritative."
+                    ),
+                    "action": (
+                        "Open the diagnosis. Reconcile is available only if Stowarr can prove one "
+                        "exact torrent-to-library mapping and no competing torrent exists."
+                    ),
+                })
             else:
                 status, reason = "in-sync", "Hash, category, save path and *Arr root agree"
             rows.append({
                 "hash": torrent["hash"],
                 "torrent_name": torrent.get("name", ""),
-                "category": torrent.get("category", ""),
+                "category": category,
                 "save_path": torrent.get("save_path", ""),
                 "qbit_pool": pool.name if pool else None,
                 "item_id": item_id,
                 "item_title": item.get("title") if item else None,
                 "arr_path": item.get("path") if item else None,
                 "expected_root": str(expected_root) if expected_root else None,
+                "expected_category": expected_category,
                 "status": status,
                 "reason": reason,
+                "issues": issues,
+                "action": issues[0]["action"] if issues else None,
             })
+        rows_by_item: dict[int, list[dict]] = {}
+        for row in rows:
+            if row["item_id"] and row["item_title"]:
+                rows_by_item.setdefault(int(row["item_id"]), []).append(row)
+        for related in rows_by_item.values():
+            if len(related) < 2:
+                continue
+            torrent_evidence = [{
+                "hash": row["hash"],
+                "name": row["torrent_name"],
+                "category": row["category"],
+                "save_path": row["save_path"],
+            } for row in related]
+            for row in related:
+                issue = {
+                    "code": "ARR_ITEM_HAS_MULTIPLE_TORRENTS",
+                    "summary": (
+                        f'{len(related)} qBittorrent torrents map to the same {service} item '
+                        f'"{row["item_title"]}".'
+                    ),
+                    "action": (
+                        "Keep seeding if required, but do not Reconcile yet. When allowed, retain "
+                        "the intended release and remove or disassociate the unwanted torrent(s); "
+                        "then verify its category and rerun the audit."
+                    ),
+                }
+                row["status"] = "multiple-torrents"
+                row["reason"] = issue["summary"]
+                row["issues"].insert(0, issue)
+                row["action"] = issue["action"]
+                row["related_torrents"] = torrent_evidence
         rows.sort(key=lambda row: (row["status"] == "in-sync", row["torrent_name"].casefold()))
         return {
             "app": app,
@@ -1949,6 +2307,37 @@ class Stowarr:
         }
 
     def reconcile(
+        self,
+        torrent_hash: str,
+        auxiliary_sources: set[str] | None = None,
+        operation_id: int | None = None,
+        verified_derived_paths: set[str] | None = None,
+        progress_callback=None,
+        mapping_hint: dict | None = None,
+        app_hint: str | None = None,
+        relocated_library_sources: set[str] | None = None,
+        prepared_plan: Plan | None = None,
+        public_id: str | None = None,
+    ) -> dict:
+        execute = lambda: self._run_reconcile(
+            torrent_hash,
+            auxiliary_sources=auxiliary_sources,
+            operation_id=operation_id,
+            verified_derived_paths=verified_derived_paths,
+            progress_callback=progress_callback,
+            mapping_hint=mapping_hint,
+            app_hint=app_hint,
+            relocated_library_sources=relocated_library_sources,
+            prepared_plan=prepared_plan,
+            public_id=public_id,
+        )
+        lock = getattr(self, "_move_lock", None)
+        if lock is None:
+            return execute()
+        with lock:
+            return execute()
+
+    def _run_reconcile(
         self,
         torrent_hash: str,
         auxiliary_sources: set[str] | None = None,
