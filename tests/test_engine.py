@@ -1,3 +1,4 @@
+import hashlib
 import os
 import tempfile
 import threading
@@ -14,6 +15,7 @@ from stowarr.engine import (
     MovePlan,
     Plan,
     Stowarr,
+    clear_digest_cache,
     is_archive,
     release_folder_warning,
     sha256,
@@ -433,6 +435,49 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(source.stat().st_nlink, 2)
             self.assertEqual(sha256(source), sha256(library))
 
+    def test_sha256_reuses_unchanged_file_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "movie.mkv"
+            source.write_bytes(b"verified media")
+            clear_digest_cache()
+
+            with patch("stowarr.engine.hashlib.sha256", wraps=hashlib.sha256) as factory:
+                first = sha256(source)
+                second = sha256(source)
+
+            self.assertEqual(first, second)
+            self.assertEqual(factory.call_count, 1)
+
+    def test_sha256_invalidates_cache_after_same_size_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "movie.mkv"
+            source.write_bytes(b"release-a")
+            clear_digest_cache()
+
+            with patch("stowarr.engine.hashlib.sha256", wraps=hashlib.sha256) as factory:
+                first = sha256(source)
+                source.write_bytes(b"release-b")
+                second = sha256(source)
+
+            self.assertNotEqual(first, second)
+            self.assertEqual(factory.call_count, 2)
+
+    def test_sha256_rejects_file_changed_during_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "movie.mkv"
+            source.write_bytes(b"abcdefgh")
+            clear_digest_cache()
+            changed = False
+
+            def mutate_after_first_chunk(completed, total):
+                nonlocal changed
+                if not changed:
+                    changed = True
+                    source.write_bytes(b"ijklmnop")
+
+            with self.assertRaisesRegex(RuntimeError, "changed while"):
+                sha256(source, chunk_size=4, progress=mutate_after_first_chunk)
+
     def test_release_identity_accepts_exact_hardlink(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -513,6 +558,38 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(is_archive(Path("movie.001")))
         self.assertTrue(is_archive(Path("movie.7z")))
         self.assertFalse(is_archive(Path("movie.mkv")))
+
+    def test_archive_integrity_proof_is_reused_only_while_volumes_are_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "release.rar"
+            archive.write_bytes(b"archive-a")
+            extractor = Mock()
+            extractor.members.return_value = [ArchiveMember("movie.mkv", 100)]
+            manager = Stowarr.__new__(Stowarr)
+            manager.archive_extractor = extractor
+
+            first = manager._verified_archive_entries([archive])
+            second = manager._verified_archive_entries([archive])
+            archive.write_bytes(b"archive-b")
+            third = manager._verified_archive_entries([archive])
+
+            self.assertEqual(first, second)
+            self.assertEqual(first, third)
+            self.assertEqual(extractor.test.call_count, 2)
+            self.assertEqual(extractor.members.call_count, 2)
+
+    def test_archive_integrity_rejects_volume_changed_during_test(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "release.rar"
+            archive.write_bytes(b"archive-a")
+            extractor = Mock()
+            extractor.test.side_effect = lambda entry: archive.write_bytes(b"archive-b")
+            extractor.members.return_value = [ArchiveMember("movie.mkv", 100)]
+            manager = Stowarr.__new__(Stowarr)
+            manager.archive_extractor = extractor
+
+            with self.assertRaisesRegex(RuntimeError, "changed while"):
+                manager._verified_archive_entries([archive])
 
     def test_subtitle_inventory_distinguishes_subfolders_and_archives(self):
         torrent = {"save_path": "/downloads", "content_path": "/downloads/Release"}

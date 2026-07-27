@@ -197,6 +197,20 @@ async function startOperationTracking(findOperation,kind='move',queueContext=nul
     resetOperationLog();
     renderTrackedOperation({kind:job.kind,public_id:job.public_id,torrent_hash:job.torrent_hash,state:'WAITING',detail:job.detail||{}},true);
   };
+  const showQueueTerminal=job=>{
+    const complete=job.state==='COMPLETE';
+    renderTrackedOperation({
+      kind:job.kind,
+      public_id:job.public_id,
+      torrent_hash:job.torrent_hash,
+      state:complete?'COMPLETE':'FAILED',
+      detail:{
+        ...(job.detail||{}),
+        error:complete?'':job.error||`Queued ${job.kind} ended in state ${job.state}`,
+        recovery:complete?'':'Review the Queue error, correct the plan or files, and submit the job again.',
+      },
+    });
+  };
   const advanceQueue=async()=>{
     await refreshQueue(true);
     if(generation!==state.operationTrackingGeneration)return false;
@@ -224,6 +238,14 @@ async function startOperationTracking(findOperation,kind='move',queueContext=nul
         if(terminalOperation(operation))keepTracking=queueContext?await advanceQueue():false;
       }else if(queueContext){
         keepTracking=await advanceQueue();
+        if(!keepTracking&&generation===state.operationTrackingGeneration){
+          const finished=queueRows().find(item=>item.public_id===queueContext.publicId&&item.kind===queueContext.kind);
+          if(finished&&['COMPLETE','FAILED','CANCELLED','INTERRUPTED'].includes(finished.state)){
+            showQueueTerminal(finished);
+          }else{
+            finishOperationTracking();
+          }
+        }
       }
       if(!keepTracking&&generation===state.operationTrackingGeneration){
         clearInterval(state.operationTimer);
