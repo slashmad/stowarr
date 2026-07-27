@@ -1,0 +1,5 @@
+ignored:
+  # Debian slim package versions are tied to the moving base-image snapshot.
+  # The image build and Dependabot cover the base; exact apt versions would
+  # make routine security refreshes fail rather than improve reproducibility.
+  - DL3008

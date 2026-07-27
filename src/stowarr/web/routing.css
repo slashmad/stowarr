@@ -1330,6 +1330,117 @@
   font-size: 11px;
 }
 
+.badge.recovery_required {
+  background: #843e3c;
+  color: #ffd3d1;
+}
+
+.recovery-panel {
+  border-color: #8f4843;
+}
+
+.recovery-intro {
+  background: #3d2927;
+  border-bottom: 1px solid #69403d;
+  color: #f4cfcc;
+  line-height: 1.5;
+  padding: 14px 20px;
+}
+
+.recovery-operation {
+  border-bottom: 1px solid var(--line);
+  padding: 16px 20px;
+}
+
+.recovery-operation:last-child {
+  border-bottom: 0;
+}
+
+.recovery-operation > header {
+  align-items: center;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.recovery-operation > header > div {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.recovery-operation > header strong {
+  overflow-wrap: anywhere;
+}
+
+.recovery-operation > header small {
+  color: var(--muted);
+  flex-basis: 100%;
+  margin-left: 0;
+}
+
+.recovery-diagnosis {
+  background: #1d2023;
+  border-left: 3px solid var(--amber);
+  margin-top: 14px;
+  padding: 13px 15px;
+}
+
+.recovery-diagnosis.candidate {
+  border-left-color: var(--blue);
+}
+
+.recovery-diagnosis dl {
+  display: grid;
+  font-size: 12px;
+  gap: 7px 12px;
+  grid-template-columns: 105px minmax(0, 1fr);
+  margin: 12px 0;
+}
+
+.recovery-diagnosis dt {
+  color: var(--muted);
+}
+
+.recovery-diagnosis dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.recovery-diagnosis p {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0;
+}
+
+.recovery-resolution {
+  align-items: end;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(260px, 1fr) auto;
+  margin-top: 14px;
+}
+
+.recovery-resolution label {
+  display: grid;
+  gap: 6px;
+}
+
+.recovery-resolution label span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.recovery-note {
+  background: #1b1d1f;
+  border: 1px solid #555a60;
+  border-radius: 3px;
+  color: #fff;
+  min-width: 0;
+  padding: 9px 11px;
+}
+
 @media (max-width: 720px) {
   .sync-filters:not(:empty) {
     grid-template-columns: 1fr;
@@ -1339,6 +1450,16 @@
     width: 100%;
     margin-top: 12px;
     flex-wrap: wrap;
+  }
+
+  .recovery-operation > header,
+  .recovery-resolution {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+  }
+
+  .recovery-operation > header {
+    flex-direction: column;
   }
 }
 

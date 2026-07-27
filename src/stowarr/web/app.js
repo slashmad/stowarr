@@ -1,4 +1,4 @@
-const state={authenticated:false,auth:null,config:null,connections:null,serviceStatus:null,runtime:null,operations:[],queue:[],reconcileQueue:[],operationEvents:new Map(),selectedHistory:new Set(),securityEvents:[],sessions:[],plan:null,movePlan:null,moveTorrent:null,qbitCatalog:null,routingAudit:null,hiddenMoveColumns:new Set(),syncApp:'radarr',sync:{},syncExpanded:new Set(),syncHiddenStatuses:{radarr:new Set(),sonarr:new Set()},operationSections:{completed:false,remaining:false},operationTracking:false,operationTrackingGeneration:0,operationHidden:false,currentOperation:null};
+const state={authenticated:false,auth:null,config:null,connections:null,serviceStatus:null,runtime:null,recovery:null,recoveryDiagnoses:new Map(),operations:[],queue:[],reconcileQueue:[],operationEvents:new Map(),selectedHistory:new Set(),securityEvents:[],sessions:[],plan:null,movePlan:null,moveTorrent:null,qbitCatalog:null,routingAudit:null,hiddenMoveColumns:new Set(),syncApp:'radarr',sync:{},syncExpanded:new Set(),syncHiddenStatuses:{radarr:new Set(),sonarr:new Set()},operationSections:{completed:false,remaining:false},operationTracking:false,operationTrackingGeneration:0,operationHidden:false,currentOperation:null};
 const $=(s,r=document)=>r.querySelector(s);const $$=(s,r=document)=>[...r.querySelectorAll(s)];
 const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const fmtTime=v=>v?new Date(v*1000).toLocaleString(): '—';
@@ -18,7 +18,7 @@ const RECONCILE_PROGRESS=[['PLANNED','Plan accepted','The reviewed repair plan h
 const ARCHIVE_PROGRESS_STATES=new Set(['MOVE_ARCHIVE_VERIFYING','MOVE_ARCHIVE_VERIFIED','MOVE_EXTRACTING','MOVE_EXTRACTED']);
 const INDETERMINATE_PROGRESS_STATES=new Set(['MOVE_RELOCATING','MOVE_ARR_RESCANNING','ARR_RESCANNING','MOVE_RESUMING','MOVE_SEEDING']);
 function resetOperationSections(){state.operationSections={completed:false,remaining:false}}
-const terminalOperation=operation=>Boolean(operation&&['COMPLETE','FAILED','BLOCKED','DRY_RUN'].includes(operation.state));
+const terminalOperation=operation=>Boolean(operation&&['COMPLETE','FAILED','BLOCKED','DRY_RUN','RECOVERY_REQUIRED'].includes(operation.state));
 function resetOperationLog(){const panel=$('#operation-log-panel');panel.open=false}
 function renderOperationMinimized(){
   const launcher=$('#operation-minimized');
@@ -27,7 +27,7 @@ function renderOperationMinimized(){
   launcher.classList.toggle('hidden',!visible);
   if(!visible)return;
   const terminal=terminalOperation(operation);
-  const failed=['FAILED','BLOCKED'].includes(operation?.state);
+  const failed=['FAILED','BLOCKED','RECOVERY_REQUIRED'].includes(operation?.state);
   const live=operation?.detail?.progress||{};
   const label=operation?.kind==='reconcile'?'Reconcile':'Move';
   const title=terminal?(failed?`${label} needs attention`:`${label} complete`):`${label} in progress…`;
@@ -82,7 +82,8 @@ function renderOperationLog(operation){
     const detail=event.detail||{};
     const percent=detail.percent!==undefined?`${Math.round(Number(detail.percent))}%`:'';
     const message=detail.error||detail.message||detail.current||'State recorded';
-    return `<li class="${event.failed||detail.error?'failed':''}"><time>${esc(fmtTime(event.created_at))}</time><strong>${esc(String(event.state).replaceAll('_',' '))}</strong>${percent?`<b>${esc(percent)}</b>`:''}<span>${esc(message)}</span>${detail.recovery?`<small>${esc(detail.recovery)}</small>`:''}</li>`
+    const recovery=typeof detail.recovery==='string'?detail.recovery:detail.recovery?.reason||detail.recovery?.note||'';
+    return `<li class="${event.failed||detail.error?'failed':''}"><time>${esc(fmtTime(event.created_at))}</time><strong>${esc(String(event.state).replaceAll('_',' '))}</strong>${percent?`<b>${esc(percent)}</b>`:''}<span>${esc(message)}</span>${recovery?`<small>${esc(recovery)}</small>`:''}</li>`
   }).join(''):'<li class="empty-log"><span>No detailed events were recorded for this operation.</span></li>';
   log.scrollTop=followTail?log.scrollHeight:previousTop;
 }
@@ -122,7 +123,8 @@ function renderOperationDialog(operation,waiting=false,updateTrackedOperation=tr
   if(updateTrackedOperation)state.currentOperation=operation;
   const terminal=terminalOperation(operation);
   const stateName=operation?.state||'WAITING';
-  const progressState=stateName==='FAILED'?(operation?.detail?.failed_after||(operation?.kind==='reconcile'?'PLANNED':'MOVE_PLANNED')):stateName;
+  const recoveryRequired=stateName==='RECOVERY_REQUIRED';
+  const progressState=stateName==='FAILED'||recoveryRequired?(operation?.detail?.recovery?.previous_state||operation?.detail?.failed_after||(operation?.kind==='reconcile'?'PLANNED':'MOVE_PLANNED')):stateName;
   const live=operation?.detail?.progress||{};
   const isReconcile=operation?.kind==='reconcile';
   const hasArchive=Boolean(operation?.detail?.extraction_required)||ARCHIVE_PROGRESS_STATES.has(progressState)||ARCHIVE_PROGRESS_STATES.has(live.state);
@@ -134,7 +136,7 @@ function renderOperationDialog(operation,waiting=false,updateTrackedOperation=tr
   const remainingSteps=currentIndex>=0&&!complete?progressSteps.slice(currentIndex+1):[];
   const currentLive=activeStep&&live.state===activeStep[0];
   const reportedPercent=Number(live.percent||0);
-  const activePercent=Number.isFinite(reportedPercent)&&(stateName==='FAILED'||currentLive)?reportedPercent:0;
+  const activePercent=Number.isFinite(reportedPercent)&&(stateName==='FAILED'||recoveryRequired||currentLive)?reportedPercent:0;
   const overallPercent=complete?100:Math.round(((completedSteps.length+(activePercent/100))/progressSteps.length)*100);
   const stepNumber=complete?progressSteps.length:currentIndex>=0?currentIndex+1:0;
   const byteProgress=live.total_bytes?`${fmtBytes(Number(live.completed_bytes||0))} of ${fmtBytes(Number(live.total_bytes))}`:'';
@@ -144,20 +146,21 @@ function renderOperationDialog(operation,waiting=false,updateTrackedOperation=tr
   const indeterminate=Boolean(activeStep&&stateName!=='FAILED'&&activePercent<100&&(INDETERMINATE_PROGRESS_STATES.has(activeStep[0])||waitingForRecheck));
   const sizeNotice=largeTorrent&&['MOVE_RELOCATING','MOVE_RECHECKING'].includes(activeStep?.[0])?`${fmtBytes(torrentSize)} torrent; relocation and verification may take a while`:'';
   const activeDetail=currentLive?[live.message,sizeNotice,live.current,byteProgress,live.qbit_state].filter(Boolean).join(' · '):sizeNotice;
-  const failureContext=stateName==='FAILED'&&completedSteps.length?`<div class="operation-failure-context"><small>Previous completed: ${completedSteps.slice(-2).map(([,title])=>esc(title)).join(' · ')}</small></div>`:'';
+  const failureContext=(stateName==='FAILED'||recoveryRequired)&&completedSteps.length?`<div class="operation-failure-context"><small>Previous completed: ${completedSteps.slice(-2).map(([,title])=>esc(title)).join(' · ')}</small></div>`:'';
   $('#operation-title').textContent=operation?.kind==='reconcile'?(terminal?'Reconcile details':'Reconcile in progress'):terminal?'Move details':'Move in progress';
   $('#operation-summary').textContent=waiting?(operation?.public_id?`${operation.public_id} · ${operation.detail?.torrent_name||operation.torrent_hash||'Queued job'} · waiting to start`:'Waiting for the API to register the operation'):operation?`${operation.public_id?`${operation.public_id} · `:''}${operation.detail?.torrent_name||operation.torrent_hash} · ${stateName.replaceAll('_',' ')}`:'Operation details unavailable';
-  const activeMarkup=activeStep?`<ol class="operation-active-list">${operationStepMarkup(activeStep,stateName==='FAILED'?'failed':'active',activePercent,activeDetail,indeterminate)}</ol>${failureContext}`:'';
+  const activeMarkup=activeStep?`<ol class="operation-active-list">${operationStepMarkup(activeStep,stateName==='FAILED'||recoveryRequired?'failed':'active',activePercent,activeDetail,indeterminate)}</ol>${failureContext}`:'';
   $('#operation-steps').innerHTML=`<div class="operation-overall"><div class="operation-step-title"><strong>${complete?'All steps complete':stepNumber?`Step ${stepNumber} of ${progressSteps.length}`:'Preparing operation'}</strong><b>${overallPercent}% overall</b></div><div class="operation-progress"><i style="width:${overallPercent}%"></i></div></div>${operationGroupMarkup('completed','Completed',completedSteps,state.operationSections.completed)}${activeMarkup}${operationGroupMarkup('remaining','Remaining',remainingSteps,state.operationSections.remaining)}`;
   $$('.operation-group',$('#operation-steps')).forEach(group=>group.addEventListener('toggle',()=>{state.operationSections[group.dataset.operationSection]=group.open}));
-  const error=operation?.detail?.error;
-  $('#operation-error').textContent=error?`${error}${operation.detail?.recovery?` ${operation.detail.recovery}`:''}`:'';
+  const recoveryReason=typeof operation?.detail?.recovery==='string'?operation.detail.recovery:operation?.detail?.recovery?.reason||'';
+  const error=operation?.detail?.error||(recoveryRequired?'Operation interrupted; all writes are paused until Recovery is reviewed.':'');
+  $('#operation-error').textContent=error?`${error}${recoveryReason?` ${recoveryReason}`:''}`:'';
   $('#operation-error').classList.toggle('hidden',!error);
   const canHide=state.operationTracking&&!terminal;
   $('#operation-close').disabled=!terminal&&!canHide;
   $('#operation-close').setAttribute('aria-label',canHide?'Hide operation details':'Close operation details');
   $('#operation-done').disabled=!terminal&&!canHide;
-  $('#operation-done').textContent=canHide?'Hide':stateName==='FAILED'?'Close failure details':'Close';
+  $('#operation-done').textContent=canHide?'Hide':stateName==='FAILED'?'Close failure details':recoveryRequired?'Close recovery details':'Close';
   renderOperationLog(waiting?null:operation);
   renderOperationMinimized();
 }
@@ -296,7 +299,7 @@ function renderServiceStatus(){const status=state.serviceStatus;if(!status)retur
 function renderConnections(){const services=state.connections?.services;if(!services)return;const form=$('#connections-form');form.elements['qbittorrent-url'].value=services.qbittorrent.url||'';form.elements['qbittorrent-api-key'].placeholder=services.qbittorrent.api_key_set?'Saved API key · preferred authentication':'API key recommended for qBittorrent 5.2+';form.elements['qbittorrent-username'].value=services.qbittorrent.username||'';form.elements['qbittorrent-password'].placeholder=services.qbittorrent.password_set?'Saved password · login fallback':'Password for login fallback';form.elements['radarr-url'].value=services.radarr.url||'';form.elements['radarr-api-key'].placeholder=services.radarr.api_key_set?'Saved API key · leave blank to keep':'API key required when Radarr is configured';form.elements['sonarr-url'].value=services.sonarr.url||'';form.elements['sonarr-api-key'].placeholder=services.sonarr.api_key_set?'Saved API key · leave blank to keep':'API key required when Sonarr is configured';const configured=state.connections.configured||{};const count=Object.values(configured).filter(Boolean).length;const complete=state.connections.status==='ready';$('#connections-status').textContent=complete?'All connected':count?`${count} of 3 connected`:'Not configured';$('#connections-status').className=`badge ${complete?'complete':count?'partial':'blocked'}`;$('#connection-error').textContent=state.connections.error||'';$('#connection-error').classList.toggle('hidden',!state.connections.error);$('#setup-error').textContent=state.connections.error||'';$('#setup-error').classList.toggle('hidden',!state.connections.error);const states={qbit:Boolean(configured.qbittorrent),radarr:Boolean(configured.radarr),sonarr:Boolean(configured.sonarr)};Object.entries(states).forEach(([name,connected])=>{const node=$(`#${name}-connection-state`);node.textContent=connected?'Connected':'Optional';node.className=`badge ${connected?'complete':'partial'}`;const dot=$(`#${name}-summary-dot`);dot.className=`dot ${connected?'ok':'warn'}`});const methods={qbit:services.qbittorrent.api_key_set?'API key':services.qbittorrent.password_set?'Username/password fallback':'No credentials',radarr:services.radarr.api_key_set?'API key':'No API key',sonarr:services.sonarr.api_key_set?'API key':'No API key'};Object.entries(states).forEach(([name,connected])=>{$(`#${name}-auth-summary`).textContent=connected?`Connected · ${methods[name]}`:`Not configured · ${methods[name]}`})}
 function renderRuntime(){if(!state.runtime)return;$('#runtime-apply').checked=state.runtime.apply;$('#runtime-status').textContent=state.runtime.apply?'Write mode':'Dry run';$('#runtime-status').className=`badge ${state.runtime.apply?'complete':'dry_run'}`;const deployment=state.runtime.deployment;$('#deployment-settings').innerHTML=`<div class="deployment-note"><strong>Docker deployment settings</strong><span>These values define the container boundary and require a Compose recreate to change safely.</span></div>${deployment.running_as_root?'<div class="alert inline-alert">The API process is running as root. Configure PUID and PGID or a non-root container user before enabling writes.</div>':''}<dl><dt>Configured identity</dt><dd>${esc(deployment.configured_puid)}:${esc(deployment.configured_pgid)}</dd><dt>Effective identity</dt><dd>${esc(deployment.process_uid)}:${esc(deployment.process_gid)}</dd><dt>File creation umask</dt><dd>${esc(deployment.umask)}</dd><dt>Media mount mode</dt><dd>${esc(deployment.media_mount_mode)}</dd><dt>API token</dt><dd>${deployment.api_token_set?'Configured':'Not configured'}</dd><dt>API listener</dt><dd>${esc(deployment.listen)}:${esc(deployment.port)}</dd><dt>API-only service</dt><dd>${deployment.api_only?'Enabled':'Disabled'}</dd><dt>Timezone</dt><dd>${esc(deployment.timezone)}</dd>${deployment.pool_mounts.map(pool=>`<dt>${esc(pool.name)} mount</dt><dd>${esc(pool.prefix)} · ${pool.writable?'writable':'read-only'}</dd>`).join('')}</dl>`}
 function renderSecurity(){const method=state.auth?.method||state.runtime?.deployment?.auth_method||'forms';$('#password-panel').classList.toggle('hidden',method!=='forms');$('#security-summary').innerHTML=`<div><small>Authentication method</small><strong>${esc(method==='external'?'External proxy':'Forms')}</strong></div><div><small>Active sessions</small><strong>${state.sessions.length}</strong></div><div><small>API authentication</small><strong>Bearer or X-Api-Key</strong></div>`;$('#revoke-sessions').disabled=method!=='forms'||!state.sessions.length;$('#security-events').innerHTML=state.securityEvents.length?state.securityEvents.map(item=>`<tr><td>${badge(item.event)}</td><td>${esc(item.username||'—')}</td><td>${esc(item.client||'—')}</td><td>${fmtTime(item.created_at)}</td></tr>`).join(''):'<tr><td colspan="4" class="empty">No security events recorded</td></tr>'}
-function renderOperations(){const ops=state.operations;const terminal=op=>['COMPLETE','FAILED','BLOCKED','DRY_RUN'].includes(op.state);const available=new Set(ops.filter(terminal).map(op=>op.id));state.selectedHistory=new Set([...state.selectedHistory].filter(id=>available.has(id)));$('#history-count').textContent=ops.length||'';$('#stat-operations').textContent=ops.length;$('#stat-complete').textContent=ops.filter(x=>x.state==='COMPLETE').length;$('#stat-blocked').textContent=ops.filter(x=>['BLOCKED','FAILED'].includes(x.state)).length;$('#recent-list').innerHTML=ops.slice(0,5).map(op=>`<div class="activity">${badge(op.state)}<div><strong>${esc(op.detail?.torrent_name||op.torrent_hash)}</strong><small>${esc(op.public_id)} · ${esc(op.kind||'reconcile')} · ${esc(op.app||'unknown')} · ${fmtTime(op.updated_at)}</small></div><button class="link-button inspect-operation" data-operation-id="${op.id}">Details</button></div>`).join('');$('#operation-rows').innerHTML=ops.length?ops.map(op=>`<tr><td><input class="history-select" type="checkbox" data-operation-id="${op.id}" aria-label="Select job ${esc(op.public_id)}" ${state.selectedHistory.has(op.id)?'checked':''} ${terminal(op)?'':'disabled'}></td><td><code>${esc(op.public_id)}</code></td><td>${badge(op.kind||'reconcile')}</td><td>${esc(op.app||'—')}</td><td>${esc(op.detail?.torrent_name||op.torrent_hash)}</td><td>${badge(op.state)}</td><td>${fmtTime(op.updated_at)}</td><td><button class="link-button inspect-operation" data-operation-id="${op.id}">Details</button></td></tr>`).join(''):`<tr><td colspan="8" class="empty">No operations recorded</td></tr>`;const selected=state.selectedHistory.size;const selectable=available.size;$('#history-selection').textContent=`${selected} selected`;$('#delete-history-selected').disabled=!selected;const selectAll=$('#select-all-history');selectAll.disabled=!selectable;selectAll.checked=Boolean(selectable)&&selected===selectable;selectAll.indeterminate=selected>0&&selected<selectable;$('#clear-history').disabled=!selectable}
+function renderOperations(){const ops=state.operations;const terminal=op=>['COMPLETE','FAILED','BLOCKED','DRY_RUN'].includes(op.state);const available=new Set(ops.filter(terminal).map(op=>op.id));state.selectedHistory=new Set([...state.selectedHistory].filter(id=>available.has(id)));$('#history-count').textContent=ops.length||'';$('#stat-operations').textContent=ops.length;$('#stat-complete').textContent=ops.filter(x=>x.state==='COMPLETE').length;$('#stat-blocked').textContent=ops.filter(x=>['BLOCKED','FAILED','RECOVERY_REQUIRED'].includes(x.state)).length;$('#recent-list').innerHTML=ops.slice(0,5).map(op=>`<div class="activity">${badge(op.state)}<div><strong>${esc(op.detail?.torrent_name||op.torrent_hash)}</strong><small>${esc(op.public_id)} · ${esc(op.kind||'reconcile')} · ${esc(op.app||'unknown')} · ${fmtTime(op.updated_at)}</small></div><button class="link-button inspect-operation" data-operation-id="${op.id}">Details</button></div>`).join('');$('#operation-rows').innerHTML=ops.length?ops.map(op=>`<tr><td><input class="history-select" type="checkbox" data-operation-id="${op.id}" aria-label="Select job ${esc(op.public_id)}" ${state.selectedHistory.has(op.id)?'checked':''} ${terminal(op)?'':'disabled'}></td><td><code>${esc(op.public_id)}</code></td><td>${badge(op.kind||'reconcile')}</td><td>${esc(op.app||'—')}</td><td>${esc(op.detail?.torrent_name||op.torrent_hash)}</td><td>${badge(op.state)}</td><td>${fmtTime(op.updated_at)}</td><td><button class="link-button inspect-operation" data-operation-id="${op.id}">Details</button></td></tr>`).join(''):`<tr><td colspan="8" class="empty">No operations recorded</td></tr>`;const selected=state.selectedHistory.size;const selectable=available.size;$('#history-selection').textContent=`${selected} selected`;$('#delete-history-selected').disabled=!selected;const selectAll=$('#select-all-history');selectAll.disabled=!selectable;selectAll.checked=Boolean(selectable)&&selected===selectable;selectAll.indeterminate=selected>0&&selected<selectable;$('#clear-history').disabled=!selectable}
 async function deleteHistory(all=false){const ids=all?[]:[...state.selectedHistory];const count=ids.length;if(!all&&!count)return;const confirmed=await confirmAction({title:all?'Clear History?':`Delete ${count} selected History ${count===1?'entry':'entries'}?`,message:'The operation records and their saved execution logs will be permanently removed. Active operations are always kept.',details:[[all?'Scope':'Selected entries',all?'All terminal History entries':String(count)]],confirmLabel:all?'Clear history':'Delete selected',danger:true});if(!confirmed)return;try{const result=await api('/api/operations',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify(all?{all:true}:{operationIds:ids})});state.selectedHistory.clear();state.operationEvents.clear();await refreshOperations();toast(`${result.deleted} History ${result.deleted===1?'entry':'entries'} deleted`)}catch(e){toast(`History was not changed: ${e.message}`)}}
 function renderReconcileBlocker(plan){
   if(plan.status!=='blocked')return '';
@@ -444,7 +447,72 @@ function renderQueue(){
   render(state.queue||[],'move','#queue-rows');
   render(state.reconcileQueue||[],'reconcile','#reconcile-queue-rows');
   const active=[...(state.queue||[]),...(state.reconcileQueue||[])].filter(item=>['QUEUED','RUNNING'].includes(item.state)).length;
-  $('#queue-count').textContent=active||'';
+  $('#queue-count').textContent=(active+(state.recovery?.count||0))||'';
+}
+
+function renderRecovery(){
+  const panel=$('#recovery-panel');
+  const recovery=state.recovery;
+  const notes=new Map($$('.recovery-note',panel).map(input=>[input.dataset.publicId,input.value]));
+  panel.classList.toggle('hidden',!recovery?.required);
+  if(!recovery?.required){
+    $('#recovery-operations').innerHTML='';
+    state.recoveryDiagnoses.clear();
+    return;
+  }
+  const activeIds=new Set(recovery.operations.map(operation=>operation.public_id));
+  for(const publicId of state.recoveryDiagnoses.keys()){
+    if(!activeIds.has(publicId))state.recoveryDiagnoses.delete(publicId);
+  }
+  $('#recovery-operations').innerHTML=recovery.operations.map(operation=>{
+    const detail=operation.detail||{};
+    const prior=detail.recovery?.previous_state||detail.failed_after||'Unknown stage';
+    const diagnosis=state.recoveryDiagnoses.get(operation.public_id)?.diagnosis;
+    const recommendation=diagnosis?.recommendation;
+    const qbit=diagnosis?.qbittorrent||{};
+    const arr=diagnosis?.arr||{};
+    const qbitSummary=diagnosis
+      ?qbit.found
+        ?`${qbit.state||'unknown state'} · ${qbit.files?.visible||0}/${qbit.files?.count||0} files visible with ${qbit.files?.size_matches||0} matching sizes`
+        :qbit.error||'Torrent not found in qBittorrent'
+      :'Not checked';
+    const arrSummary=diagnosis
+      ?arr.mapping_found
+        ?`${arr.app||'*Arr'} item #${arr.item_id||'—'} · ${arr.item_path||'path unavailable'}`
+        :arr.error||'No exact *Arr mapping found'
+      :'Not checked';
+    const diagnosisMarkup=diagnosis?`<div class="recovery-diagnosis ${recommendation?.safe_action==='manual'?'manual':'candidate'}"><strong>${esc(recommendation?.summary||'Inspection complete')}</strong><dl><dt>qBittorrent</dt><dd>${esc(qbitSummary)}</dd><dt>*Arr</dt><dd>${esc(arrSummary)}</dd><dt>Result</dt><dd>${esc(String(recommendation?.code||'manual review').replaceAll('_',' '))}</dd></dl><p>This diagnosis is read-only and does not replace a qBittorrent force recheck or a manual file-content inspection.</p></div>`:'';
+    return `<section class="recovery-operation" data-recovery-public-id="${esc(operation.public_id)}"><header><div><span>${badge(operation.kind)}</span><strong>${esc(operation.public_id)} · ${esc(detail.torrent_name||operation.torrent_hash)}</strong><small>Interrupted after ${esc(String(prior).replaceAll('_',' '))}</small></div><button type="button" class="secondary compact diagnose-recovery" data-public-id="${esc(operation.public_id)}">${diagnosis?'Diagnose again':'Diagnose current state'}</button></header>${diagnosisMarkup}<div class="recovery-resolution ${diagnosis?'':'hidden'}"><label><span>Manual inspection / repair note</span><input class="recovery-note" data-public-id="${esc(operation.public_id)}" value="${esc(notes.get(operation.public_id)||'')}" placeholder="Example: qBittorrent force recheck passed; Radarr path and target files verified"></label><button type="button" class="danger compact resolve-recovery" data-public-id="${esc(operation.public_id)}">Acknowledge and resume when clear</button></div></section>`;
+  }).join('');
+}
+
+async function diagnoseRecovery(publicId){
+  const button=$(`.diagnose-recovery[data-public-id="${CSS.escape(publicId)}"]`);
+  if(button){button.disabled=true;button.textContent='Inspecting…'}
+  try{
+    const result=await api(`/api/recovery/${encodeURIComponent(publicId)}/diagnose`,{method:'POST'});
+    state.recoveryDiagnoses.set(publicId,result);
+    renderRecovery();
+  }catch(error){
+    toast(`Recovery diagnosis failed: ${error.message}`);
+    if(button){button.disabled=false;button.textContent='Diagnose current state'}
+  }
+}
+
+async function resolveRecovery(publicId){
+  const input=$(`.recovery-note[data-public-id="${CSS.escape(publicId)}"]`);
+  const note=input?.value.trim()||'';
+  if(note.length<3){toast('Describe what you inspected or repaired before resuming');input?.focus();return}
+  const operation=state.recovery?.operations.find(item=>item.public_id===publicId);
+  if(!await confirmAction({title:`Acknowledge interrupted job ${publicId}?`,message:'This marks the old operation failed and may resume later queued work. It does not move, delete, recheck, or repair external data.',details:[['Torrent',operation?.detail?.torrent_name||operation?.torrent_hash||'—'],['Inspection note',note]],confirmLabel:'Acknowledge interruption',danger:true}))return;
+  try{
+    const result=await api(`/api/recovery/${encodeURIComponent(publicId)}/resolve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true,note})});
+    state.recovery=result.recovery;
+    state.recoveryDiagnoses.delete(publicId);
+    await Promise.all([refreshOperations(),refreshQueue(true)]);
+    renderRecovery();
+    toast(state.recovery.required?'Interruption acknowledged; queue remains paused for other recovery work':'Recovery cleared; queued work may resume');
+  }catch(error){toast(`Recovery was not cleared: ${error.message}`)}
 }
 
 function automaticallyTrackRunningQueue(){
@@ -469,8 +537,9 @@ async function refreshQueue(quiet=false){
   if(!state.authenticated)return;
   const previousActiveReconcile=activeReconcileQueueSignature();
   try{
-    [state.queue,state.reconcileQueue]=await Promise.all([api('/api/queue'),api('/api/reconcile-queue')]);
+    [state.queue,state.reconcileQueue,state.recovery]=await Promise.all([api('/api/queue'),api('/api/reconcile-queue'),api('/api/recovery')]);
     renderQueue();
+    renderRecovery();
     automaticallyTrackRunningQueue();
     if(previousActiveReconcile!==activeReconcileQueueSignature()&&state.sync[state.syncApp])renderSync(state.sync[state.syncApp]);
   }catch(error){if(!quiet||location.hash==='#queue')toast(`Could not load queues: ${error.message}`)}
@@ -660,7 +729,7 @@ async function viewSyncQueue(publicId){
 }
 async function inspect(hash){navigate('reconcile');$('#torrent-hash').value=hash;$('#global-hash').value=hash;$('#plan-loading').classList.remove('hidden');$('#plan-result').innerHTML='';try{state.plan=await api(`/api/plan/${encodeURIComponent(hash.trim())}`);renderPlan(state.plan)}catch(e){$('#plan-result').innerHTML=`<div class="alert"><div class="alert-head">Request failed</div><p>${esc(e.message)}</p></div>`}finally{$('#plan-loading').classList.add('hidden')}}
 async function refreshServiceStatus(){if(!state.authenticated)return;try{state.serviceStatus=await api('/api/status');renderServiceStatus()}catch(e){state.serviceStatus={version:state.config?.version,services:{stowarr_api:{status:'unavailable',error:e.message},qbittorrent:{status:'unavailable',error:e.message},radarr:{status:'unavailable',error:e.message},sonarr:{status:'unavailable',error:e.message}}};renderServiceStatus()}}
-async function load(){try{const [config,connections,status,runtime,operations,queue,reconcileQueue,security,sessions]=await Promise.all([api('/api/config'),api('/api/settings/connections'),api('/api/status'),api('/api/settings/runtime'),api('/api/operations'),api('/api/queue'),api('/api/reconcile-queue'),api('/api/security/events'),api('/api/auth/sessions')]);state.config=config;state.connections=connections;state.serviceStatus=status;state.runtime=runtime;state.operations=operations;state.queue=queue;state.reconcileQueue=reconcileQueue;state.securityEvents=security.events;state.sessions=sessions.sessions;renderConfig();renderConnections();renderServiceStatus();renderRuntime();renderOperations();renderQueue();automaticallyTrackRunningQueue();renderSecurity()}catch(e){toast(`Could not load Stowarr: ${e.message}`)}}
+async function load(){try{const [config,connections,status,runtime,recovery,operations,queue,reconcileQueue,security,sessions]=await Promise.all([api('/api/config'),api('/api/settings/connections'),api('/api/status'),api('/api/settings/runtime'),api('/api/recovery'),api('/api/operations'),api('/api/queue'),api('/api/reconcile-queue'),api('/api/security/events'),api('/api/auth/sessions')]);state.config=config;state.connections=connections;state.serviceStatus=status;state.runtime=runtime;state.recovery=recovery;state.operations=operations;state.queue=queue;state.reconcileQueue=reconcileQueue;state.securityEvents=security.events;state.sessions=sessions.sessions;renderConfig();renderConnections();renderServiceStatus();renderRuntime();renderOperations();renderQueue();renderRecovery();automaticallyTrackRunningQueue();renderSecurity()}catch(e){toast(`Could not load Stowarr: ${e.message}`)}}
 async function revokeSessions(){if(!await confirmAction({title:'Sign out all sessions?',message:'Every active WebUI session, including this one, will be revoked.',confirmLabel:'Sign out all',danger:true}))return;try{await api('/api/auth/sessions/revoke',{method:'POST'});state.authenticated=false;state.config=null;showLogin('All WebUI sessions were signed out.')}catch(e){toast(`Sessions were not revoked: ${e.message}`)}}
 async function saveRuntime(event){event.preventDefault();const apply=$('#runtime-apply').checked;if(!await confirmAction({title:`${apply?'Enable':'Disable'} confirmed write operations?`,message:'Move and Reconcile still require an explicit plan-bound confirmation.',details:[['Execution mode',apply?'Write mode':'Dry run']],confirmLabel:apply?'Enable writes':'Enable dry run',danger:apply}))return;const button=event.currentTarget.querySelector('button');button.disabled=true;button.textContent='Validating mounts…';try{state.runtime=await api('/api/settings/runtime',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apply})});state.config.apply=state.runtime.apply;renderRuntime();renderConfig();toast(`Execution mode: ${apply?'Write mode':'Dry run'}`)}catch(e){$('#runtime-apply').checked=state.runtime.apply;toast(`Execution mode was not changed: ${e.message}`)}finally{button.disabled=false;button.textContent='Save execution mode'}}
 async function saveConnections(event){event.preventDefault();const form=event.currentTarget;const button=$('#save-connections');const services={qbittorrent:{url:form.elements['qbittorrent-url'].value.trim(),api_key:form.elements['qbittorrent-api-key'].value.trim(),username:form.elements['qbittorrent-username'].value.trim(),password:form.elements['qbittorrent-password'].value},radarr:{url:form.elements['radarr-url'].value.trim(),api_key:form.elements['radarr-api-key'].value.trim()},sonarr:{url:form.elements['sonarr-url'].value.trim(),api_key:form.elements['sonarr-api-key'].value.trim()}};const selected=Object.entries(services).filter(([,service])=>service.url);if(!selected.length){$('#setup-error').textContent='Enter the URL and credentials for at least one service';$('#setup-error').classList.remove('hidden');return}if(!await confirmAction({title:'Test and save configured services?',message:'Existing credentials are kept for blank secret fields. Only services with a URL are tested.',details:selected.map(([name,service])=>[name==='qbittorrent'?'qBittorrent':name[0].toUpperCase()+name.slice(1),service.url]),confirmLabel:'Test and save'}))return;button.disabled=true;button.textContent='Testing connections…';$('#setup-error').classList.add('hidden');try{const result=await api('/api/settings/connections',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({services})});state.connections=result;renderConnections();form.elements['qbittorrent-api-key'].value='';form.elements['qbittorrent-password'].value='';form.elements['radarr-api-key'].value='';form.elements['sonarr-api-key'].value='';state.qbitCatalog=null;state.routingAudit=null;await refreshServiceStatus();$('#connection-setup').close();toast(`${selected.length} configured service${selected.length===1?'':'s'} tested and saved`)}catch(e){$('#setup-error').textContent=e.message;$('#setup-error').classList.remove('hidden')}finally{button.disabled=false;button.textContent='Test and save configured services'}}
@@ -718,6 +787,10 @@ document.addEventListener('click',event=>{
   if(event.target.closest('#queue-reconcile'))enqueueReconcile();
   if(event.target.closest('#queue-move'))enqueueMove();
   if(event.target.closest('#refresh-queue'))refreshQueue();
+  const diagnose=event.target.closest('.diagnose-recovery');
+  if(diagnose)diagnoseRecovery(diagnose.dataset.publicId);
+  const resolve=event.target.closest('.resolve-recovery');
+  if(resolve)resolveRecovery(resolve.dataset.publicId);
   const cancel=event.target.closest('.cancel-queue');
   if(cancel)cancelQueue(cancel.dataset.queueId,cancel.dataset.kind);
 });

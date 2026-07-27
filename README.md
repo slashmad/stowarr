@@ -12,21 +12,22 @@ Static analysis is installed inside the project rather than globally:
 python -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 npm ci
+scripts/bootstrap-analysis-tools.sh
 ```
 
-Run the same checks used by CI:
+The bootstrap script installs checksum-pinned ShellCheck, actionlint, and
+Hadolint binaries under the ignored `.tools/` directory; no system-wide
+installation is required. Run the complete repository check:
 
 ```bash
-.venv/bin/ruff check .
-.venv/bin/mypy
-.venv/bin/bandit -q -c pyproject.toml -r src/stowarr
-npm run lint
-PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
+scripts/check.sh
 ```
 
 MyPy currently checks every Python module, with a temporary gradual-typing
 override for `stowarr.engine`. Ruff, Bandit, ESLint, and the test suite cover
-that module normally.
+that module normally. The full check also covers HTML, CSS, shell scripts,
+GitHub Actions workflows, Dockerfiles, Compose and JSON syntax, plus Python
+and npm dependency advisories.
 
 ## Workflows
 
@@ -476,9 +477,9 @@ images with provenance and SBOM attestations.
 ## Versioning
 
 Stowarr follows Semantic Versioning. Prereleases use tags such as
-`v1.0.0-beta.3`, while the WebUI and API expose the corresponding product
-version `1.0.0-beta.3`. Python package metadata uses the PEP 440 equivalent
-`1.0.0b3`. Tagged builds are published to GHCR alongside commit-SHA images;
+`v1.0.0-beta.4`, while the WebUI and API expose the corresponding product
+version `1.0.0-beta.4`. Python package metadata uses the PEP 440 equivalent
+`1.0.0b4`. Tagged builds are published to GHCR alongside commit-SHA images;
 `latest` continues to track `main`.
 
 ## Project status
