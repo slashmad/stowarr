@@ -1,5 +1,5 @@
-import unittest
 import threading
+import unittest
 
 from stowarr.queue import MoveQueueWorker, ReconcileQueueWorker
 

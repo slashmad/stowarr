@@ -1,0 +1,12 @@
+{
+  "name": "stowarr-web",
+  "private": true,
+  "scripts": {
+    "lint": "eslint src/stowarr/web/app.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.8.0",
+    "globals": "^17.8.0"
+  }
+}

@@ -82,7 +82,7 @@ class AuthManager:
             self.store.delete_web_session(token_hash)
         self.store.security_event("logout", "admin", client)
 
-    def session_summary(self, current_token: str = "") -> list[dict]:
+    def session_summary(self, current_token: str | None = None) -> list[dict]:
         now = int(time.time())
         current_hash = hashlib.sha256(current_token.encode()).hexdigest() if current_token else ""
         with self.lock:

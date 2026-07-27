@@ -4,11 +4,12 @@ import os
 import re
 import selectors
 import shutil
-import subprocess
+
+# 7-Zip is invoked without a shell and with fixed operations.
+import subprocess  # nosec
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-
 
 ARCHIVE_SUFFIXES = {".rar", ".zip", ".7z", ".tar", ".tgz", ".gz", ".bz2", ".tbz2", ".iso"}
 VOLUME_SUFFIX = re.compile(r"(?:\.r\d{2,3}|\.\d{3})$", re.IGNORECASE)
@@ -80,7 +81,8 @@ class ArchiveExtractor:
 
     def _run(self, arguments: list[str]) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run(
+            # Arguments are passed directly without a shell.
+            return subprocess.run(  # nosec
                 [self.executable, *arguments],
                 check=True,
                 capture_output=True,
@@ -127,7 +129,8 @@ class ArchiveExtractor:
         self.test(entry)
         command = [self.executable, "x", "-y", "-snl-", "-snh-", "-bso0", "-bsp1", "-bse1", f"-o{destination}", "--", str(entry)]
         try:
-            process = subprocess.Popen(
+            # Arguments are passed directly without a shell.
+            process = subprocess.Popen(  # nosec
                 command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 env={"PATH": os.environ.get("PATH", "")},
             )
@@ -135,7 +138,9 @@ class ArchiveExtractor:
             raise RuntimeError(f"Archive extractor is unavailable: {self.executable}") from error
         started = time.monotonic()
         output = b""
-        assert process.stderr is not None
+        if process.stderr is None:
+            process.kill()
+            raise RuntimeError("Archive extractor did not expose a progress stream")
         selector = selectors.DefaultSelector()
         selector.register(process.stderr, selectors.EVENT_READ)
         while process.poll() is None:

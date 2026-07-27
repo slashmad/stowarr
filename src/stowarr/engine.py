@@ -1,23 +1,27 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
-import shutil
 import secrets
-import json
+import shutil
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from .clients import ArrClient, QBittorrentClient
-from .archive import ArchiveExtractor, ArchiveMember, is_archive_path, select_archive_entries
+from . import __version__
+from .archive import (
+    ArchiveExtractor,
+    ArchiveMember,
+    is_archive_path,
+    select_archive_entries,
+)
 from .auth import AuthManager
+from .clients import ArrClient, QBittorrentClient
 from .config import Config, Pool, Service
 from .store import Store
-from . import __version__
-
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".vtt"}
@@ -1441,10 +1445,13 @@ class Stowarr:
                 )
             for index, entry in enumerate(entries):
                 output = staging / f"archive-{index:04d}"
-                archive_progress = lambda percent, index=index, entry=entry: progress and progress({
-                        "percent": round((index + percent / 100) / len(entries) * 55),
-                        "current": entry.name,
-                        "message": f"Extracting archive {index + 1} of {len(entries)}",
+                def archive_progress(percent, archive_index=index, archive_entry=entry):
+                    if not progress:
+                        return None
+                    return progress({
+                        "percent": round((archive_index + percent / 100) / len(entries) * 55),
+                        "current": archive_entry.name,
+                        "message": f"Extracting archive {archive_index + 1} of {len(entries)}",
                     })
                 files = (
                     self.archive_extractor.extract(entry, output, archive_progress)
@@ -2680,19 +2687,21 @@ class Stowarr:
         public_id: str | None = None,
         write_enabled: bool | None = None,
     ) -> dict:
-        execute = lambda: self._run_reconcile(
-            torrent_hash,
-            auxiliary_sources=auxiliary_sources,
-            operation_id=operation_id,
-            verified_derived_paths=verified_derived_paths,
-            progress_callback=progress_callback,
-            mapping_hint=mapping_hint,
-            app_hint=app_hint,
-            relocated_library_sources=relocated_library_sources,
-            prepared_plan=prepared_plan,
-            public_id=public_id,
-            write_enabled=write_enabled,
-        )
+        def execute():
+            return self._run_reconcile(
+                torrent_hash,
+                auxiliary_sources=auxiliary_sources,
+                operation_id=operation_id,
+                verified_derived_paths=verified_derived_paths,
+                progress_callback=progress_callback,
+                mapping_hint=mapping_hint,
+                app_hint=app_hint,
+                relocated_library_sources=relocated_library_sources,
+                prepared_plan=prepared_plan,
+                public_id=public_id,
+                write_enabled=write_enabled,
+            )
+
         lock = getattr(self, "_move_lock", None)
         if lock is None:
             return execute()
@@ -2736,7 +2745,9 @@ class Stowarr:
                 torrent_hash, plan.app, "PLANNED", plan.json(),
                 kind="reconcile", public_id=public_id,
             )
-        state_name = lambda standalone, move: move if nested_move else standalone
+        def state_name(standalone, move):
+            return move if nested_move else standalone
+
         if progress_callback is None and not nested_move:
             def progress_callback(state, percent, **progress):
                 self.store.update(operation_id, state, {

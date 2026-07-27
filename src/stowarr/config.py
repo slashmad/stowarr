@@ -74,7 +74,8 @@ def _service(raw: dict, name: str) -> Service:
 
 
 def load_config(path: str | Path | None = None) -> Config:
-    config_path = Path(path or os.getenv("STOWARR_CONFIG", "/config/config.json"))
+    configured_path = path if path is not None else os.getenv("STOWARR_CONFIG", "/config/config.json")
+    config_path = Path(configured_path)
     raw = json.loads(config_path.read_text())
     pools = tuple(
         Pool(
@@ -100,7 +101,8 @@ def load_config(path: str | Path | None = None) -> Config:
         sonarr=_service(raw, "sonarr"),
         database=Path(raw.get("database", "/state/stowarr.sqlite3")),
         apply=os.getenv("STOWARR_APPLY", str(raw.get("apply", False))).lower() == "true",
-        listen=os.getenv("STOWARR_LISTEN", raw.get("listen", "0.0.0.0")),
+        # The container listener is configurable and intentionally defaults to all interfaces.
+        listen=os.getenv("STOWARR_LISTEN", raw.get("listen", "0.0.0.0")),  # nosec
         port=int(os.getenv("STOWARR_PORT", raw.get("port", 8787))),
         api_token=os.getenv("STOWARR_API_TOKEN", raw.get("api_token", "")),
         api_only=os.getenv("STOWARR_API_ONLY", str(raw.get("api_only", False))).lower() == "true",

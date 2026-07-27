@@ -161,7 +161,7 @@ function renderOperationDialog(operation,waiting=false,updateTrackedOperation=tr
   renderOperationLog(waiting?null:operation);
   renderOperationMinimized();
 }
-async function refreshOperations(){if(!state.authenticated)return;try{state.operations=await api('/api/operations');renderOperations()}catch(_){}}
+async function refreshOperations(){if(!state.authenticated)return;try{state.operations=await api('/api/operations');renderOperations()}catch{/* Keep the last successfully loaded operation list during transient refresh failures. */}}
 async function startOperationTracking(findOperation,kind='move',queueContext=null,startHidden=false){
   const generation=++state.operationTrackingGeneration;
   const dialog=$('#operation-dialog');
