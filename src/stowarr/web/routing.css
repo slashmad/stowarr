@@ -1191,6 +1191,20 @@
   font-weight: 500;
 }
 
+.queue-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+@media (max-width: 720px) {
+  .queue-panel-actions {
+    width: 100%;
+    margin-top: 12px;
+    flex-wrap: wrap;
+  }
+}
+
 .hash-short {
   font-family: Consolas, monospace;
   white-space: nowrap;

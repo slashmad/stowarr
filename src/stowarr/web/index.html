@@ -118,11 +118,11 @@
       <section id="queue" class="page">
         <div class="page-title"><div><h1>Job queues</h1><p>Confirmed Move and Reconcile jobs run in separate FIFO queues</p></div></div>
         <article class="panel">
-          <div class="panel-head"><div><h2>Move queue</h2><p>Storage relocation transactions; processed independently from repairs</p></div><button id="refresh-queue" class="primary compact" type="button">Refresh queues</button></div>
+          <div class="panel-head"><div><h2>Move queue</h2><p>Storage relocation transactions; processed independently from repairs</p></div><div class="queue-panel-actions"><button class="danger compact clear-queue" data-kind="move" type="button">Clear</button><button id="refresh-queue" class="primary compact" type="button">Refresh queues</button></div></div>
           <div class="table-wrap"><table><thead><tr><th>Job / position</th><th>Torrent</th><th>Route</th><th>State</th><th>Operation</th><th>Updated</th><th></th></tr></thead><tbody id="queue-rows"><tr><td colspan="7" class="empty">The Move queue is empty</td></tr></tbody></table></div>
         </article>
         <article class="panel">
-          <div class="panel-head"><div><h2>Reconcile queue</h2><p>Library verification and repair jobs; processed independently from moves</p></div></div>
+          <div class="panel-head"><div><h2>Reconcile queue</h2><p>Library verification and repair jobs; processed independently from moves</p></div><div class="queue-panel-actions"><button class="danger compact clear-queue" data-kind="reconcile" type="button">Clear</button></div></div>
           <div class="table-wrap"><table><thead><tr><th>Job / position</th><th>Torrent</th><th>Pool</th><th>State</th><th>Operation</th><th>Updated</th><th></th></tr></thead><tbody id="reconcile-queue-rows"><tr><td colspan="7" class="empty">The Reconcile queue is empty</td></tr></tbody></table></div>
         </article>
       </section>

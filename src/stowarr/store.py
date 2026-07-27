@@ -147,10 +147,16 @@ class Store:
         event = self._event_detail(detail)
         encoded = json.dumps(event, sort_keys=True)
         previous = self.db.execute(
-            "SELECT state, detail FROM operation_events WHERE operation_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT id, state, detail FROM operation_events WHERE operation_id=? ORDER BY id DESC LIMIT 1",
             (operation_id,),
         ).fetchone()
-        if previous and previous["state"] == state and previous["detail"] == encoded:
+        if previous and previous["state"] == state:
+            if previous["detail"] == encoded:
+                return
+            self.db.execute(
+                "UPDATE operation_events SET detail=?,created_at=? WHERE id=?",
+                (encoded, created_at or int(time.time()), previous["id"]),
+            )
             return
         self.db.execute(
             "INSERT INTO operation_events(operation_id,state,detail,created_at) VALUES(?,?,?,?)",
@@ -268,6 +274,14 @@ class Store:
                 (torrent_hash, app, kind, state, json.dumps(detail), now, now, public_id),
             )
             operation_id = int(cursor.lastrowid)
+            self.db.execute(
+                "UPDATE move_queue SET operation_id=? WHERE public_id=?",
+                (operation_id, public_id),
+            )
+            self.db.execute(
+                "UPDATE reconcile_queue SET operation_id=? WHERE public_id=?",
+                (operation_id, public_id),
+            )
             self._record_event(operation_id, state, detail, now)
             self.db.commit()
         print(
@@ -302,8 +316,14 @@ class Store:
     def operation_events(self, operation_id: int) -> list[dict]:
         with self.lock:
             rows = self.db.execute(
-                "SELECT id, operation_id, state, detail, created_at FROM operation_events "
-                "WHERE operation_id=? ORDER BY id",
+                """SELECT events.id, events.operation_id, events.state,
+                events.detail, events.created_at
+                FROM operation_events events
+                JOIN (
+                    SELECT state, MAX(id) AS id FROM operation_events
+                    WHERE operation_id=? GROUP BY state
+                ) latest ON latest.id=events.id
+                ORDER BY events.id""",
                 (operation_id,),
             ).fetchall()
             if rows:
@@ -412,6 +432,20 @@ class Store:
                 (max(1, min(limit, 1000)),),
             ).fetchall()
         return [self._queue_row(row) for row in rows]
+
+    def _clear_queue(self, table: str) -> int:
+        if table not in {"move_queue", "reconcile_queue"}:
+            raise ValueError("Unknown queue")
+        with self.lock:
+            cursor = self.db.execute(f"DELETE FROM {table} WHERE state!='RUNNING'")
+            self.db.commit()
+            return int(cursor.rowcount)
+
+    def clear_move_queue(self) -> int:
+        return self._clear_queue("move_queue")
+
+    def clear_reconcile_queue(self) -> int:
+        return self._clear_queue("reconcile_queue")
 
     def claim_next_move(self) -> dict | None:
         with self.lock:

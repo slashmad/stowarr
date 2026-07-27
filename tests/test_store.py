@@ -102,13 +102,17 @@ class StoreTest(unittest.TestCase):
                 {"progress": {"percent": 10, "message": "Relocating files"}},
             )
             store.update(
+                operation_id, "MOVE_RELOCATING",
+                {"progress": {"percent": 45, "message": "Relocating files"}},
+            )
+            store.update(
                 operation_id, "FAILED",
                 {"error": "Source disappeared", "recovery": "Rebuild the plan"},
             )
 
             events = Store(path).operation_events(operation_id)
             self.assertEqual(len(events), 2)
-            self.assertEqual(events[0]["detail"]["percent"], 10)
+            self.assertEqual(events[0]["detail"]["percent"], 45)
             self.assertEqual(events[1]["state"], "FAILED")
             self.assertEqual(events[1]["detail"]["recovery"], "Rebuild the plan")
 
@@ -220,13 +224,37 @@ class StoreTest(unittest.TestCase):
                 "repair", {"auxiliaryFiles": ["/subtitle.srt"]},
                 "repair-fingerprint", {"torrent_name": "Repair"},
             )
+            operation_id = store.record(
+                "repair", "radarr", "RECONCILE_VERIFYING", {},
+                kind="reconcile", public_id=repair["public_id"],
+            )
 
             reopened = Store(path)
             self.assertEqual(reopened.claim_next_move()["public_id"], move["public_id"])
-            self.assertEqual(
-                reopened.reconcile_queue()[0]["public_id"], repair["public_id"]
-            )
+            reconcile_entry = reopened.reconcile_queue()[0]
+            self.assertEqual(reconcile_entry["public_id"], repair["public_id"])
+            self.assertEqual(reconcile_entry["operation_id"], operation_id)
             self.assertTrue(
                 reopened.cancel_queued_reconcile_by_public_id(repair["public_id"])
             )
             self.assertEqual(reopened.reconcile_queue()[0]["state"], "CANCELLED")
+
+    def test_queue_cleanup_keeps_running_work_and_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            finished = store.enqueue_move("finished", "p1", {}, "finished", {})
+            store.claim_next_move()
+            operation_id = store.record(
+                "finished", "radarr", "COMPLETE", {}, kind="move",
+                public_id=finished["public_id"],
+            )
+            store.finish_move(finished["id"], "COMPLETE", operation_id)
+            waiting = store.enqueue_move("waiting", "p1", {}, "waiting", {})
+
+            running = store.claim_next_move()
+            queued = store.enqueue_move("queued", "p1", {}, "queued", {})
+            self.assertEqual(store.clear_move_queue(), 2)
+            remaining = store.move_queue()
+            self.assertEqual([item["public_id"] for item in remaining], [running["public_id"]])
+            self.assertNotEqual(remaining[0]["public_id"], queued["public_id"])
+            self.assertEqual(store.recent()[0]["id"], operation_id)
