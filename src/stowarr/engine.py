@@ -21,6 +21,7 @@ from .archive import (
 from .auth import AuthManager
 from .clients import ArrClient, QBittorrentClient
 from .config import Config, Pool, Service
+from .mutations import ExternalMutationGuard, GuardedFilesystem
 from .store import Store
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
@@ -219,6 +220,8 @@ def is_archive(path: Path) -> bool:
 class Stowarr:
     def __init__(self, config: Config):
         self.store = Store(config.database)
+        self.mutation_guard = ExternalMutationGuard(self._recovery_is_required)
+        self.filesystem = GuardedFilesystem(self.mutation_guard)
         self.auth = AuthManager(self.store)
         self.generated_api_token = None
         saved_api_auth = self.store.setting("api_auth") or {}
@@ -265,9 +268,10 @@ class Stowarr:
         return self.qbit is not None and set(self.arr) == {"radarr", "sonarr"}
 
     def _activate_connections(self, qbittorrent: Service, radarr: Service, sonarr: Service, validate: bool = True) -> dict:
-        qbit = QBittorrentClient(qbittorrent) if qbittorrent.url and (qbittorrent.api_key or (qbittorrent.username and qbittorrent.password)) else None
+        mutation_guard = self._mutation_guard()
+        qbit = QBittorrentClient(qbittorrent, mutation_guard) if qbittorrent.url and (qbittorrent.api_key or (qbittorrent.username and qbittorrent.password)) else None
         arr = {
-            name: ArrClient(service, name)
+            name: ArrClient(service, name, mutation_guard)
             for name, service in (("radarr", radarr), ("sonarr", sonarr))
             if service.url and service.api_key
         }
@@ -497,21 +501,36 @@ class Stowarr:
         if not isinstance(apply, bool):
             raise ValueError("apply must be a boolean")
         if apply:
+            self._require_recovery_clear()
             self._validate_write_paths()
         self.store.set_setting("runtime", {"apply": apply})
         self.config = replace(self.config, apply=apply)
         return self.runtime_settings()
 
     def _recovery_is_required(self) -> bool:
-        check = getattr(self.store, "has_recovery_required", None)
-        return bool(check()) if callable(check) else False
+        store = getattr(self, "store", None)
+        check = getattr(store, "has_recovery_required", None)
+        if not callable(check):
+            return False
+        result = check()
+        return result if isinstance(result, bool) else False
+
+    def _mutation_guard(self) -> ExternalMutationGuard:
+        guard = getattr(self, "mutation_guard", None)
+        if guard is None:
+            guard = ExternalMutationGuard(self._recovery_is_required)
+            self.mutation_guard = guard
+        return guard
+
+    def _filesystem(self) -> GuardedFilesystem:
+        filesystem = getattr(self, "filesystem", None)
+        if filesystem is None:
+            filesystem = GuardedFilesystem(self._mutation_guard())
+            self.filesystem = filesystem
+        return filesystem
 
     def _require_recovery_clear(self) -> None:
-        if self._recovery_is_required():
-            raise RuntimeError(
-                "A previous operation was interrupted. Review Recovery in Queue "
-                "before starting or queuing more write operations."
-            )
+        self._mutation_guard().require_allowed()
 
     @staticmethod
     def _recovery_path_fact(value: str | None) -> dict | None:
@@ -1132,10 +1151,12 @@ class Stowarr:
             for root in self._pool_media_paths(pool, strict_discovery=True):
                 probe = root / f".stowarr-write-test-{secrets.token_hex(6)}"
                 try:
-                    probe.write_bytes(b"")
-                    probe.unlink()
+                    self._filesystem().execute(
+                        "write probe", probe.write_bytes, b""
+                    )
+                    self._filesystem().unlink(probe)
                 except OSError as error:
-                    probe.unlink(missing_ok=True)
+                    self._filesystem().unlink(probe, missing_ok=True)
                     raise PermissionError(
                         f"Required media path is not writable inside the API container: {root}"
                     ) from error
@@ -1684,37 +1705,37 @@ class Stowarr:
             f"qBittorrent completed recheck but {len(missing)} tracked file(s) are not visible inside Stowarr: {sample}"
         )
 
-    @staticmethod
-    def _remove_empty_tree(root: Path | None) -> None:
+    def _remove_empty_tree(self, root: Path | None) -> None:
         if not root or not root.exists() or not root.is_dir():
             return
         for directory in sorted((path for path in root.rglob("*") if path.is_dir()), key=lambda path: len(path.parts), reverse=True):
             if not any(directory.iterdir()):
-                directory.rmdir()
+                self._filesystem().rmdir(directory)
         if root.exists() and not any(root.iterdir()):
-            root.rmdir()
+            self._filesystem().rmdir(root)
 
     @staticmethod
     def _old_library_folder_remaining(current: Path | None, target: Path | None) -> bool:
         """Return true only when a distinct source library folder still exists."""
         return bool(current and target and current != target and current.exists())
 
-    @staticmethod
-    def _copy_verified(source: Path, target: Path, expected_hash: str) -> None:
+    def _copy_verified(
+        self, source: Path, target: Path, expected_hash: str
+    ) -> None:
         if not source.exists() or sha256(source) != expected_hash:
             raise RuntimeError(f"Additional source changed or disappeared: {source}")
-        target.parent.mkdir(parents=True, exist_ok=True)
+        self._filesystem().mkdir(target.parent, parents=True, exist_ok=True)
         if target.exists():
             if sha256(target) != expected_hash:
                 raise RuntimeError(f"Additional file target conflict: {target}")
             return
         temporary = target.with_name(f".{target.name}.stowarr-copy")
-        temporary.unlink(missing_ok=True)
-        shutil.copy2(source, temporary)
+        self._filesystem().unlink(temporary, missing_ok=True)
+        self._filesystem().copy2(source, temporary)
         if sha256(temporary) != expected_hash:
-            temporary.unlink(missing_ok=True)
+            self._filesystem().unlink(temporary, missing_ok=True)
             raise RuntimeError(f"Additional file copy verification failed: {source}")
-        os.replace(temporary, target)
+        self._filesystem().replace(temporary, target)
 
     def _extract_managed_media(self, torrent_hash: str, plan: MovePlan, progress=None) -> list[dict]:
         """Regenerate archive-derived *Arr files on the destination pool."""
@@ -1758,8 +1779,20 @@ class Stowarr:
                         "message": f"Extracting archive {archive_index + 1} of {len(entries)}",
                     })
                 files = (
-                    self.archive_extractor.extract(entry, output, archive_progress)
-                    if progress else self.archive_extractor.extract(entry, output)
+                    self._filesystem().execute(
+                        "extract archive",
+                        self.archive_extractor.extract,
+                        entry,
+                        output,
+                        archive_progress,
+                    )
+                    if progress
+                    else self._filesystem().execute(
+                        "extract archive",
+                        self.archive_extractor.extract,
+                        entry,
+                        output,
+                    )
                 )
                 extracted.extend(item.path for item in files)
             videos = [path for path in extracted if path.suffix.casefold() in VIDEO_EXTENSIONS]
@@ -1796,19 +1829,21 @@ class Stowarr:
                     )
                 candidate = candidates[0]
                 used.add(candidate)
-                target.parent.mkdir(parents=True, exist_ok=True)
+                self._filesystem().mkdir(
+                    target.parent, parents=True, exist_ok=True
+                )
                 existed_before = target.exists()
                 if existed_before:
                     if sha256(target) != expected_hash:
                         raise RuntimeError(f"Existing archive-derived target differs from verified media: {target}")
                 else:
                     temporary = target.with_name(f".{target.name}.stowarr-extract")
-                    temporary.unlink(missing_ok=True)
-                    shutil.copy2(candidate, temporary)
+                    self._filesystem().unlink(temporary, missing_ok=True)
+                    self._filesystem().copy2(candidate, temporary)
                     if sha256(temporary, progress=lambda done, total: hash_progress(done, total, "published media")) != expected_hash:
-                        temporary.unlink(missing_ok=True)
+                        self._filesystem().unlink(temporary, missing_ok=True)
                         raise RuntimeError(f"Published archive-derived media failed verification: {target}")
-                    os.replace(temporary, target)
+                    self._filesystem().replace(temporary, target)
                 published.append({
                     "source": str(source), "target": str(target), "sha256": expected_hash,
                     "created": not existed_before,
@@ -1822,10 +1857,10 @@ class Stowarr:
                 if item.get("created"):
                     target = Path(item["target"])
                     if target.exists() and sha256(target) == item["sha256"]:
-                        target.unlink()
+                        self._filesystem().unlink(target)
             raise
         finally:
-            shutil.rmtree(staging, ignore_errors=True)
+            self._filesystem().rmtree(staging, ignore_errors=True)
 
     def _cleanup_verified_unpackerr_derivatives(self, torrent_hash: str, extracted: list[dict], progress=None) -> list[str]:
         """Remove only recognizable Unpackerr output whose media matches published library media."""
@@ -1860,7 +1895,7 @@ class Stowarr:
                 }))
                 if digest not in possible:
                     raise RuntimeError(f"Unpackerr derivative differs from published library media: {video}")
-            shutil.rmtree(directory)
+            self._filesystem().rmtree(directory)
             removed.append(str(directory))
         return removed
 
@@ -2021,13 +2056,13 @@ class Stowarr:
             for item in plan.additional_files or []:
                 source, target = Path(item["source"]), Path(item["target"])
                 if actions[item["source"]] == "delete":
-                    source.unlink(missing_ok=True)
+                    self._filesystem().unlink(source, missing_ok=True)
                     if item["scope"] == "download":
-                        target.unlink(missing_ok=True)
+                        self._filesystem().unlink(target, missing_ok=True)
                 elif item["scope"] == "download" and source.exists():
                     if not target.exists() or sha256(source) != sha256(target):
                         raise RuntimeError(f"Final additional file verification failed: {source}")
-                    source.unlink()
+                    self._filesystem().unlink(source)
             old_item = Path(plan.current_item_path) if plan.current_item_path else None
             target_item = Path(plan.target_item_path) if plan.target_item_path else None
             if old_item != target_item:
@@ -2053,7 +2088,7 @@ class Stowarr:
                 if item.get("created"):
                     target = Path(item["target"])
                     if target.exists() and sha256(target) == item["sha256"]:
-                        target.unlink()
+                        self._filesystem().unlink(target)
             previous = next((item for item in self.store.recent() if item["id"] == operation_id), None)
             self.store.update(operation_id, "FAILED", {
                 **detail,
@@ -3086,18 +3121,20 @@ class Stowarr:
                 if pair.strategy == "verified-copy":
                     if not source.exists() or source.stat().st_size != pair.size:
                         raise RuntimeError(f"Derived media changed or missing: {source}")
-                    target.parent.mkdir(parents=True, exist_ok=True)
+                    self._filesystem().mkdir(
+                        target.parent, parents=True, exist_ok=True
+                    )
                     temporary = target.with_name(f".{target.name}.stowarr-copy")
-                    shutil.copy2(source, temporary)
+                    self._filesystem().copy2(source, temporary)
                     if sha256(source, progress=lambda done, total: pair_progress(done, total, "derived source")) != sha256(
                         temporary, progress=lambda done, total: pair_progress(done, total, "derived destination")
                     ):
-                        temporary.unlink(missing_ok=True)
+                        self._filesystem().unlink(temporary, missing_ok=True)
                         raise RuntimeError(f"Derived media copy verification failed: {source}")
                     if target.exists() and sha256(target) != sha256(source):
-                        temporary.unlink(missing_ok=True)
+                        self._filesystem().unlink(temporary, missing_ok=True)
                         raise RuntimeError(f"Existing library target differs from derived media: {target}")
-                    os.replace(temporary, target)
+                    self._filesystem().replace(temporary, target)
                     created.append(target)
                     continue
                 if pair.strategy == "archive-reextract":
@@ -3119,14 +3156,16 @@ class Stowarr:
                     same_file = (target_stat.st_dev, target_stat.st_ino) == (torrent_stat.st_dev, torrent_stat.st_ino)
                     if not same_file and sha256(target) != sha256(torrent_file):
                         raise RuntimeError(f"Existing library target differs from torrent data: {target}")
-                target.parent.mkdir(parents=True, exist_ok=True)
+                self._filesystem().mkdir(
+                    target.parent, parents=True, exist_ok=True
+                )
                 temporary = target.with_name(f".{target.name}.stowarr-link")
                 if temporary.exists():
-                    temporary.unlink()
-                os.link(torrent_file, temporary)
+                    self._filesystem().unlink(temporary)
+                self._filesystem().link(torrent_file, temporary)
                 if target.exists():
-                    target.unlink()
-                os.replace(temporary, target)
+                    self._filesystem().unlink(target)
+                self._filesystem().replace(temporary, target)
                 created.append(target)
                 if progress_callback:
                     progress_callback(state_name("RECONCILE_VERIFYING", "MOVE_LIBRARY_VERIFYING"), (pair_index + 1) / pair_total * 100,
@@ -3145,25 +3184,29 @@ class Stowarr:
                                 continue
                             if sha256(source) != sha256(target):
                                 raise RuntimeError(f"Sidecar target conflict: {source} != {target}")
-                            target.unlink()
-                        target.parent.mkdir(parents=True, exist_ok=True)
+                            self._filesystem().unlink(target)
+                        self._filesystem().mkdir(
+                            target.parent, parents=True, exist_ok=True
+                        )
                         temporary = target.with_name(f".{target.name}.stowarr-link")
-                        temporary.unlink(missing_ok=True)
-                        os.link(source, temporary)
-                        os.replace(temporary, target)
+                        self._filesystem().unlink(temporary, missing_ok=True)
+                        self._filesystem().link(source, temporary)
+                        self._filesystem().replace(temporary, target)
                         continue
                     if item.status == "target-exists-same-size":
                         if sha256(source) == sha256(target):
                             copied_auxiliary.append((source, target))
                             continue
                         raise RuntimeError(f"Sidecar files have equal size but different content: {source} != {target}")
-                    target.parent.mkdir(parents=True, exist_ok=True)
+                    self._filesystem().mkdir(
+                        target.parent, parents=True, exist_ok=True
+                    )
                     temporary = target.with_name(f".{target.name}.stowarr-copy")
-                    shutil.copy2(source, temporary)
+                    self._filesystem().copy2(source, temporary)
                     if sha256(source) != sha256(temporary):
-                        temporary.unlink(missing_ok=True)
+                        self._filesystem().unlink(temporary, missing_ok=True)
                         raise RuntimeError(f"Auxiliary file verification failed: {source}")
-                    os.replace(temporary, target)
+                    self._filesystem().replace(temporary, target)
                     copied_auxiliary.append((source, target))
                 self.store.update(operation_id, state_name("AUXILIARY_COPIED", "MOVE_LIBRARY_AUXILIARY"), plan.json())
             pool = next(pool for pool in self.config.pools if pool.name == plan.target_pool)
@@ -3206,16 +3249,18 @@ class Stowarr:
             for pair in plan.pairs:
                 source, target = Path(pair.source_library), Path(pair.target_library)
                 if source != target and source.exists():
-                    source.unlink()
+                    self._filesystem().unlink(source)
             for source, _ in copied_auxiliary:
                 if source.exists():
-                    source.unlink()
+                    self._filesystem().unlink(source)
             old_root = Path(plan.current_item_path) if plan.current_item_path else None
             if old_root and old_root != Path(plan.target_item_path or "") and old_root.exists():
                 directories = (path for path in old_root.rglob("*") if path.is_dir())
                 for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
-                    directory.rmdir() if not any(directory.iterdir()) else None
-                old_root.rmdir() if not any(old_root.iterdir()) else None
+                    if not any(directory.iterdir()):
+                        self._filesystem().rmdir(directory)
+                if not any(old_root.iterdir()):
+                    self._filesystem().rmdir(old_root)
             self.store.update(operation_id, state_name("SOURCE_UNLINKED", "MOVE_OLD_LIBRARY_REMOVED"), plan.json())
             if not nested_move:
                 self.store.update(operation_id, "COMPLETE", plan.json())

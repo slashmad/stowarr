@@ -1,15 +1,33 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
+from typing import Any
 
 from .config import Service
 from .http import JsonClient
+from .mutations import ExternalMutationGuard
 
 
 class ArrClient:
-    def __init__(self, service: Service, kind: str):
+    def __init__(
+        self,
+        service: Service,
+        kind: str,
+        mutation_guard: ExternalMutationGuard | None = None,
+    ):
         self.kind = kind
         self.http = JsonClient(service.url, {"X-Api-Key": service.api_key})
+        self.mutation_guard = mutation_guard
+
+    def _mutate(
+        self, action: str, operation: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        if self.mutation_guard is None:
+            raise RuntimeError("External mutation guard is required")
+        return self.mutation_guard.execute(
+            self.kind, action, operation, *args, **kwargs
+        )
 
     def tags(self) -> list[dict]:
         return self.http.request("GET", "/api/v3/tag")
@@ -43,7 +61,13 @@ class ArrClient:
 
     def ensure_tag(self, label: str) -> int:
         existing = next((tag for tag in self.tags() if tag["label"] == label), None)
-        return existing["id"] if existing else self.http.request("POST", "/api/v3/tag", body={"label": label})["id"]
+        return existing["id"] if existing else self._mutate(
+            "create tag",
+            self.http.request,
+            "POST",
+            "/api/v3/tag",
+            body={"label": label},
+        )["id"]
 
     def item_for_download(self, download_id: str) -> dict | None:
         key = "movieId" if self.kind == "radarr" else "seriesId"
@@ -223,12 +247,25 @@ class ArrClient:
             title_folder = item["path"].rstrip("/").split("/")[-1]
             item["path"] = f"{root.rstrip('/')}/{title_folder}"
         endpoint = "movie" if self.kind == "radarr" else "series"
-        return self.http.request("PUT", f"/api/v3/{endpoint}/{item['id']}", query={"moveFiles": "false"}, body=item)
+        return self._mutate(
+            "update library route",
+            self.http.request,
+            "PUT",
+            f"/api/v3/{endpoint}/{item['id']}",
+            query={"moveFiles": "false"},
+            body=item,
+        )
 
     def rescan(self, item_id: int, timeout: int = 1800) -> dict:
         name = "RescanMovie" if self.kind == "radarr" else "RescanSeries"
         key = "movieId" if self.kind == "radarr" else "seriesId"
-        command = self.http.request("POST", "/api/v3/command", body={"name": name, key: item_id})
+        command = self._mutate(
+            "start library rescan",
+            self.http.request,
+            "POST",
+            "/api/v3/command",
+            body={"name": name, key: item_id},
+        )
         command_id = command.get("id")
         if not command_id:
             raise RuntimeError(f"{self.kind.capitalize()} did not return a command id for {name}")
@@ -245,11 +282,25 @@ class ArrClient:
 
 
 class QBittorrentClient:
-    def __init__(self, service: Service):
+    def __init__(
+        self,
+        service: Service,
+        mutation_guard: ExternalMutationGuard | None = None,
+    ):
         headers = {"Authorization": f"Bearer {service.api_key}"} if service.api_key else None
         self.http = JsonClient(service.url, headers)
+        self.mutation_guard = mutation_guard
         if not service.api_key:
             self.http.request("POST", "/api/v2/auth/login", form={"username": service.username, "password": service.password})
+
+    def _mutate(
+        self, action: str, operation: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        if self.mutation_guard is None:
+            raise RuntimeError("External mutation guard is required")
+        return self.mutation_guard.execute(
+            "qbittorrent", action, operation, *args, **kwargs
+        )
 
     def torrents(self) -> list[dict]:
         return self.http.request("GET", "/api/v2/torrents/info")
@@ -268,25 +319,65 @@ class QBittorrentClient:
         return self.http.request_text("GET", "/api/v2/app/version")
 
     def pause(self, torrent_hash: str) -> None:
-        self.http.request("POST", "/api/v2/torrents/stop", form={"hashes": torrent_hash})
+        self._mutate(
+            "pause torrent",
+            self.http.request,
+            "POST",
+            "/api/v2/torrents/stop",
+            form={"hashes": torrent_hash},
+        )
 
     def resume(self, torrent_hash: str) -> None:
-        self.http.request("POST", "/api/v2/torrents/start", form={"hashes": torrent_hash})
+        self._mutate(
+            "resume torrent",
+            self.http.request,
+            "POST",
+            "/api/v2/torrents/start",
+            form={"hashes": torrent_hash},
+        )
 
     def recheck(self, torrent_hash: str) -> None:
-        self.http.request("POST", "/api/v2/torrents/recheck", form={"hashes": torrent_hash})
+        self._mutate(
+            "recheck torrent",
+            self.http.request,
+            "POST",
+            "/api/v2/torrents/recheck",
+            form={"hashes": torrent_hash},
+        )
 
     def set_location(self, torrent_hash: str, location: str) -> None:
-        self.http.request("POST", "/api/v2/torrents/setLocation", form={"hashes": torrent_hash, "location": location})
+        self._mutate(
+            "set torrent location",
+            self.http.request,
+            "POST",
+            "/api/v2/torrents/setLocation",
+            form={"hashes": torrent_hash, "location": location},
+        )
 
     def set_category(self, torrent_hash: str, category: str) -> None:
-        self.http.request("POST", "/api/v2/torrents/setCategory", form={"hashes": torrent_hash, "category": category})
+        self._mutate(
+            "set torrent category",
+            self.http.request,
+            "POST",
+            "/api/v2/torrents/setCategory",
+            form={"hashes": torrent_hash, "category": category},
+        )
 
     def ensure_category(self, category: str, save_path: str) -> None:
         endpoint = "editCategory" if category in self.categories() else "createCategory"
-        self.http.request(
-            "POST", f"/api/v2/torrents/{endpoint}", form={"category": category, "savePath": save_path}
+        self._mutate(
+            "ensure category",
+            self.http.request,
+            "POST",
+            f"/api/v2/torrents/{endpoint}",
+            form={"category": category, "savePath": save_path},
         )
 
     def delete_category(self, category: str) -> None:
-        self.http.request("POST", "/api/v2/torrents/removeCategories", form={"categories": category})
+        self._mutate(
+            "delete category",
+            self.http.request,
+            "POST",
+            "/api/v2/torrents/removeCategories",
+            form={"categories": category},
+        )

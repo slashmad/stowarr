@@ -24,6 +24,7 @@ fi
 .venv/bin/mypy
 .venv/bin/bandit -q -c pyproject.toml -r src/stowarr
 .venv/bin/pip-audit --strict .
+.venv/bin/python scripts/check-mutation-boundaries.py
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/python -m py_compile src/stowarr/*.py
 

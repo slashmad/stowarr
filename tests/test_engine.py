@@ -942,9 +942,10 @@ class EngineTest(unittest.TestCase):
             source.write_bytes(b"original")
             expected = sha256(source)
             source.write_bytes(b"changed")
+            manager = Stowarr.__new__(Stowarr)
 
             with self.assertRaises(RuntimeError):
-                Stowarr._copy_verified(source, target, expected)
+                manager._copy_verified(source, target, expected)
 
             self.assertFalse(target.exists())
 

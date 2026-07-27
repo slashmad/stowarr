@@ -3,6 +3,9 @@ from unittest.mock import patch
 
 from stowarr.clients import ArrClient, QBittorrentClient
 from stowarr.config import Service
+from stowarr.mutations import ExternalMutationGuard
+
+ALLOW_MUTATIONS = ExternalMutationGuard(lambda: False)
 
 
 class FakeHttp:
@@ -33,7 +36,11 @@ class ArrClientTest(unittest.TestCase):
                     return {"id": 19}
                 return {"id": 19, "status": next(self.statuses)}
 
-        client = ArrClient(Service("http://unused", api_key="unused"), "radarr")
+        client = ArrClient(
+            Service("http://unused", api_key="unused"),
+            "radarr",
+            ALLOW_MUTATIONS,
+        )
         client.http = CommandHttp()
         result = client.rescan(42)
 
@@ -160,7 +167,9 @@ class QBittorrentClientTest(unittest.TestCase):
     @patch("stowarr.clients.JsonClient")
     def test_version_uses_qbittorrent_plain_text_endpoint(self, json_client):
         json_client.return_value.request_text.return_value = "v5.2.1"
-        client = QBittorrentClient(Service("http://qbit", api_key="key"))
+        client = QBittorrentClient(
+            Service("http://qbit", api_key="key"), ALLOW_MUTATIONS
+        )
 
         self.assertEqual(client.version(), "v5.2.1")
         json_client.return_value.request_text.assert_called_once_with("GET", "/api/v2/app/version")
@@ -184,7 +193,9 @@ class QBittorrentClientTest(unittest.TestCase):
     @patch("stowarr.clients.JsonClient")
     def test_temporary_category_is_created_with_destination_path(self, json_client):
         json_client.return_value.request.side_effect = [{}, None]
-        client = QBittorrentClient(Service("http://qbit", api_key="key"))
+        client = QBittorrentClient(
+            Service("http://qbit", api_key="key"), ALLOW_MUTATIONS
+        )
 
         client.ensure_category("radarr-stowarr-moving-hash", "/p1/download")
 

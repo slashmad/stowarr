@@ -56,6 +56,15 @@ unrelated files.
 - Unknown hardlinks, ambiguous matches, and paths outside configured pools are
   blocked.
 - Cross-seed group migration is not automatic.
+- **INVARIANT-RECOVERY-001:** while recovery is required, no operation may
+  mutate qBittorrent, Radarr, Sonarr, or media files. Read-only diagnosis,
+  explicit recovery resolution, and local queue administration remain
+  available.
+
+External API mutations and filesystem writes pass through one fail-closed
+mutation guard. Workflow-level checks provide early errors, while the guarded
+client and filesystem boundaries prevent a missed entry-point check from
+bypassing recovery.
 
 Archive-backed cross-pool execution uses qBittorrent recheck, archive integrity
 testing, isolated extraction, SHA-256 comparison, and a completed *Arr rescan
@@ -310,9 +319,10 @@ mid-transaction.
 
 Waiting entries survive normal container restarts. If Stowarr restarts while a
 Move is already running, that entry becomes **Interrupted** and is never
-automatically replayed. Inspect qBittorrent and the library before creating a
-new plan. Run only one `stowarr-api` replica against a state database and media
-set.
+automatically replayed. The Queue recovery panel pauses later writes, provides
+read-only qBittorrent, *Arr, and filesystem diagnosis, and requires an explicit
+review note before work resumes. Run only one `stowarr-api` replica against a
+state database and media set.
 
 The WebUI **Guide** page summarizes every page and action button.
 

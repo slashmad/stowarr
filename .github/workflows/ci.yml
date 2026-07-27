@@ -44,6 +44,8 @@ jobs:
         run: bandit -q -c pyproject.toml -r src/stowarr
       - name: Python dependency audit
         run: pip-audit --strict .
+      - name: External mutation boundary
+        run: python scripts/check-mutation-boundaries.py
       - name: ESLint
         run: npm run lint
       - name: JavaScript dependency audit
