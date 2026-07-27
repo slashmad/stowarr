@@ -87,11 +87,39 @@ function renderOperationLog(operation){
   log.scrollTop=followTail?log.scrollHeight:previousTop;
 }
 async function loadOperationEvents(operationId){try{const result=await api(`/api/operations/${encodeURIComponent(operationId)}/events`);state.operationEvents.set(Number(operationId),result.events||[])}catch(e){state.operationEvents.set(Number(operationId),[{state:'LOG_UNAVAILABLE',created_at:Math.floor(Date.now()/1000),detail:{error:e.message}}])}}
-async function openOperationDetails(operationId){if(state.operationTracking&&!terminalOperation(state.currentOperation)){showOperationTracking();return}const operation=state.operations.find(item=>String(item.id)===String(operationId));if(!operation)return;if(!terminalOperation(operation)){await trackOperationById(operation.id);return}state.operationTracking=false;state.operationHidden=false;state.currentOperation=operation;renderOperationMinimized();resetOperationSections();resetOperationLog();renderOperationDialog(operation);const dialog=$('#operation-dialog');if(!dialog.open)dialog.showModal();await loadOperationEvents(operation.id);renderOperationDialog(operation)}
+async function openOperationDetails(operationId){
+  await refreshOperations();
+  const operation=state.operations.find(item=>String(item.id)===String(operationId));
+  if(!operation)return;
+  if(!terminalOperation(operation)){
+    if(state.operationTracking&&String(state.currentOperation?.id)===String(operation.id)){
+      showOperationTracking();
+      return;
+    }
+    await trackOperationById(operation.id);
+    return;
+  }
+  const trackingLiveOperation=state.operationTracking&&!terminalOperation(state.currentOperation);
+  if(trackingLiveOperation){
+    state.operationHidden=true;
+    renderOperationMinimized();
+  }else{
+    if(state.operationTracking)finishOperationTracking();
+    state.currentOperation=operation;
+    renderOperationMinimized();
+  }
+  resetOperationSections();
+  resetOperationLog();
+  renderOperationDialog(operation,false,!trackingLiveOperation);
+  const dialog=$('#operation-dialog');
+  if(!dialog.open)dialog.showModal();
+  await loadOperationEvents(operation.id);
+  renderOperationDialog(operation,false,!trackingLiveOperation);
+}
 function operationStepMarkup(step,status,percent,detail='',indeterminate=false){const [,title,description]=step;return `<li class="${status}${indeterminate?' indeterminate':''}"><div class="operation-step-title"><strong>${esc(title)}</strong><b>${indeterminate?'Working':`${Math.round(percent)}%`}</b></div><div class="operation-progress"><i style="width:${indeterminate?100:Math.max(0,Math.min(100,percent))}%"></i></div><small>${esc(detail||description)}</small></li>`}
 function operationGroupMarkup(kind,label,steps,open){if(!steps.length)return '';const body=kind==='remaining'?`<ol class="operation-upcoming-list">${steps.map(([,title,description])=>`<li><strong>${esc(title)}</strong><small>${esc(description)}</small></li>`).join('')}</ol>`:`<ol class="operation-group-list">${steps.map(step=>operationStepMarkup(step,'complete',100)).join('')}</ol>`;const hint=kind==='remaining'&&steps[0]?`Next: ${steps[0][1]}`:`${steps.length} step${steps.length===1?'':'s'}`;return `<details class="operation-group operation-group-${kind}" data-operation-section="${kind}"${open?' open':''}><summary><span>${esc(label)}</span><small>${esc(hint)}</small></summary>${body}</details>`}
-function renderOperationDialog(operation,waiting=false){
-  state.currentOperation=operation;
+function renderOperationDialog(operation,waiting=false,updateTrackedOperation=true){
+  if(updateTrackedOperation)state.currentOperation=operation;
   const terminal=terminalOperation(operation);
   const stateName=operation?.state||'WAITING';
   const progressState=stateName==='FAILED'?(operation?.detail?.failed_after||(operation?.kind==='reconcile'?'PLANNED':'MOVE_PLANNED')):stateName;
@@ -134,35 +162,51 @@ function renderOperationDialog(operation,waiting=false){
   renderOperationMinimized();
 }
 async function refreshOperations(){if(!state.authenticated)return;try{state.operations=await api('/api/operations');renderOperations()}catch(_){}}
-async function startOperationTracking(findOperation,kind='move',queueContext=null){
+async function startOperationTracking(findOperation,kind='move',queueContext=null,startHidden=false){
   const generation=++state.operationTrackingGeneration;
   const dialog=$('#operation-dialog');
   state.operationTracking=true;
-  state.operationHidden=false;
+  state.operationHidden=startHidden;
   state.currentOperation=null;
   resetOperationSections();
   resetOperationLog();
-  renderOperationDialog({kind,state:'WAITING',detail:{}},true);
-  if(!dialog.open)dialog.showModal();
+  const renderTrackedOperation=(operation,waiting=false)=>{
+    if(state.operationHidden){
+      state.currentOperation=operation;
+      renderOperationMinimized();
+    }else{
+      renderOperationDialog(operation,waiting);
+    }
+  };
+  const queueRows=()=>[
+    ...(state.queue||[]).map(item=>({...item,kind:'move'})),
+    ...(state.reconcileQueue||[]).map(item=>({...item,kind:'reconcile'})),
+  ].sort((left,right)=>{
+    const stateOrder={RUNNING:0,QUEUED:1};
+    return (stateOrder[left.state]??2)-(stateOrder[right.state]??2)||(left.position||Number.MAX_SAFE_INTEGER)-(right.position||Number.MAX_SAFE_INTEGER);
+  });
+  const initialQueueJob=queueContext?queueRows().find(item=>item.public_id===queueContext.publicId&&item.kind===queueContext.kind):null;
+  renderTrackedOperation(initialQueueJob?{kind:initialQueueJob.kind,public_id:initialQueueJob.public_id,torrent_hash:initialQueueJob.torrent_hash,state:'WAITING',detail:initialQueueJob.detail||{}}:{kind,state:'WAITING',detail:{}},true);
+  if(!startHidden&&!dialog.open)dialog.showModal();
   clearInterval(state.operationTimer);
   state.operationTimer=null;
   let updating=false;
   let keepTracking=true;
-  const queueRows=()=>queueContext?.kind==='reconcile'?state.reconcileQueue:state.queue;
   const showQueueWaiting=job=>{
     resetOperationSections();
     resetOperationLog();
-    renderOperationDialog({kind:queueContext.kind,public_id:job.public_id,torrent_hash:job.torrent_hash,state:'WAITING',detail:job.detail||{}},true);
+    renderTrackedOperation({kind:job.kind,public_id:job.public_id,torrent_hash:job.torrent_hash,state:'WAITING',detail:job.detail||{}},true);
   };
   const advanceQueue=async()=>{
     await refreshQueue(true);
     if(generation!==state.operationTrackingGeneration)return false;
     const rows=queueRows()||[];
-    const current=rows.find(item=>item.public_id===queueContext.publicId);
+    const current=rows.find(item=>item.public_id===queueContext.publicId&&item.kind===queueContext.kind);
     if(current&&['RUNNING','QUEUED'].includes(current.state))return true;
-    const next=rows.find(item=>item.public_id!==queueContext.publicId&&['RUNNING','QUEUED'].includes(item.state));
+    const next=rows.find(item=>(item.public_id!==queueContext.publicId||item.kind!==queueContext.kind)&&['RUNNING','QUEUED'].includes(item.state));
     if(!next)return false;
     queueContext.publicId=next.public_id;
+    queueContext.kind=next.kind;
     showQueueWaiting(next);
     return true;
   };
@@ -176,7 +220,7 @@ async function startOperationTracking(findOperation,kind='move',queueContext=nul
       if(operation){
         await loadOperationEvents(operation.id);
         if(generation!==state.operationTrackingGeneration)return state.currentOperation;
-        renderOperationDialog(operation);
+        renderTrackedOperation(operation);
         if(terminalOperation(operation))keepTracking=queueContext?await advanceQueue():false;
       }else if(queueContext){
         keepTracking=await advanceQueue();
@@ -195,12 +239,12 @@ async function startOperationTracking(findOperation,kind='move',queueContext=nul
 }
 async function trackOperation(torrentHash,kind='move',afterId=0){return startOperationTracking(operations=>operations.find(item=>item.id>afterId&&item.torrent_hash.toLowerCase()===torrentHash.toLowerCase()&&item.kind===kind),kind)}
 async function trackOperationById(operationId){const kind=state.operations.find(item=>String(item.id)===String(operationId))?.kind||'move';return startOperationTracking(operations=>operations.find(item=>String(item.id)===String(operationId)),kind)}
-async function trackOperationByPublicId(publicId,kind){
+async function trackOperationByPublicId(publicId,kind,startHidden=false){
   const queueContext={publicId,kind:kind||'move'};
-  return startOperationTracking(operations=>operations.find(item=>item.public_id===queueContext.publicId&&item.kind===queueContext.kind),queueContext.kind,queueContext);
+  return startOperationTracking(operations=>operations.find(item=>item.public_id===queueContext.publicId&&item.kind===queueContext.kind),queueContext.kind,queueContext,startHidden);
 }
 function hideOperationTracking(){if(!state.operationTracking||terminalOperation(state.currentOperation))return finishOperationTracking();state.operationHidden=true;const dialog=$('#operation-dialog');if(dialog.open)dialog.close();renderOperationMinimized()}
-function showOperationTracking(){if(!state.operationTracking)return;state.operationHidden=false;renderOperationMinimized();const dialog=$('#operation-dialog');if(!dialog.open)dialog.showModal()}
+function showOperationTracking(){if(!state.operationTracking)return;state.operationHidden=false;renderOperationDialog(state.currentOperation,state.currentOperation?.state==='WAITING');const dialog=$('#operation-dialog');if(!dialog.open)dialog.showModal()}
 function finishOperationTracking(){state.operationTrackingGeneration++;clearInterval(state.operationTimer);state.operationTimer=null;state.operationTracking=false;state.operationHidden=false;state.currentOperation=null;renderOperationMinimized();const dialog=$('#operation-dialog');if(dialog.open)dialog.close()}
 function rejectOperationTracking(torrentHash,kind,message,afterId=0){const registered=state.operations.find(item=>item.id>afterId&&item.torrent_hash.toLowerCase()===torrentHash.toLowerCase()&&item.kind===kind);if(registered){renderOperationDialog(registered);return}state.operationTrackingGeneration++;clearInterval(state.operationTimer);state.operationTimer=null;state.operationEvents=[];renderOperationDialog({id:0,kind,torrent_hash:torrentHash,state:'FAILED',detail:{torrent_name:state.movePlan?.torrent_name||torrentHash,error:`Operation was rejected before it started: ${message}. No files were changed by this request.`,live:{state:kind==='move'?'MOVE_PLANNED':'PLANNED',percent:0,message:'The API did not register the operation'}}})}
 function navigate(page){$$('.page').forEach(x=>x.classList.toggle('active',x.id===page));$$('.nav-item').forEach(x=>x.classList.toggle('active',x.dataset.page===page));$('.sidebar').classList.remove('open');location.hash=page;if(page==='move')loadQbitCatalog();if(page==='queue')refreshQueue()}
@@ -338,7 +382,7 @@ function renderQueue(){
       const positionLabel=item.state==='RUNNING'?'Running':item.state==='QUEUED'?`#${item.position||'—'} global`:'—';
       const error=item.error?`<small class="queue-error">${esc(item.error)}</small>`:'';
       const route=kind==='move'?`${esc(detail.current_pool||'—')} → ${esc(item.target_pool)}`:esc(detail.target_pool||'—');
-      return `<tr><td><code>${esc(item.public_id)}</code><small>${esc(positionLabel)}</small></td><td class="queue-torrent"><strong>${esc(detail.torrent_name||item.torrent_hash)}</strong><code>${esc(item.torrent_hash)}</code>${error}</td><td>${route}</td><td>${badge(item.state)}</td><td>${operation}</td><td>${fmtTime(item.updated_at)}</td><td>${action}</td></tr>`;
+      return `<tr data-queue-public-id="${esc(item.public_id)}"><td><code>${esc(item.public_id)}</code><small>${esc(positionLabel)}</small></td><td class="queue-torrent"><strong>${esc(detail.torrent_name||item.torrent_hash)}</strong><code>${esc(item.torrent_hash)}</code>${error}</td><td>${route}</td><td>${badge(item.state)}</td><td>${operation}</td><td>${fmtTime(item.updated_at)}</td><td>${action}</td></tr>`;
     }).join(''):`<tr><td colspan="7" class="empty">The ${kind==='move'?'Move':'Reconcile'} queue is empty</td></tr>`;
     const removable=rows.filter(item=>item.state!=='RUNNING').length;
     const clearButton=$(`.clear-queue[data-kind="${kind}"]`);
@@ -350,9 +394,27 @@ function renderQueue(){
   $('#queue-count').textContent=active||'';
 }
 
+function automaticallyTrackRunningQueue(){
+  const runningMove=(state.queue||[]).find(item=>item.state==='RUNNING');
+  const runningReconcile=(state.reconcileQueue||[]).find(item=>item.state==='RUNNING');
+  const running=runningMove||runningReconcile;
+  if(!running)return;
+  if(state.operationTracking){
+    if(!state.operationHidden||!terminalOperation(state.currentOperation))return;
+    finishOperationTracking();
+  }
+  trackOperationByPublicId(running.public_id,runningMove?'move':'reconcile',true);
+}
+
 async function refreshQueue(quiet=false){
   if(!state.authenticated)return;
-  try{[state.queue,state.reconcileQueue]=await Promise.all([api('/api/queue'),api('/api/reconcile-queue')]);renderQueue()}catch(error){if(!quiet||location.hash==='#queue')toast(`Could not load queues: ${error.message}`)}
+  const previousActiveReconcile=activeReconcileQueueSignature();
+  try{
+    [state.queue,state.reconcileQueue]=await Promise.all([api('/api/queue'),api('/api/reconcile-queue')]);
+    renderQueue();
+    automaticallyTrackRunningQueue();
+    if(previousActiveReconcile!==activeReconcileQueueSignature()&&state.sync[state.syncApp])renderSync(state.sync[state.syncApp]);
+  }catch(error){if(!quiet||location.hash==='#queue')toast(`Could not load queues: ${error.message}`)}
 }
 
 async function cancelQueue(id,kind='move'){
@@ -468,6 +530,17 @@ function setSyncApp(app){
     $('#sync-rows').innerHTML=`<tr><td colspan="7" class="empty">Run the ${esc(app[0].toUpperCase()+app.slice(1))} audit to compare hashes</td></tr>`;
   }
 }
+function activeReconcileQueueItem(hash){
+  const normalized=String(hash||'').toLowerCase();
+  return (state.reconcileQueue||[]).find(item=>['QUEUED','RUNNING'].includes(item.state)&&String(item.torrent_hash||'').toLowerCase()===normalized);
+}
+function activeReconcileQueueSignature(){
+  return (state.reconcileQueue||[])
+    .filter(item=>['QUEUED','RUNNING'].includes(item.state))
+    .map(item=>`${String(item.torrent_hash||'').toLowerCase()}:${item.state}`)
+    .sort()
+    .join('|');
+}
 function renderSync(result){
   const missingLabel=result.app==='sonarr'?'No matching Sonarr series':'No matching Radarr movie';
   const hidden=state.syncHiddenStatuses[result.app]||(state.syncHiddenStatuses[result.app]=new Set());
@@ -476,9 +549,13 @@ function renderSync(result){
   const visibleRows=result.rows.filter(row=>!hidden.has(row.status));
   const rowMarkup=row=>{
     const issue=row.status!=='in-sync';
+    const queued=activeReconcileQueueItem(row.hash);
     const canRepairCategory=row.status==='category-unconfigured'&&row.category_repairable;
     const categoryAction=canRepairCategory?`<button type="button" class="secondary compact repair-sync-category" data-app="${esc(result.app)}" data-hash="${esc(row.hash)}" data-name="${esc(row.torrent_name)}" data-current-category="${esc(row.category||'none')}" data-category="${esc(row.expected_category)}" data-pool="${esc(row.qbit_pool)}" ${state.config?.apply?'':'disabled'}>Set category</button>`:'';
-    return `<tr title="${esc(row.reason)}"><td>${badge(row.status)}</td><td class="sync-title-cell"><strong>${esc(row.torrent_name)}</strong><small>${esc(row.item_title||missingLabel)}</small>${issue?`<small class="sync-diagnosis">${esc(row.reason)}</small>`:''}</td><td><span class="hash-short" title="${esc(row.hash)}">${esc(row.hash.slice(0,12))}…</span></td><td><span class="category">${esc(row.category||'none')}</span>${row.expected_category&&row.category!==row.expected_category?`<small class="sync-expected">Expected: ${esc(row.expected_category)}</small>`:''}</td><td>${esc(row.qbit_pool||'—')}</td><td class="path">${esc(row.arr_path||row.reason)}${issue&&row.action?`<small class="sync-action"><b>${canRepairCategory?'Stowarr fix available':'Manual fix'}:</b> ${esc(row.action)}</small>`:''}</td><td><div class="sync-row-actions">${categoryAction}<button class="link-button inspect" data-hash="${esc(row.hash)}">${issue?'Diagnose':'Reconcile'}</button></div></td></tr>`;
+    const primaryAction=queued
+      ?`<button class="link-button view-sync-queue" data-public-id="${esc(queued.public_id)}" title="Open this Reconcile job in Queue">${queued.state==='RUNNING'?'Running':'In queue'}</button>`
+      :`<button class="link-button inspect" data-hash="${esc(row.hash)}">${issue?'Diagnose':'Reconcile'}</button>`;
+    return `<tr title="${esc(row.reason)}"><td>${badge(row.status)}</td><td class="sync-title-cell"><strong>${esc(row.torrent_name)}</strong><small>${esc(row.item_title||missingLabel)}</small>${issue?`<small class="sync-diagnosis">${esc(row.reason)}</small>`:''}</td><td><span class="hash-short" title="${esc(row.hash)}">${esc(row.hash.slice(0,12))}…</span></td><td><span class="category">${esc(row.category||'none')}</span>${row.expected_category&&row.category!==row.expected_category?`<small class="sync-expected">Expected: ${esc(row.expected_category)}</small>`:''}</td><td>${esc(row.qbit_pool||'—')}</td><td class="path">${esc(row.arr_path||row.reason)}${issue&&row.action?`<small class="sync-action"><b>${canRepairCategory?'Stowarr fix available':'Manual fix'}:</b> ${esc(row.action)}</small>`:''}</td><td><div class="sync-row-actions">${categoryAction}${primaryAction}</div></td></tr>`;
   };
   const issues=visibleRows.filter(row=>row.status!=='in-sync');
   const healthy=visibleRows.filter(row=>row.status==='in-sync');
@@ -506,9 +583,15 @@ async function repairSyncCategory(button){
   }
 }
 async function runSync(){const app=state.syncApp;$('#sync-loading').classList.remove('hidden');$('#run-sync').disabled=true;try{const result=await api(`/api/sync/${app}`);state.sync[app]=result;state.syncExpanded.delete(app);renderSync(result)}catch(e){toast(`Audit failed: ${e.message}`)}finally{$(`#sync-loading`).classList.add('hidden');$('#run-sync').disabled=false}}
+async function viewSyncQueue(publicId){
+  navigate('queue');
+  await refreshQueue(true);
+  const row=document.querySelector(`[data-queue-public-id="${CSS.escape(publicId)}"]`);
+  if(row)row.scrollIntoView({behavior:'smooth',block:'center'});
+}
 async function inspect(hash){navigate('reconcile');$('#torrent-hash').value=hash;$('#global-hash').value=hash;$('#plan-loading').classList.remove('hidden');$('#plan-result').innerHTML='';try{state.plan=await api(`/api/plan/${encodeURIComponent(hash.trim())}`);renderPlan(state.plan)}catch(e){$('#plan-result').innerHTML=`<div class="alert"><div class="alert-head">Request failed</div><p>${esc(e.message)}</p></div>`}finally{$('#plan-loading').classList.add('hidden')}}
 async function refreshServiceStatus(){if(!state.authenticated)return;try{state.serviceStatus=await api('/api/status');renderServiceStatus()}catch(e){state.serviceStatus={version:state.config?.version,services:{stowarr_api:{status:'unavailable',error:e.message},qbittorrent:{status:'unavailable',error:e.message},radarr:{status:'unavailable',error:e.message},sonarr:{status:'unavailable',error:e.message}}};renderServiceStatus()}}
-async function load(){try{const [config,connections,status,runtime,operations,queue,reconcileQueue,security,sessions]=await Promise.all([api('/api/config'),api('/api/settings/connections'),api('/api/status'),api('/api/settings/runtime'),api('/api/operations'),api('/api/queue'),api('/api/reconcile-queue'),api('/api/security/events'),api('/api/auth/sessions')]);state.config=config;state.connections=connections;state.serviceStatus=status;state.runtime=runtime;state.operations=operations;state.queue=queue;state.reconcileQueue=reconcileQueue;state.securityEvents=security.events;state.sessions=sessions.sessions;renderConfig();renderConnections();renderServiceStatus();renderRuntime();renderOperations();renderQueue();renderSecurity()}catch(e){toast(`Could not load Stowarr: ${e.message}`)}}
+async function load(){try{const [config,connections,status,runtime,operations,queue,reconcileQueue,security,sessions]=await Promise.all([api('/api/config'),api('/api/settings/connections'),api('/api/status'),api('/api/settings/runtime'),api('/api/operations'),api('/api/queue'),api('/api/reconcile-queue'),api('/api/security/events'),api('/api/auth/sessions')]);state.config=config;state.connections=connections;state.serviceStatus=status;state.runtime=runtime;state.operations=operations;state.queue=queue;state.reconcileQueue=reconcileQueue;state.securityEvents=security.events;state.sessions=sessions.sessions;renderConfig();renderConnections();renderServiceStatus();renderRuntime();renderOperations();renderQueue();automaticallyTrackRunningQueue();renderSecurity()}catch(e){toast(`Could not load Stowarr: ${e.message}`)}}
 async function revokeSessions(){if(!await confirmAction({title:'Sign out all sessions?',message:'Every active WebUI session, including this one, will be revoked.',confirmLabel:'Sign out all',danger:true}))return;try{await api('/api/auth/sessions/revoke',{method:'POST'});state.authenticated=false;state.config=null;showLogin('All WebUI sessions were signed out.')}catch(e){toast(`Sessions were not revoked: ${e.message}`)}}
 async function saveRuntime(event){event.preventDefault();const apply=$('#runtime-apply').checked;if(!await confirmAction({title:`${apply?'Enable':'Disable'} confirmed write operations?`,message:'Move and Reconcile still require an explicit plan-bound confirmation.',details:[['Execution mode',apply?'Write mode':'Dry run']],confirmLabel:apply?'Enable writes':'Enable dry run',danger:apply}))return;const button=event.currentTarget.querySelector('button');button.disabled=true;button.textContent='Validating mounts…';try{state.runtime=await api('/api/settings/runtime',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apply})});state.config.apply=state.runtime.apply;renderRuntime();renderConfig();toast(`Execution mode: ${apply?'Write mode':'Dry run'}`)}catch(e){$('#runtime-apply').checked=state.runtime.apply;toast(`Execution mode was not changed: ${e.message}`)}finally{button.disabled=false;button.textContent='Save execution mode'}}
 async function saveConnections(event){event.preventDefault();const form=event.currentTarget;const button=$('#save-connections');const services={qbittorrent:{url:form.elements['qbittorrent-url'].value.trim(),api_key:form.elements['qbittorrent-api-key'].value.trim(),username:form.elements['qbittorrent-username'].value.trim(),password:form.elements['qbittorrent-password'].value},radarr:{url:form.elements['radarr-url'].value.trim(),api_key:form.elements['radarr-api-key'].value.trim()},sonarr:{url:form.elements['sonarr-url'].value.trim(),api_key:form.elements['sonarr-api-key'].value.trim()}};const selected=Object.entries(services).filter(([,service])=>service.url);if(!selected.length){$('#setup-error').textContent='Enter the URL and credentials for at least one service';$('#setup-error').classList.remove('hidden');return}if(!await confirmAction({title:'Test and save configured services?',message:'Existing credentials are kept for blank secret fields. Only services with a URL are tested.',details:selected.map(([name,service])=>[name==='qbittorrent'?'qBittorrent':name[0].toUpperCase()+name.slice(1),service.url]),confirmLabel:'Test and save'}))return;button.disabled=true;button.textContent='Testing connections…';$('#setup-error').classList.add('hidden');try{const result=await api('/api/settings/connections',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({services})});state.connections=result;renderConnections();form.elements['qbittorrent-api-key'].value='';form.elements['qbittorrent-password'].value='';form.elements['radarr-api-key'].value='';form.elements['sonarr-api-key'].value='';state.qbitCatalog=null;state.routingAudit=null;await refreshServiceStatus();$('#connection-setup').close();toast(`${selected.length} configured service${selected.length===1?'':'s'} tested and saved`)}catch(e){$('#setup-error').textContent=e.message;$('#setup-error').classList.remove('hidden')}finally{button.disabled=false;button.textContent='Test and save configured services'}}
@@ -551,6 +634,8 @@ document.addEventListener('click',event=>{
   }
   const categoryRepair=event.target.closest('.repair-sync-category');
   if(categoryRepair)repairSyncCategory(categoryRepair);
+  const queuedSync=event.target.closest('.view-sync-queue');
+  if(queuedSync)viewSyncQueue(queuedSync.dataset.publicId);
   const syncGroup=event.target.closest('.sync-group-toggle');
   if(syncGroup){
     const app=syncGroup.dataset.syncGroup;
