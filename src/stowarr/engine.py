@@ -573,10 +573,19 @@ class Stowarr:
         return queued
 
     def submit_move(self, token: str, torrent_hash: str, payload: dict) -> dict:
-        """Run immediately only when the shared slot and both queues are empty."""
-        if not self.config.apply:
-            raise RuntimeError("Move is unavailable in dry-run mode")
+        """Record dry runs directly; serialize or queue confirmed write operations."""
         authorized = self.consume_confirmation(token, "move", torrent_hash, payload)
+        if not self.config.apply:
+            with self._move_lock:
+                return {
+                    **self._run_move(
+                        torrent_hash,
+                        authorized["payload"]["targetPool"],
+                        authorized["payload"]["additionalFiles"],
+                    ),
+                    "kind": "move",
+                    "disposition": "direct",
+                }
         if self.store.has_active_queue_work():
             return {
                 **self._enqueue_authorized_move(torrent_hash, authorized),
@@ -609,10 +618,17 @@ class Stowarr:
             self._move_lock.release()
 
     def submit_reconcile(self, token: str, torrent_hash: str, payload: dict) -> dict:
-        """Run immediately only when the shared slot and both queues are empty."""
-        if not self.config.apply:
-            raise RuntimeError("Reconcile is unavailable in dry-run mode")
+        """Record dry runs directly; serialize or queue confirmed write operations."""
         authorized = self.consume_confirmation(token, "reconcile", torrent_hash, payload)
+        if not self.config.apply:
+            return {
+                **self.reconcile(
+                    torrent_hash,
+                    set(authorized["payload"]["auxiliaryFiles"]),
+                ),
+                "kind": "reconcile",
+                "disposition": "direct",
+            }
         if self.store.has_active_queue_work():
             return {
                 **self._enqueue_authorized_reconcile(torrent_hash, authorized),
@@ -1913,6 +1929,7 @@ class Stowarr:
             for pool in self.config.pools
         }
         all_torrents = self.qbit.torrents()
+        qbit_categories = getattr(self.qbit, "categories", lambda: {})()
         all_hashes = {
             str(torrent.get("hash") or "").casefold()
             for torrent in all_torrents if torrent.get("hash")
@@ -1935,6 +1952,7 @@ class Stowarr:
             item = items.get(item_id) if item_id else None
             expected_root = None
             expected_category = None
+            category_repairable = False
             if pool:
                 expected_root = pool.radarr_root if app == "radarr" else pool.sonarr_root
                 expected_category = pool.radarr_category if app == "radarr" else pool.sonarr_category
@@ -1969,6 +1987,18 @@ class Stowarr:
             elif not category_pool or category_pool[1] != app:
                 status, reason = "category-unconfigured", (
                     f'qBittorrent category "{category or "none"}" is not a configured {service} pool route'
+                )
+                expected_route = qbit_categories.get(expected_category) if expected_category else None
+                route_path = str((expected_route or {}).get("savePath") or "")
+                save_path = Path(str(torrent.get("save_path") or ""))
+                category_repairable = bool(
+                    not category_pool
+                    and expected_route
+                    and Path(route_path) in pool.download_roots
+                    and any(
+                        save_path == root or save_path.is_relative_to(root)
+                        for root in pool.download_roots
+                    )
                 )
                 issues.append({
                     "code": "QBITTORRENT_CATEGORY_UNROUTED",
@@ -2017,6 +2047,7 @@ class Stowarr:
                 "arr_path": item.get("path") if item else None,
                 "expected_root": str(expected_root) if expected_root else None,
                 "expected_category": expected_category,
+                "category_repairable": category_repairable,
                 "status": status,
                 "reason": reason,
                 "issues": issues,
@@ -2062,6 +2093,83 @@ class Stowarr:
             "issues": sum(row["status"] != "in-sync" for row in rows),
             "rows": rows,
         }
+
+    def repair_sync_category(self, app: str, torrent_hash: str) -> dict:
+        """Assign the configured pool category after revalidating history, path, and route."""
+        if app not in self.arr:
+            raise ValueError(f"Unsupported application: {app}")
+        if not self.config.apply:
+            raise RuntimeError("Category repair is unavailable in dry-run mode")
+        if self.store.has_active_queue_work():
+            raise RuntimeError("Wait for the active Move/Reconcile queue to finish before changing a category")
+        if not self._move_lock.acquire(blocking=False):
+            raise RuntimeError("Wait for the active Move/Reconcile operation to finish before changing a category")
+        try:
+            torrent = self.qbit.torrent(torrent_hash)
+            if not torrent:
+                raise ValueError("Torrent not found in qBittorrent")
+            pool = self.config.pool_for_path(torrent.get("save_path", ""))
+            if not pool:
+                raise RuntimeError("The qBittorrent save path is outside configured pools")
+            save_path = Path(str(torrent.get("save_path") or ""))
+            if not any(
+                save_path == root or save_path.is_relative_to(root)
+                for root in pool.download_roots
+            ):
+                raise RuntimeError(
+                    "Automatic category repair is limited to torrents below a configured download root"
+                )
+            current_category = str(torrent.get("category") or "")
+            current_route = self.config.pool_for_category(current_category)
+            expected_category = pool.radarr_category if app == "radarr" else pool.sonarr_category
+            if current_category == expected_category:
+                return {
+                    "changed": False,
+                    "hash": torrent_hash,
+                    "app": app,
+                    "pool": pool.name,
+                    "previous_category": current_category,
+                    "category": expected_category,
+                }
+            if current_route:
+                raise RuntimeError(
+                    "The current category is already a configured route; resolve this route conflict manually"
+                )
+            history = self.arr[app].history_for_downloads({torrent_hash.casefold()})
+            if torrent_hash.casefold() not in history:
+                raise RuntimeError(
+                    f"{app.capitalize()} does not associate this exact qBittorrent hash with an item"
+                )
+            category = self.qbit.categories().get(expected_category)
+            category_path = str((category or {}).get("savePath") or "")
+            if not category or Path(category_path) not in pool.download_roots:
+                raise RuntimeError(
+                    f'qBittorrent category "{expected_category}" is missing or does not point '
+                    f"to a configured {pool.name} download root"
+                )
+            self.qbit.set_category(torrent_hash, expected_category)
+            self.store.security_event(
+                "sync-category-repaired",
+                "admin",
+                "",
+                {
+                    "app": app,
+                    "torrent_hash": torrent_hash.casefold(),
+                    "pool": pool.name,
+                    "previous_category": current_category,
+                    "category": expected_category,
+                },
+            )
+            return {
+                "changed": True,
+                "hash": torrent_hash,
+                "app": app,
+                "pool": pool.name,
+                "previous_category": current_category,
+                "category": expected_category,
+            }
+        finally:
+            self._move_lock.release()
 
     def qbit_search(self, query: str, limit: int = 100) -> dict:
         """Search qBittorrent directly without consulting Radarr or Sonarr."""
