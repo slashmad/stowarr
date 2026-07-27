@@ -1,4 +1,4 @@
-const state={authenticated:false,auth:null,config:null,connections:null,serviceStatus:null,runtime:null,operations:[],queue:[],reconcileQueue:[],operationEvents:new Map(),selectedHistory:new Set(),securityEvents:[],sessions:[],plan:null,movePlan:null,moveTorrent:null,qbitCatalog:null,routingAudit:null,hiddenMoveColumns:new Set(),syncApp:'radarr',sync:{},syncExpanded:new Set(),operationSections:{completed:false,remaining:false},operationTracking:false,operationTrackingGeneration:0,operationHidden:false,currentOperation:null};
+const state={authenticated:false,auth:null,config:null,connections:null,serviceStatus:null,runtime:null,operations:[],queue:[],reconcileQueue:[],operationEvents:new Map(),selectedHistory:new Set(),securityEvents:[],sessions:[],plan:null,movePlan:null,moveTorrent:null,qbitCatalog:null,routingAudit:null,hiddenMoveColumns:new Set(),syncApp:'radarr',sync:{},syncExpanded:new Set(),syncHiddenStatuses:{radarr:new Set(),sonarr:new Set()},operationSections:{completed:false,remaining:false},operationTracking:false,operationTrackingGeneration:0,operationHidden:false,currentOperation:null};
 const $=(s,r=document)=>r.querySelector(s);const $$=(s,r=document)=>[...r.querySelectorAll(s)];
 const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const fmtTime=v=>v?new Date(v*1000).toLocaleString(): '—';
@@ -457,8 +457,54 @@ async function loadQbitCatalog(force=false){if(state.qbitCatalog&&state.routingA
 function selectMoveTorrent(hash){const torrent=catalogRows().find(row=>row.hash===hash);if(!torrent)return;state.moveTorrent=torrent;$('#move-hash').value=hash;$('#move-selected-name').textContent=torrent.name;$('#move-selected-hash').textContent=hash;$('.move-selection').classList.remove('hidden');const destination=state.config.pools.find(pool=>pool.name!==torrent.pool)||state.config.pools[0];if(destination)$('#move-target').value=destination.name;$('#move-result').innerHTML='';$('.move-selection').scrollIntoView({behavior:'smooth',block:'nearest'})}
 function hashCell(file,label){if(!file)return `<div><small>${esc(label)}</small><strong>Not applicable</strong><span>Packed torrent: media is not part of the torrent manifest</span></div>`;if(!file.exists)return `<div><small>${esc(label)}</small><strong>Not present</strong><code class="path">${esc(file.path)}</code></div>`;return `<div><small>${esc(label)}</small><strong title="${esc(file.sha256)}">SHA-256 ${esc(file.sha256.slice(0,16))}…</strong><span>inode ${file.inode} · links ${file.links}</span><code class="path">${esc(file.path)}</code></div>`}
 async function verifyPlan(){const plan=state.plan;if(!plan||plan.status!=='ready')return;const button=$('#verify-plan');button.disabled=true;button.textContent='Hashing files…';$('#verification-result').innerHTML='<div class="loading"><span></span>Hashing torrent, old library, and new library paths. This may take several minutes…</div>';try{const result=await api(`/api/verify/${encodeURIComponent(plan.torrent_hash)}`,{method:'POST'});const videos=result.video_files.map(file=>{const packed=file.strategy==='archive-reextract'||file.strategy==='verified-copy';const valid=packed?file.new_matches_torrent!==false:file.old_matches_torrent&&file.new_matches_torrent!==false;return `<div class="verification-file"><div class="verification-head">${badge(valid?'verified':'mismatch')}<strong>${packed?'Extracted media comparison':'Direct torrent media comparison'}</strong></div><div class="hash-grid">${hashCell(file.torrent,'qBittorrent media file')}${hashCell(file.old_library,'Old library path')}${hashCell(file.new_library,'New library path')}</div><p>${packed?'The archive set remains authoritative; extracted media is verified independently.':`Old matches torrent: ${file.old_matches_torrent?'Yes':'No'}`} · New matches expected content: <b>${file.new_matches_torrent===null?'Not present yet':file.new_matches_torrent?'Yes':'No'}</b></p></div>`}).join('');const sidecarMatched=result.sidecar_files.filter(x=>x.matches_target===true).length;const sidecarMissing=result.sidecar_files.filter(x=>x.matches_target===null).length;const sidecarDifferent=result.sidecar_files.filter(x=>x.matches_target===false).length;$('#verification-result').innerHTML=`<div class="verification ${result.status}"><div class="verification-title"><strong>Hash verification: ${esc(result.status)}</strong><span>${result.sidecar_files.length} sidecars · ${sidecarMatched} matching · ${sidecarMissing} destination missing · ${sidecarDifferent} different</span></div>${videos}</div>`}catch(e){$('#verification-result').innerHTML=`<div class="alert"><div class="alert-head">Hash verification failed</div><p>${esc(e.message)}</p></div>`}finally{button.disabled=false;button.textContent='Verify content hashes'}}
-function setSyncApp(app){state.syncApp=app;$$('.service-tab').forEach(x=>x.classList.toggle('active',x.dataset.app===app));$('#sync-title').textContent=`${app[0].toUpperCase()+app.slice(1)} hash audit`;const cached=state.sync[app];if(cached)renderSync(cached);else{$('#sync-summary').innerHTML='';$('#sync-rows').innerHTML=`<tr><td colspan="7" class="empty">Run the ${esc(app[0].toUpperCase()+app.slice(1))} audit to compare hashes</td></tr>`}}
-function renderSync(result){const missingLabel=result.app==='sonarr'?'No matching Sonarr series':'No matching Radarr movie';const rowMarkup=row=>{const issue=row.status!=='in-sync';return `<tr title="${esc(row.reason)}"><td>${badge(row.status)}</td><td class="sync-title-cell"><strong>${esc(row.torrent_name)}</strong><small>${esc(row.item_title||missingLabel)}</small>${issue?`<small class="sync-diagnosis">${esc(row.reason)}</small>`:''}</td><td><span class="hash-short" title="${esc(row.hash)}">${esc(row.hash.slice(0,12))}…</span></td><td><span class="category">${esc(row.category||'none')}</span>${row.expected_category&&row.category!==row.expected_category?`<small class="sync-expected">Expected: ${esc(row.expected_category)}</small>`:''}</td><td>${esc(row.qbit_pool||'—')}</td><td class="path">${esc(row.arr_path||row.reason)}${issue&&row.action?`<small class="sync-action"><b>Manual fix:</b> ${esc(row.action)}</small>`:''}</td><td><button class="link-button inspect" data-hash="${esc(row.hash)}">${issue?'Diagnose':'Reconcile'}</button></td></tr>`};const issues=result.rows.filter(row=>row.status!=='in-sync');const healthy=result.rows.filter(row=>row.status==='in-sync');const expanded=state.syncExpanded.has(result.app);const healthyGroup=healthy.length?`<tr class="sync-group-row"><td colspan="7"><button type="button" class="sync-group-toggle" data-sync-group="${esc(result.app)}" aria-expanded="${expanded}"><span><i>${expanded?'▾':'▸'}</i><strong>In sync</strong><small>${healthy.length} ${healthy.length===1?'title':'titles'} without detected issues</small></span><b>${expanded?'Collapse':'Show'}</b></button></td></tr>${expanded?healthy.map(rowMarkup).join(''):''}`:'';$('#sync-summary').innerHTML=`<span><strong>${result.scanned}</strong><small>qBit torrents</small></span><span><strong>${result.matched_history}</strong><small>hash matches</small></span><span><strong>${result.in_sync}</strong><small>in sync</small></span><span><strong>${result.issues}</strong><small>issues</small></span>`;$('#sync-rows').innerHTML=result.rows.length?`${issues.map(rowMarkup).join('')}${healthyGroup}`:`<tr><td colspan="7" class="empty">No ${esc(result.app)} torrents found in qBittorrent</td></tr>`}
+function setSyncApp(app){
+  state.syncApp=app;
+  $$('.service-tab').forEach(x=>x.classList.toggle('active',x.dataset.app===app));
+  $('#sync-title').textContent=`${app[0].toUpperCase()+app.slice(1)} hash audit`;
+  const cached=state.sync[app];
+  if(cached)renderSync(cached);else{
+    $('#sync-summary').innerHTML='';
+    $('#sync-filters').innerHTML='';
+    $('#sync-rows').innerHTML=`<tr><td colspan="7" class="empty">Run the ${esc(app[0].toUpperCase()+app.slice(1))} audit to compare hashes</td></tr>`;
+  }
+}
+function renderSync(result){
+  const missingLabel=result.app==='sonarr'?'No matching Sonarr series':'No matching Radarr movie';
+  const hidden=state.syncHiddenStatuses[result.app]||(state.syncHiddenStatuses[result.app]=new Set());
+  const statusCounts=new Map();
+  result.rows.forEach(row=>statusCounts.set(row.status,(statusCounts.get(row.status)||0)+1));
+  const visibleRows=result.rows.filter(row=>!hidden.has(row.status));
+  const rowMarkup=row=>{
+    const issue=row.status!=='in-sync';
+    const canRepairCategory=row.status==='category-unconfigured'&&row.category_repairable;
+    const categoryAction=canRepairCategory?`<button type="button" class="secondary compact repair-sync-category" data-app="${esc(result.app)}" data-hash="${esc(row.hash)}" data-name="${esc(row.torrent_name)}" data-current-category="${esc(row.category||'none')}" data-category="${esc(row.expected_category)}" data-pool="${esc(row.qbit_pool)}" ${state.config?.apply?'':'disabled'}>Set category</button>`:'';
+    return `<tr title="${esc(row.reason)}"><td>${badge(row.status)}</td><td class="sync-title-cell"><strong>${esc(row.torrent_name)}</strong><small>${esc(row.item_title||missingLabel)}</small>${issue?`<small class="sync-diagnosis">${esc(row.reason)}</small>`:''}</td><td><span class="hash-short" title="${esc(row.hash)}">${esc(row.hash.slice(0,12))}…</span></td><td><span class="category">${esc(row.category||'none')}</span>${row.expected_category&&row.category!==row.expected_category?`<small class="sync-expected">Expected: ${esc(row.expected_category)}</small>`:''}</td><td>${esc(row.qbit_pool||'—')}</td><td class="path">${esc(row.arr_path||row.reason)}${issue&&row.action?`<small class="sync-action"><b>${canRepairCategory?'Stowarr fix available':'Manual fix'}:</b> ${esc(row.action)}</small>`:''}</td><td><div class="sync-row-actions">${categoryAction}<button class="link-button inspect" data-hash="${esc(row.hash)}">${issue?'Diagnose':'Reconcile'}</button></div></td></tr>`;
+  };
+  const issues=visibleRows.filter(row=>row.status!=='in-sync');
+  const healthy=visibleRows.filter(row=>row.status==='in-sync');
+  const expanded=state.syncExpanded.has(result.app);
+  const healthyGroup=healthy.length?`<tr class="sync-group-row"><td colspan="7"><button type="button" class="sync-group-toggle" data-sync-group="${esc(result.app)}" aria-expanded="${expanded}"><span><i>${expanded?'▾':'▸'}</i><strong>In sync</strong><small>${healthy.length} ${healthy.length===1?'title':'titles'} without detected issues</small></span><b>${expanded?'Collapse':'Show'}</b></button></td></tr>${expanded?healthy.map(rowMarkup).join(''):''}`:'';
+  $('#sync-summary').innerHTML=`<span><strong>${result.scanned}</strong><small>qBit torrents</small></span><span><strong>${result.matched_history}</strong><small>hash matches</small></span><span><strong>${result.in_sync}</strong><small>in sync</small></span><span><strong>${result.issues}</strong><small>issues</small></span><span><strong>${visibleRows.length}</strong><small>visible</small></span>`;
+  $('#sync-filters').innerHTML=`<span>Status</span><div>${[...statusCounts].map(([status,count])=>`<button type="button" class="sync-status-filter ${hidden.has(status)?'':'active'}" data-status="${esc(status)}" aria-pressed="${hidden.has(status)?'false':'true'}">${badge(status)}<b>${count}</b></button>`).join('')}</div><button type="button" class="text-button" id="sync-issues-only">Issues only</button><button type="button" class="text-button" id="sync-show-all">Show all</button>`;
+  $('#sync-rows').innerHTML=!result.rows.length?`<tr><td colspan="7" class="empty">No ${esc(result.app)} torrents found in qBittorrent</td></tr>`:visibleRows.length?`${issues.map(rowMarkup).join('')}${healthyGroup}`:'<tr><td colspan="7" class="empty">No audit rows match the selected status filters</td></tr>';
+}
+async function repairSyncCategory(button){
+  const app=button.dataset.app;
+  const hash=button.dataset.hash;
+  const category=button.dataset.category;
+  if(!await confirmAction({title:`Set qBittorrent category to ${category}?`,message:'Stowarr will revalidate the exact *Arr hash association, torrent save path, and configured qBittorrent category route before changing anything.',details:[['Torrent',button.dataset.name],['Current category',button.dataset.currentCategory],['New category',category],['Authoritative pool',button.dataset.pool]],confirmLabel:'Set category'}))return;
+  button.disabled=true;
+  button.textContent='Validating…';
+  try{
+    const result=await api(`/api/sync/${encodeURIComponent(app)}/${encodeURIComponent(hash)}/category`,{method:'POST'});
+    toast(result.changed?`Category changed to ${result.category}`:`Category is already ${result.category}`);
+    await runSync();
+  }catch(error){
+    toast(`Category was not changed: ${error.message}`);
+    button.disabled=false;
+    button.textContent='Set category';
+  }
+}
 async function runSync(){const app=state.syncApp;$('#sync-loading').classList.remove('hidden');$('#run-sync').disabled=true;try{const result=await api(`/api/sync/${app}`);state.sync[app]=result;state.syncExpanded.delete(app);renderSync(result)}catch(e){toast(`Audit failed: ${e.message}`)}finally{$(`#sync-loading`).classList.add('hidden');$('#run-sync').disabled=false}}
 async function inspect(hash){navigate('reconcile');$('#torrent-hash').value=hash;$('#global-hash').value=hash;$('#plan-loading').classList.remove('hidden');$('#plan-result').innerHTML='';try{state.plan=await api(`/api/plan/${encodeURIComponent(hash.trim())}`);renderPlan(state.plan)}catch(e){$('#plan-result').innerHTML=`<div class="alert"><div class="alert-head">Request failed</div><p>${esc(e.message)}</p></div>`}finally{$('#plan-loading').classList.add('hidden')}}
 async function refreshServiceStatus(){if(!state.authenticated)return;try{state.serviceStatus=await api('/api/status');renderServiceStatus()}catch(e){state.serviceStatus={version:state.config?.version,services:{stowarr_api:{status:'unavailable',error:e.message},qbittorrent:{status:'unavailable',error:e.message},radarr:{status:'unavailable',error:e.message},sonarr:{status:'unavailable',error:e.message}}};renderServiceStatus()}}
@@ -486,6 +532,25 @@ $('#runtime-form').addEventListener('submit',saveRuntime);
 $('#revoke-sessions').addEventListener('click',revokeSessions);
 document.addEventListener('click',event=>{const button=event.target.closest('.set-extra-action');if(button?.dataset.action==='move')$$('.move-extra-action').filter(input=>input.options[0].disabled).forEach(input=>input.value='delete')});
 document.addEventListener('click',event=>{
+  const statusFilter=event.target.closest('.sync-status-filter');
+  if(statusFilter){
+    const hidden=state.syncHiddenStatuses[state.syncApp];
+    const status=statusFilter.dataset.status;
+    if(hidden.has(status))hidden.delete(status);else hidden.add(status);
+    if(state.sync[state.syncApp])renderSync(state.sync[state.syncApp]);
+  }
+  if(event.target.closest('#sync-issues-only')){
+    const hidden=state.syncHiddenStatuses[state.syncApp];
+    hidden.clear();
+    hidden.add('in-sync');
+    if(state.sync[state.syncApp])renderSync(state.sync[state.syncApp]);
+  }
+  if(event.target.closest('#sync-show-all')){
+    state.syncHiddenStatuses[state.syncApp].clear();
+    if(state.sync[state.syncApp])renderSync(state.sync[state.syncApp]);
+  }
+  const categoryRepair=event.target.closest('.repair-sync-category');
+  if(categoryRepair)repairSyncCategory(categoryRepair);
   const syncGroup=event.target.closest('.sync-group-toggle');
   if(syncGroup){
     const app=syncGroup.dataset.syncGroup;

@@ -270,6 +270,17 @@ def handler(manager: Stowarr):
                     self.send_json(201, manager.issue_confirmation(kind, torrent_hash, payload))
                 except Exception as error:
                     self.send_json(409, {"error": str(error)})
+            elif path.startswith("/api/sync/") and path.endswith("/category"):
+                try:
+                    parts = path.strip("/").split("/")
+                    if len(parts) != 5:
+                        raise ValueError("Invalid Sync category repair path")
+                    _, _, app, torrent_hash, _ = parts
+                    self.send_json(
+                        200, manager.repair_sync_category(app.casefold(), torrent_hash)
+                    )
+                except Exception as error:
+                    self.send_json(409, {"error": str(error)})
             elif path.startswith("/api/reconcile/"):
                 try:
                     body = self.read_json()

@@ -62,6 +62,48 @@ class EngineTest(unittest.TestCase):
             ("reconcile", "queued", "R2JOB"),
         )
 
+    def test_dry_run_submissions_record_directly_but_queues_remain_disabled(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=False)
+        manager._move_lock = threading.RLock()
+        manager.store = SimpleNamespace(
+            has_active_queue_work=lambda: self.fail(
+                "Dry-run submissions must bypass persistent queue state"
+            )
+        )
+        manager.consume_confirmation = lambda token, kind, torrent_hash, payload: {
+            "plan": {"torrent_name": "Example"},
+            "payload": payload,
+            "fingerprint": f"{kind}-fingerprint",
+        }
+        manager._run_move = lambda *args, **kwargs: {
+            "operation_id": 11, "state": "DRY_RUN",
+        }
+        manager.reconcile = lambda *args, **kwargs: {
+            "operation_id": 12, "state": "DRY_RUN",
+        }
+
+        move = manager.submit_move(
+            "move-token", "move-hash",
+            {"targetPool": "p1", "additionalFiles": {}},
+        )
+        reconcile = manager.submit_reconcile(
+            "reconcile-token", "reconcile-hash", {"auxiliaryFiles": []},
+        )
+
+        self.assertEqual(
+            (move["state"], move["kind"], move["disposition"]),
+            ("DRY_RUN", "move", "direct"),
+        )
+        self.assertEqual(
+            (reconcile["state"], reconcile["kind"], reconcile["disposition"]),
+            ("DRY_RUN", "reconcile", "direct"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "dry-run"):
+            manager.enqueue_move("token", "move-hash", {})
+        with self.assertRaisesRegex(RuntimeError, "dry-run"):
+            manager.enqueue_reconcile("token", "reconcile-hash", {})
+
     def test_service_status_reports_live_versions_without_credentials(self):
         manager = Stowarr.__new__(Stowarr)
         manager.config = SimpleNamespace(apply=True)
@@ -702,7 +744,12 @@ class EngineTest(unittest.TestCase):
             {"id": 43, "title": "How to Make a Killing", "path": "/p1/movies/How to Make a Killing (2026)"},
         ]
         manager = Stowarr.__new__(Stowarr)
-        manager.qbit = SimpleNamespace(torrents=lambda: torrents)
+        manager.qbit = SimpleNamespace(
+            torrents=lambda: torrents,
+            categories=lambda: {
+                "radarr-pool3": {"savePath": "/p3/download"},
+            },
+        )
         manager.config = SimpleNamespace(
             pools=(p1, p3),
             pool_for_path=lambda path: p3 if str(path).startswith("/p3") else p1,
@@ -724,6 +771,52 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(len(by_hash["A"]["related_torrents"]), 2)
         self.assertEqual(by_hash["C"]["status"], "category-unconfigured")
         self.assertEqual(by_hash["C"]["expected_category"], "radarr-pool3")
+        self.assertTrue(by_hash["C"]["category_repairable"])
+
+    def test_sync_category_repair_revalidates_route_and_history(self):
+        pool = Pool(
+            "p3", Path("/p3"), (Path("/p3/download"),),
+            Path("/p3/movies"), Path("/p3/series"),
+            "radarr-pool3", "sonarr-pool3", "radarr-pool3", "sonarr-pool3",
+        )
+        changed = []
+        security_events = []
+        torrent = {
+            "hash": "ABC123",
+            "name": "Example",
+            "category": "radarr",
+            "save_path": "/p3/download/Example",
+        }
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(
+            apply=True,
+            pool_for_path=lambda path: pool,
+            pool_for_category=lambda category: None,
+        )
+        manager.qbit = SimpleNamespace(
+            torrent=lambda torrent_hash: torrent,
+            categories=lambda: {
+                "radarr-pool3": {"savePath": "/p3/download"},
+            },
+            set_category=lambda torrent_hash, category: changed.append(
+                (torrent_hash, category)
+            ),
+        )
+        manager.arr = {"radarr": SimpleNamespace(
+            history_for_downloads=lambda hashes: {"abc123": 42},
+        )}
+        manager.store = SimpleNamespace(
+            has_active_queue_work=lambda: False,
+            security_event=lambda *args: security_events.append(args),
+        )
+        manager._move_lock = threading.RLock()
+
+        result = manager.repair_sync_category("radarr", "ABC123")
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["category"], "radarr-pool3")
+        self.assertEqual(changed, [("ABC123", "radarr-pool3")])
+        self.assertEqual(security_events[0][0], "sync-category-repaired")
 
     def test_qbittorrent_search_does_not_consult_arr(self):
         manager = Stowarr.__new__(Stowarr)
