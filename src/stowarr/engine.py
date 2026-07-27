@@ -2647,6 +2647,7 @@ class Stowarr:
             raise ValueError(f"Unsupported application: {app}")
         if not self.config.apply:
             raise RuntimeError("Category repair is unavailable in dry-run mode")
+        self._require_recovery_clear()
         if self.store.has_active_queue_work():
             raise RuntimeError("Wait for the active Move/Reconcile queue to finish before changing a category")
         if not self._move_lock.acquire(blocking=False):

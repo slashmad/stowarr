@@ -1383,6 +1383,23 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(changed, [("ABC123", "radarr-pool3")])
         self.assertEqual(security_events[0][0], "sync-category-repaired")
 
+    def test_sync_category_repair_is_rejected_while_recovery_is_required(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=True)
+        manager.arr = {"radarr": SimpleNamespace()}
+        manager.qbit = Mock()
+        manager.store = SimpleNamespace(
+            has_recovery_required=lambda: True,
+            has_active_queue_work=lambda: False,
+        )
+        manager._move_lock = threading.RLock()
+
+        with self.assertRaisesRegex(RuntimeError, "Recovery"):
+            manager.repair_sync_category("radarr", "ABC123")
+
+        manager.qbit.torrent.assert_not_called()
+        manager.qbit.set_category.assert_not_called()
+
     def test_qbittorrent_search_does_not_consult_arr(self):
         manager = Stowarr.__new__(Stowarr)
         manager.qbit = SimpleNamespace(torrents=lambda: [
