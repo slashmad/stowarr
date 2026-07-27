@@ -43,6 +43,43 @@ class StoreTest(unittest.TestCase):
             operation_id = store.record("hash", "radarr", "MOVE_PLANNED", {}, kind="move")
             record = next(item for item in store.recent() if item["id"] == operation_id)
             self.assertEqual(record["kind"], "move")
+            self.assertRegex(record["public_id"], r"^(?=.*[A-Z])(?=.*\d)[A-Z2-9]{5}$")
+
+    def test_public_job_ids_are_short_unique_and_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.db"
+            store = Store(path)
+            first_id = store.record("first", "radarr", "COMPLETE", {})
+            second_id = store.record("second", "sonarr", "COMPLETE", {})
+            queued = store.enqueue_move("third", "p1", {}, "fingerprint", {})
+
+            operations = {item["id"]: item for item in Store(path).recent()}
+            public_ids = {
+                operations[first_id]["public_id"],
+                operations[second_id]["public_id"],
+                queued["public_id"],
+            }
+            self.assertEqual(len(public_ids), 3)
+            for public_id in public_ids:
+                self.assertRegex(public_id, r"^(?=.*[A-Z])(?=.*\d)[A-Z2-9]{5}$")
+
+    def test_existing_history_and_queue_receive_public_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.db"
+            store = Store(path)
+            operation_id = store.record("hash", "radarr", "COMPLETE", {}, kind="move")
+            queued = store.enqueue_move("queued", "p1", {}, "fingerprint", {})
+            store.db.execute("DROP INDEX operations_public_id")
+            store.db.execute("DROP INDEX move_queue_public_id")
+            store.db.execute("UPDATE operations SET public_id=NULL")
+            store.db.execute("UPDATE move_queue SET public_id=NULL")
+            store.db.commit()
+
+            reopened = Store(path)
+            operation = next(item for item in reopened.recent() if item["id"] == operation_id)
+            queue_item = next(item for item in reopened.move_queue() if item["id"] == queued["id"])
+            self.assertTrue(operation["public_id"])
+            self.assertTrue(queue_item["public_id"])
 
     def test_active_filters_terminal_operations_and_kind(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -110,6 +147,7 @@ class StoreTest(unittest.TestCase):
             reopened = Store(path)
             claimed = reopened.claim_next_move()
             self.assertEqual(claimed["id"], first["id"])
+            self.assertEqual(claimed["public_id"], first["public_id"])
             self.assertEqual(claimed["state"], "RUNNING")
             reopened.finish_move(first["id"], "COMPLETE", operation_id=42)
             self.assertEqual(reopened.claim_next_move()["id"], second["id"])
@@ -172,3 +210,23 @@ class StoreTest(unittest.TestCase):
             entries = store.move_queue()
             self.assertEqual(entries[0]["id"], queued["id"])
             self.assertEqual([item["id"] for item in entries[1:]], [new["id"], old["id"]])
+
+    def test_reconcile_queue_is_separate_persistent_and_cancellable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.db"
+            store = Store(path)
+            move = store.enqueue_move("move", "p1", {}, "move-fingerprint", {})
+            repair = store.enqueue_reconcile(
+                "repair", {"auxiliaryFiles": ["/subtitle.srt"]},
+                "repair-fingerprint", {"torrent_name": "Repair"},
+            )
+
+            reopened = Store(path)
+            self.assertEqual(reopened.claim_next_move()["public_id"], move["public_id"])
+            self.assertEqual(
+                reopened.reconcile_queue()[0]["public_id"], repair["public_id"]
+            )
+            self.assertTrue(
+                reopened.cancel_queued_reconcile_by_public_id(repair["public_id"])
+            )
+            self.assertEqual(reopened.reconcile_queue()[0]["state"], "CANCELLED")

@@ -447,9 +447,9 @@ images with provenance and SBOM attestations.
 ## Versioning
 
 Stowarr follows Semantic Versioning. Prereleases use tags such as
-`v1.0.0-beta.1`, while the WebUI and API expose the corresponding product
-version `1.0.0-beta.1`. Python package metadata uses the PEP 440 equivalent
-`1.0.0b1`. Tagged builds are published to GHCR alongside commit-SHA images;
+`v1.0.0-beta.2`, while the WebUI and API expose the corresponding product
+version `1.0.0-beta.2`. Python package metadata uses the PEP 440 equivalent
+`1.0.0b2`. Tagged builds are published to GHCR alongside commit-SHA images;
 `latest` continues to track `main`.
 
 ## Project status

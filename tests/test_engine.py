@@ -32,7 +32,7 @@ class EngineTest(unittest.TestCase):
 
         result = manager.service_status()
 
-        self.assertEqual(result["version"], "1.0.0-beta.1")
+        self.assertEqual(result["version"], "1.0.0-beta.2")
         self.assertTrue(result["apply"])
         self.assertEqual(result["services"]["qbittorrent"]["version"], "5.2.1")
         self.assertEqual(result["services"]["radarr"]["status"], "connected")

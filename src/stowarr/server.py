@@ -9,7 +9,7 @@ from importlib.resources import files
 from urllib.parse import parse_qs, urlparse
 
 from .engine import Stowarr
-from .queue import MoveQueueWorker
+from .queue import MoveQueueWorker, ReconcileQueueWorker
 from . import __version__
 
 
@@ -149,6 +149,8 @@ def handler(manager: Stowarr):
                 self.send_json(200, manager.store.recent())
             elif path == "/api/queue":
                 self.send_json(200, manager.store.move_queue())
+            elif path == "/api/reconcile-queue":
+                self.send_json(200, manager.store.reconcile_queue())
             elif path.startswith("/api/operations/") and path.endswith("/events"):
                 try:
                     operation_id = int(path.split("/")[3])
@@ -239,10 +241,18 @@ def handler(manager: Stowarr):
                     self.send_json(400, {"error": str(error)})
             elif path.startswith("/api/queue/") and path.endswith("/cancel"):
                 try:
-                    queue_id = int(path.split("/")[3])
-                    if not manager.store.cancel_queued_move(queue_id):
+                    public_id = path.split("/")[3].upper()
+                    if not manager.store.cancel_queued_move_by_public_id(public_id):
                         raise ValueError("Only a waiting queued Move can be cancelled")
-                    self.send_json(200, {"id": queue_id, "state": "CANCELLED"})
+                    self.send_json(200, {"public_id": public_id, "state": "CANCELLED"})
+                except (ValueError, IndexError) as error:
+                    self.send_json(409, {"error": str(error)})
+            elif path.startswith("/api/reconcile-queue/") and path.endswith("/cancel"):
+                try:
+                    public_id = path.split("/")[3].upper()
+                    if not manager.store.cancel_queued_reconcile_by_public_id(public_id):
+                        raise ValueError("Only a waiting queued Reconcile can be cancelled")
+                    self.send_json(200, {"public_id": public_id, "state": "CANCELLED"})
                 except (ValueError, IndexError) as error:
                     self.send_json(409, {"error": str(error)})
             elif not manager.connections_ready:
@@ -303,6 +313,25 @@ def handler(manager: Stowarr):
                     payload = {"targetPool": target_pool, "additionalFiles": additional_files}
                     queued = manager.enqueue_move(
                         body.get("confirmationToken", ""), torrent_hash, payload
+                    )
+                    self.send_json(202, queued)
+                except Exception as error:
+                    self.send_json(409, {"error": str(error)})
+            elif path == "/api/reconcile-queue":
+                try:
+                    body = self.read_json()
+                    torrent_hash = body.get("torrentHash")
+                    auxiliary_files = body.get("auxiliaryFiles", [])
+                    if not isinstance(torrent_hash, str) or not torrent_hash:
+                        raise ValueError("torrentHash is required")
+                    if not isinstance(auxiliary_files, list) or not all(
+                        isinstance(item, str) for item in auxiliary_files
+                    ):
+                        raise ValueError("auxiliaryFiles must be a list of paths")
+                    queued = manager.enqueue_reconcile(
+                        body.get("confirmationToken", ""),
+                        torrent_hash,
+                        {"auxiliaryFiles": auxiliary_files},
                     )
                     self.send_json(202, queued)
                 except Exception as error:
@@ -379,7 +408,9 @@ def print_startup_credentials(manager: Stowarr) -> None:
 def serve(manager: Stowarr) -> None:
     server = ThreadingHTTPServer((manager.config.listen, manager.config.port), handler(manager))
     queue_worker = MoveQueueWorker(manager)
+    reconcile_queue_worker = ReconcileQueueWorker(manager)
     queue_worker.start()
+    reconcile_queue_worker.start()
     print_startup_credentials(manager)
     print(f"stowarr listening on {manager.config.listen}:{manager.config.port}; apply={manager.config.apply}", flush=True)
     try:
@@ -390,4 +421,6 @@ def serve(manager: Stowarr) -> None:
                 "stowarr queue worker is still finishing an active Move during shutdown",
                 flush=True,
             )
+        if not reconcile_queue_worker.stop():
+            print("stowarr reconcile queue worker is still finishing during shutdown", flush=True)
         server.server_close()

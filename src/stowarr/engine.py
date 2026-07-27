@@ -229,6 +229,7 @@ class Stowarr:
         self.archive_extractor = ArchiveExtractor()
         self._move_lock = threading.Lock()
         self.queue_worker = None
+        self.reconcile_queue_worker = None
         try:
             self._activate_connections(config.qbittorrent, config.radarr, config.sonarr, validate=False)
         except Exception as error:
@@ -544,6 +545,25 @@ class Stowarr:
         )
         if self.queue_worker:
             self.queue_worker.wake()
+        return queued
+
+    def enqueue_reconcile(self, token: str, torrent_hash: str, payload: dict) -> dict:
+        if not self.config.apply:
+            raise RuntimeError("Reconcile queue is unavailable in dry-run mode")
+        authorized = self.consume_confirmation(token, "reconcile", torrent_hash, payload)
+        plan = authorized["plan"]
+        queued = self.store.enqueue_reconcile(
+            torrent_hash,
+            authorized["payload"],
+            authorized["fingerprint"],
+            {
+                "torrent_name": plan.get("torrent_name", torrent_hash),
+                "app": plan.get("app"),
+                "target_pool": plan.get("target_pool"),
+            },
+        )
+        if self.reconcile_queue_worker:
+            self.reconcile_queue_worker.wake()
         return queued
 
     @staticmethod
@@ -1249,15 +1269,19 @@ class Stowarr:
         target_pool_name: str,
         additional_actions: dict[str, str] | None = None,
         wait_for_slot: bool = False,
+        public_id: str | None = None,
     ) -> dict:
         if not self._move_lock.acquire(blocking=wait_for_slot):
             raise RuntimeError("Another Move transaction is already running; add this Move to the queue")
         try:
-            return self._run_move(torrent_hash, target_pool_name, additional_actions)
+            return self._run_move(torrent_hash, target_pool_name, additional_actions, public_id)
         finally:
             self._move_lock.release()
 
-    def _run_move(self, torrent_hash: str, target_pool_name: str, additional_actions: dict[str, str] | None = None) -> dict:
+    def _run_move(
+        self, torrent_hash: str, target_pool_name: str,
+        additional_actions: dict[str, str] | None = None, public_id: str | None = None,
+    ) -> dict:
         if self.store.active(torrent_hash, kind="move"):
             raise RuntimeError("Another Move operation is already active for this torrent")
         plan = self.move_plan(torrent_hash, target_pool_name)
@@ -1269,7 +1293,9 @@ class Stowarr:
         if any(actions[source] == "move" for source in conflicts):
             raise ValueError("Conflicting additional files must be deleted or resolved manually")
         detail = {**plan.json(), "additional_actions": dict(sorted(actions.items()))}
-        operation_id = self.store.record(torrent_hash, plan.app, "MOVE_PLANNED", detail, kind="move")
+        operation_id = self.store.record(
+            torrent_hash, plan.app, "MOVE_PLANNED", detail, kind="move", public_id=public_id
+        )
         if plan.status != "ready" or not self.config.apply:
             state = "BLOCKED" if plan.status != "ready" else "DRY_RUN"
             self.store.update(operation_id, state, detail)
@@ -1933,6 +1959,7 @@ class Stowarr:
         app_hint: str | None = None,
         relocated_library_sources: set[str] | None = None,
         prepared_plan: Plan | None = None,
+        public_id: str | None = None,
     ) -> dict:
         plan = prepared_plan or self.plan(
             torrent_hash,
@@ -1952,8 +1979,17 @@ class Stowarr:
             raise ValueError("One or more selected sidecar paths are not eligible in the current plan")
         nested_move = operation_id is not None
         if operation_id is None:
-            operation_id = self.store.record(torrent_hash, plan.app, "PLANNED", plan.json())
+            operation_id = self.store.record(
+                torrent_hash, plan.app, "PLANNED", plan.json(),
+                kind="reconcile", public_id=public_id,
+            )
         state_name = lambda standalone, move: move if nested_move else standalone
+        if progress_callback is None and not nested_move:
+            def progress_callback(state, percent, **progress):
+                self.store.update(operation_id, state, {
+                    **plan.json(),
+                    "progress": {"state": state, "percent": percent, **progress},
+                })
         if plan.status != "ready" or not self.config.apply:
             state = "BLOCKED" if plan.status != "ready" else "DRY_RUN"
             if nested_move:
@@ -1971,7 +2007,7 @@ class Stowarr:
                 def pair_progress(completed, total, label="library media"):
                     if progress_callback:
                         progress_callback(
-                            "MOVE_LIBRARY_VERIFYING",
+                            state_name("RECONCILE_VERIFYING", "MOVE_LIBRARY_VERIFYING"),
                             (pair_index + completed / max(total, 1)) / pair_total * 100,
                             completed_bytes=completed, total_bytes=total, current=source.name,
                             message=f"Hash-verifying {label}",
@@ -2024,7 +2060,7 @@ class Stowarr:
                 os.replace(temporary, target)
                 created.append(target)
                 if progress_callback:
-                    progress_callback("MOVE_LIBRARY_VERIFYING", (pair_index + 1) / pair_total * 100,
+                    progress_callback(state_name("RECONCILE_VERIFYING", "MOVE_LIBRARY_VERIFYING"), (pair_index + 1) / pair_total * 100,
                                       completed_files=pair_index + 1, total_files=len(plan.pairs), current=target.name,
                                       message="Created verified library file")
             self.store.update(operation_id, state_name("LINKED", "MOVE_LIBRARY_LINKED"), plan.json())
@@ -2075,10 +2111,10 @@ class Stowarr:
             self.arr[plan.app].sync_pool(item, str(root), tag, pool_tags)
             self.store.update(operation_id, state_name("ARR_UPDATED", "MOVE_ARR_UPDATED"), plan.json())
             if progress_callback:
-                progress_callback("MOVE_ARR_RESCANNING", 0, message=f"Waiting for {plan.app.capitalize()} rescan")
+                progress_callback(state_name("ARR_RESCANNING", "MOVE_ARR_RESCANNING"), 0, message=f"Waiting for {plan.app.capitalize()} rescan")
             self.arr[plan.app].rescan(int(item["id"]))
             if progress_callback:
-                progress_callback("MOVE_ARR_RESCANNING", 100, message=f"{plan.app.capitalize()} rescan completed")
+                progress_callback(state_name("ARR_RESCANNING", "MOVE_ARR_RESCANNING"), 100, message=f"{plan.app.capitalize()} rescan completed")
             self.store.update(operation_id, state_name("ARR_RESCANNED", "MOVE_ARR_RESCANNED"), plan.json())
             expected_paths = [
                 str(Path(plan.target_item_path or "") / record["relativePath"])
@@ -2115,5 +2151,12 @@ class Stowarr:
             return {"operation_id": operation_id, "state": "COMPLETE", "plan": plan.json()}
         except Exception as error:
             if not nested_move:
-                self.store.update(operation_id, "FAILED", {**plan.json(), "error": str(error)})
+                previous = next(
+                    (item for item in self.store.recent() if item["id"] == operation_id), None
+                )
+                self.store.update(operation_id, "FAILED", {
+                    **plan.json(),
+                    "error": str(error),
+                    "failed_after": previous["state"] if previous else "PLANNED",
+                })
             raise
