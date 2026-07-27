@@ -87,7 +87,7 @@ function renderOperationLog(operation){
   log.scrollTop=followTail?log.scrollHeight:previousTop;
 }
 async function loadOperationEvents(operationId){try{const result=await api(`/api/operations/${encodeURIComponent(operationId)}/events`);state.operationEvents.set(Number(operationId),result.events||[])}catch(e){state.operationEvents.set(Number(operationId),[{state:'LOG_UNAVAILABLE',created_at:Math.floor(Date.now()/1000),detail:{error:e.message}}])}}
-async function openOperationDetails(operationId){if(state.operationTracking&&!terminalOperation(state.currentOperation)){showOperationTracking();return}const operation=state.operations.find(item=>String(item.id)===String(operationId));if(!operation)return;state.operationTracking=false;state.operationHidden=false;state.currentOperation=operation;renderOperationMinimized();resetOperationSections();resetOperationLog();renderOperationDialog(operation);const dialog=$('#operation-dialog');if(!dialog.open)dialog.showModal();await loadOperationEvents(operation.id);renderOperationDialog(operation)}
+async function openOperationDetails(operationId){if(state.operationTracking&&!terminalOperation(state.currentOperation)){showOperationTracking();return}const operation=state.operations.find(item=>String(item.id)===String(operationId));if(!operation)return;if(!terminalOperation(operation)){await trackOperationById(operation.id);return}state.operationTracking=false;state.operationHidden=false;state.currentOperation=operation;renderOperationMinimized();resetOperationSections();resetOperationLog();renderOperationDialog(operation);const dialog=$('#operation-dialog');if(!dialog.open)dialog.showModal();await loadOperationEvents(operation.id);renderOperationDialog(operation)}
 function operationStepMarkup(step,status,percent,detail='',indeterminate=false){const [,title,description]=step;return `<li class="${status}${indeterminate?' indeterminate':''}"><div class="operation-step-title"><strong>${esc(title)}</strong><b>${indeterminate?'Working':`${Math.round(percent)}%`}</b></div><div class="operation-progress"><i style="width:${indeterminate?100:Math.max(0,Math.min(100,percent))}%"></i></div><small>${esc(detail||description)}</small></li>`}
 function operationGroupMarkup(kind,label,steps,open){if(!steps.length)return '';const body=kind==='remaining'?`<ol class="operation-upcoming-list">${steps.map(([,title,description])=>`<li><strong>${esc(title)}</strong><small>${esc(description)}</small></li>`).join('')}</ol>`:`<ol class="operation-group-list">${steps.map(step=>operationStepMarkup(step,'complete',100)).join('')}</ol>`;const hint=kind==='remaining'&&steps[0]?`Next: ${steps[0][1]}`:`${steps.length} step${steps.length===1?'':'s'}`;return `<details class="operation-group operation-group-${kind}" data-operation-section="${kind}"${open?' open':''}><summary><span>${esc(label)}</span><small>${esc(hint)}</small></summary>${body}</details>`}
 function renderOperationDialog(operation,waiting=false){
@@ -117,7 +117,7 @@ function renderOperationDialog(operation,waiting=false){
   const sizeNotice=largeTorrent&&['MOVE_RELOCATING','MOVE_RECHECKING'].includes(activeStep?.[0])?`${fmtBytes(torrentSize)} torrent; relocation and verification may take a while`:'';
   const activeDetail=currentLive?[live.message,sizeNotice,live.current,byteProgress,live.qbit_state].filter(Boolean).join(' · '):sizeNotice;
   const failureContext=stateName==='FAILED'&&completedSteps.length?`<div class="operation-failure-context"><small>Previous completed: ${completedSteps.slice(-2).map(([,title])=>esc(title)).join(' · ')}</small></div>`:'';
-  $('#operation-title').textContent=operation?.kind==='reconcile'?'Reconcile details':terminal?'Move details':'Move in progress';
+  $('#operation-title').textContent=operation?.kind==='reconcile'?(terminal?'Reconcile details':'Reconcile in progress'):terminal?'Move details':'Move in progress';
   $('#operation-summary').textContent=waiting?'Waiting for the API to register the operation':operation?`${operation.public_id?`${operation.public_id} · `:''}${operation.detail?.torrent_name||operation.torrent_hash} · ${stateName.replaceAll('_',' ')}`:'Operation details unavailable';
   const activeMarkup=activeStep?`<ol class="operation-active-list">${operationStepMarkup(activeStep,stateName==='FAILED'?'failed':'active',activePercent,activeDetail,indeterminate)}</ol>${failureContext}`:'';
   $('#operation-steps').innerHTML=`<div class="operation-overall"><div class="operation-step-title"><strong>${complete?'All steps complete':stepNumber?`Step ${stepNumber} of ${progressSteps.length}`:'Preparing operation'}</strong><b>${overallPercent}% overall</b></div><div class="operation-progress"><i style="width:${overallPercent}%"></i></div></div>${operationGroupMarkup('completed','Completed',completedSteps,state.operationSections.completed)}${activeMarkup}${operationGroupMarkup('remaining','Remaining',remainingSteps,state.operationSections.remaining)}`;
@@ -130,11 +130,14 @@ function renderOperationDialog(operation,waiting=false){
   $('#operation-close').setAttribute('aria-label',canHide?'Hide operation details':'Close operation details');
   $('#operation-done').disabled=!terminal&&!canHide;
   $('#operation-done').textContent=canHide?'Hide':stateName==='FAILED'?'Close failure details':'Close';
-  renderOperationLog(operation);
+  renderOperationLog(waiting?null:operation);
   renderOperationMinimized();
 }
 async function refreshOperations(){if(!state.authenticated)return;try{state.operations=await api('/api/operations');renderOperations()}catch(_){}}
-async function trackOperation(torrentHash,kind='move',afterId=0){const dialog=$('#operation-dialog');state.operationTracking=true;state.operationHidden=false;state.currentOperation=null;resetOperationSections();resetOperationLog();renderOperationDialog(null,true);if(!dialog.open)dialog.showModal();clearInterval(state.operationTimer);const update=async()=>{await refreshOperations();const operation=state.operations.find(item=>item.id>afterId&&item.torrent_hash.toLowerCase()===torrentHash.toLowerCase()&&item.kind===kind);if(operation){await loadOperationEvents(operation.id);renderOperationDialog(operation);if(terminalOperation(operation)){clearInterval(state.operationTimer);state.operationTimer=null}}return operation};const initial=await update();if(!terminalOperation(initial))state.operationTimer=setInterval(update,1000)}
+async function startOperationTracking(findOperation,kind='move'){const dialog=$('#operation-dialog');state.operationTracking=true;state.operationHidden=false;state.currentOperation=null;resetOperationSections();resetOperationLog();renderOperationDialog({kind,state:'WAITING',detail:{}},true);if(!dialog.open)dialog.showModal();clearInterval(state.operationTimer);let updating=false;const update=async()=>{if(updating)return state.currentOperation;updating=true;try{await refreshOperations();const operation=findOperation(state.operations);if(operation){await loadOperationEvents(operation.id);renderOperationDialog(operation);if(terminalOperation(operation)){clearInterval(state.operationTimer);state.operationTimer=null}}return operation}finally{updating=false}};const initial=await update();if(!terminalOperation(initial))state.operationTimer=setInterval(update,1000)}
+async function trackOperation(torrentHash,kind='move',afterId=0){return startOperationTracking(operations=>operations.find(item=>item.id>afterId&&item.torrent_hash.toLowerCase()===torrentHash.toLowerCase()&&item.kind===kind),kind)}
+async function trackOperationById(operationId){const kind=state.operations.find(item=>String(item.id)===String(operationId))?.kind||'move';return startOperationTracking(operations=>operations.find(item=>String(item.id)===String(operationId)),kind)}
+async function trackOperationByPublicId(publicId,kind){return startOperationTracking(operations=>operations.find(item=>item.public_id===publicId&&(!kind||item.kind===kind)),kind)}
 function hideOperationTracking(){if(!state.operationTracking||terminalOperation(state.currentOperation))return finishOperationTracking();state.operationHidden=true;const dialog=$('#operation-dialog');if(dialog.open)dialog.close();renderOperationMinimized()}
 function showOperationTracking(){if(!state.operationTracking)return;state.operationHidden=false;renderOperationMinimized();const dialog=$('#operation-dialog');if(!dialog.open)dialog.showModal()}
 function finishOperationTracking(){clearInterval(state.operationTimer);state.operationTimer=null;state.operationTracking=false;state.operationHidden=false;state.currentOperation=null;renderOperationMinimized();const dialog=$('#operation-dialog');if(dialog.open)dialog.close()}
@@ -223,13 +226,18 @@ function renderQueue(){
     const position=new Map(waiting.map((item,index)=>[item.id,index+1]));
     $(target).innerHTML=rows.length?rows.map(item=>{
       const detail=item.detail||{};
-      const operation=item.operation_id?`<button class="link-button inspect-operation" data-operation-id="${item.operation_id}">Details</button>`:'—';
+      const linkedOperation=state.operations.find(operation=>operation.public_id===item.public_id);
+      const operationId=item.operation_id||linkedOperation?.id;
+      const operation=item.state==='RUNNING'?`<button class="link-button track-operation" data-public-id="${esc(item.public_id)}" data-kind="${kind}">Live progress</button>`:operationId?`<button class="link-button inspect-operation" data-operation-id="${operationId}">Details</button>`:'—';
       const action=item.state==='QUEUED'?`<button class="secondary compact cancel-queue" data-kind="${kind}" data-queue-id="${esc(item.public_id)}">Cancel</button>`:'';
       const positionLabel=item.state==='RUNNING'?'Running':item.state==='QUEUED'?`#${position.get(item.id)}`:'—';
       const error=item.error?`<small class="queue-error">${esc(item.error)}</small>`:'';
       const route=kind==='move'?`${esc(detail.current_pool||'—')} → ${esc(item.target_pool)}`:esc(detail.target_pool||'—');
       return `<tr><td><code>${esc(item.public_id)}</code><small>${esc(positionLabel)}</small></td><td class="queue-torrent"><strong>${esc(detail.torrent_name||item.torrent_hash)}</strong><code>${esc(item.torrent_hash)}</code>${error}</td><td>${route}</td><td>${badge(item.state)}</td><td>${operation}</td><td>${fmtTime(item.updated_at)}</td><td>${action}</td></tr>`;
     }).join(''):`<tr><td colspan="7" class="empty">The ${kind==='move'?'Move':'Reconcile'} queue is empty</td></tr>`;
+    const removable=rows.filter(item=>item.state!=='RUNNING').length;
+    const clearButton=$(`.clear-queue[data-kind="${kind}"]`);
+    if(clearButton)clearButton.disabled=!removable;
   };
   render(state.queue||[],'move','#queue-rows');
   render(state.reconcileQueue||[],'reconcile','#reconcile-queue-rows');
@@ -247,6 +255,18 @@ async function cancelQueue(id,kind='move'){
   const endpoint=kind==='reconcile'?'reconcile-queue':'queue';
   if(!await confirmAction({title:`Cancel queued ${label} ${id}?`,message:'Only work that has not started can be cancelled.',confirmLabel:`Cancel queued ${label}`,danger:true}))return;
   try{await api(`/api/${endpoint}/${encodeURIComponent(id)}/cancel`,{method:'POST'});await refreshQueue();toast(`Queued ${label} ${id} cancelled`)}catch(error){toast(`Queued ${label} was not cancelled: ${error.message}`)}
+}
+async function clearQueue(kind){
+  const label=kind==='reconcile'?'Reconcile':'Move';
+  const rows=kind==='reconcile'?state.reconcileQueue:state.queue;
+  const finished=rows.filter(item=>['COMPLETE','FAILED','CANCELLED','INTERRUPTED'].includes(item.state)).length;
+  const queued=rows.filter(item=>item.state==='QUEUED').length;
+  const count=finished+queued;
+  if(!count)return;
+  const message=`This removes ${finished} finished and ${queued} waiting queue entries. Running work and Operation History are always kept.`;
+  if(!await confirmAction({title:`Clear ${label} queue?`,message,details:[['Queue',label],['Entries removed',String(count)]],confirmLabel:'Clear queue',danger:true}))return;
+  const endpoint=kind==='reconcile'?'reconcile-queue':'queue';
+  try{const result=await api(`/api/${endpoint}`,{method:'DELETE'});await refreshQueue();toast(`${result.deleted} ${label} queue ${result.deleted===1?'entry':'entries'} removed`)}catch(error){toast(`${label} queue was not cleared: ${error.message}`)}
 }
 function enhanceMoveRecovery(plan){
   if(plan.error_code!=='QBITTORRENT_ALREADY_ON_TARGET')return;
@@ -325,6 +345,10 @@ document.addEventListener('click',event=>{
     if(state.syncExpanded.has(app))state.syncExpanded.delete(app);else state.syncExpanded.add(app);
     if(state.sync[app])renderSync(state.sync[app]);
   }
+  const liveOperation=event.target.closest('.track-operation');
+  if(liveOperation)trackOperationByPublicId(liveOperation.dataset.publicId,liveOperation.dataset.kind);
+  const clear=event.target.closest('.clear-queue');
+  if(clear)clearQueue(clear.dataset.kind);
   if(event.target.closest('#queue-reconcile'))enqueueReconcile();
   if(event.target.closest('#queue-move'))enqueueMove();
   if(event.target.closest('#refresh-queue'))refreshQueue();

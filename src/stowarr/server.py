@@ -354,10 +354,24 @@ def handler(manager: Stowarr):
             if not self.csrf_valid():
                 self.send_json(403, {"error": "Valid CSRF header required"})
                 return
-            if path != "/api/operations":
+            if path not in {"/api/operations", "/api/queue", "/api/reconcile-queue"}:
                 self.send_json(404, {"error": "not found"})
                 return
             try:
+                if path in {"/api/queue", "/api/reconcile-queue"}:
+                    clear = (
+                        manager.store.clear_move_queue
+                        if path == "/api/queue"
+                        else manager.store.clear_reconcile_queue
+                    )
+                    deleted = clear()
+                    kind = "move" if path == "/api/queue" else "reconcile"
+                    manager.store.security_event(
+                        "queue-cleared", "admin", self.client_identity(),
+                        {"kind": kind, "deleted": deleted},
+                    )
+                    self.send_json(200, {"kind": kind, "deleted": deleted})
+                    return
                 body = self.read_json()
                 clear_all = body.get("all") is True
                 operation_ids = body.get("operationIds", [])
