@@ -176,6 +176,8 @@ def handler(manager: Stowarr):
                 self.send_json(200, manager.store.move_queue())
             elif path == "/api/reconcile-queue":
                 self.send_json(200, manager.store.reconcile_queue())
+            elif path == "/api/queue-summary":
+                self.send_json(200, manager.store.queue_summary())
             elif path == "/api/recovery":
                 self.send_json(200, manager.recovery_status())
             elif path.startswith("/api/operations/") and path.endswith("/events"):

@@ -310,10 +310,40 @@ class StoreTest(unittest.TestCase):
                 "waiting", {"auxiliaryFiles": []}, "waiting", {}
             )
 
+            self.assertEqual(
+                store.queue_summary()["reconcile"],
+                {"total": 2, "terminal": 1},
+            )
             self.assertEqual(store.clear_reconcile_queue(), 1)
             self.assertEqual(
                 [item["public_id"] for item in store.reconcile_queue()],
                 [waiting["public_id"]],
+            )
+            self.assertEqual(
+                store.queue_summary()["reconcile"],
+                {"total": 1, "terminal": 0},
+            )
+
+    def test_queue_summary_counts_finished_work_beyond_list_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            finished = store.enqueue_move("finished", "p1", {}, "finished", {})
+            store.claim_next_move()
+            store.finish_move(finished["id"], "COMPLETE")
+            for index in range(200):
+                store.enqueue_move(
+                    f"waiting-{index}", "p1", {}, f"waiting-{index}", {}
+                )
+
+            visible = store.move_queue()
+            self.assertEqual(len(visible), 200)
+            self.assertFalse(
+                any(item["state"] in {"COMPLETE", "FAILED", "CANCELLED", "INTERRUPTED"}
+                    for item in visible)
+            )
+            self.assertEqual(
+                store.queue_summary()["move"],
+                {"total": 201, "terminal": 1},
             )
 
     def test_restart_marks_queue_and_history_and_pauses_later_work(self):

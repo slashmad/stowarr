@@ -510,6 +510,26 @@ class Store:
             for row in rows
         ]
 
+    def queue_summary(self) -> dict[str, dict[str, int]]:
+        terminal = ("COMPLETE", "FAILED", "CANCELLED", "INTERRUPTED")
+        result: dict[str, dict[str, int]] = {}
+        with self.lock:
+            for kind, table in (
+                ("move", "move_queue"),
+                ("reconcile", "reconcile_queue"),
+            ):
+                row = self.db.execute(
+                    f"""SELECT COUNT(*) AS total,
+                    SUM(CASE WHEN state IN (?,?,?,?) THEN 1 ELSE 0 END) AS terminal
+                    FROM {table}""",  # nosec
+                    terminal,
+                ).fetchone()
+                result[kind] = {
+                    "total": int(row["total"]),
+                    "terminal": int(row["terminal"] or 0),
+                }
+        return result
+
     def _clear_queue(self, table: str) -> int:
         if table not in {"move_queue", "reconcile_queue"}:
             raise ValueError("Unknown queue")
