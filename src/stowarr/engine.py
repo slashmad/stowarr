@@ -2721,15 +2721,29 @@ class Stowarr:
             "rows": rows,
         }
 
-    def safe_sync_plan(self, app: str) -> dict:
+    def safe_sync_plan(self, app: str, progress=None) -> dict:
         """Classify audit issues into narrowly safe assisted actions and manual work."""
+        if progress:
+            progress({
+                "stage": "audit", "current": 0, "total": 1,
+                "message": f"Reading the current {app.capitalize()} audit",
+            })
         audit = self.sync_audit(app)
+        if progress:
+            progress({
+                "stage": "audit", "current": 1, "total": 1,
+                "message": (
+                    f'{audit["scanned"]} torrents read; '
+                    f'{audit["issues"]} issues require classification'
+                ),
+            })
         active_reconciles = {
             str(item.get("torrent_hash") or "").casefold(): item
             for item in self.store.reconcile_queue()
             if item.get("state") in {"QUEUED", "RUNNING"}
         }
         category_repairs = []
+        root_mismatches = []
         reconcile_candidates = []
         queued_reconciles = []
         manual = []
@@ -2750,15 +2764,43 @@ class Stowarr:
                 })
                 continue
             if row["status"] == "root-mismatch":
-                queued = active_reconciles.get(row["hash"].casefold())
-                if queued:
-                    queued_reconciles.append({
-                        "hash": row["hash"],
-                        "torrent_name": row["torrent_name"],
-                        "public_id": queued["public_id"],
-                        "state": queued["state"],
-                    })
-                    continue
+                root_mismatches.append(row)
+                continue
+            manual.append({
+                "hash": row["hash"],
+                "torrent_name": row["torrent_name"],
+                "status": row["status"],
+                "reason": row.get("reason"),
+                "error_code": (row.get("issues") or [{}])[0].get("code"),
+            })
+        if progress:
+            progress({
+                "stage": "categories", "current": 1, "total": 1,
+                "message": (
+                    f"{len(category_repairs)} safe category fixes; "
+                    f"{len(root_mismatches)} root mismatches need fresh plans"
+                ),
+            })
+        reconcile_total = len(root_mismatches)
+        if progress:
+            progress({
+                "stage": "reconciles", "current": 0, "total": reconcile_total,
+                "message": (
+                    "No root mismatches need planning"
+                    if not reconcile_total
+                    else f"Building 0 of {reconcile_total} fresh Reconcile plans"
+                ),
+            })
+        for index, row in enumerate(root_mismatches, 1):
+            queued = active_reconciles.get(row["hash"].casefold())
+            if queued:
+                queued_reconciles.append({
+                    "hash": row["hash"],
+                    "torrent_name": row["torrent_name"],
+                    "public_id": queued["public_id"],
+                    "state": queued["state"],
+                })
+            else:
                 try:
                     plan = self.plan(row["hash"]).json()
                 except Exception as error:
@@ -2769,39 +2811,51 @@ class Stowarr:
                         "reason": f"Fresh Reconcile planning failed: {error}",
                         "error_code": "FRESH_PLAN_FAILED",
                     })
-                    continue
-                if plan["status"] == "ready":
-                    blocked_sidecars = {"target-conflict", "torrent-name-conflict"}
-                    auxiliary_files = sorted({
-                        item["source"]
-                        for item in plan.get("auxiliary_files", [])
-                        if item["status"] not in blocked_sidecars
-                    })
-                    reconcile_candidates.append({
-                        "hash": row["hash"],
-                        "torrent_name": plan["torrent_name"],
-                        "item_title": plan.get("item_title"),
-                        "target_pool": plan["target_pool"],
-                        "current_item_path": plan.get("current_item_path"),
-                        "target_item_path": plan.get("target_item_path"),
-                        "auxiliary_files": auxiliary_files,
-                        "auxiliary_count": len(auxiliary_files),
-                    })
-                    continue
-                manual.append({
-                    "hash": row["hash"],
-                    "torrent_name": row["torrent_name"],
-                    "status": row["status"],
-                    "reason": plan.get("reason") or row.get("reason"),
-                    "error_code": plan.get("error_code"),
+                else:
+                    if plan["status"] != "ready":
+                        manual.append({
+                            "hash": row["hash"],
+                            "torrent_name": row["torrent_name"],
+                            "status": row["status"],
+                            "reason": plan.get("reason") or row.get("reason"),
+                            "error_code": plan.get("error_code"),
+                        })
+                    else:
+                        blocked_sidecars = {
+                            "target-conflict", "torrent-name-conflict"
+                        }
+                        auxiliary_files = sorted({
+                            item["source"]
+                            for item in plan.get("auxiliary_files", [])
+                            if item["status"] not in blocked_sidecars
+                        })
+                        reconcile_candidates.append({
+                            "hash": row["hash"],
+                            "torrent_name": plan["torrent_name"],
+                            "item_title": plan.get("item_title"),
+                            "target_pool": plan["target_pool"],
+                            "current_item_path": plan.get("current_item_path"),
+                            "target_item_path": plan.get("target_item_path"),
+                            "auxiliary_files": auxiliary_files,
+                            "auxiliary_count": len(auxiliary_files),
+                        })
+            if progress:
+                progress({
+                    "stage": "reconciles", "current": index,
+                    "total": reconcile_total,
+                    "message": (
+                        f"Built {index} of {reconcile_total} fresh "
+                        f"Reconcile plans · {row['torrent_name']}"
+                    ),
                 })
-                continue
-            manual.append({
-                "hash": row["hash"],
-                "torrent_name": row["torrent_name"],
-                "status": row["status"],
-                "reason": row.get("reason"),
-                "error_code": (row.get("issues") or [{}])[0].get("code"),
+        if progress:
+            progress({
+                "stage": "manual", "current": 1, "total": 1,
+                "message": (
+                    f"{len(reconcile_candidates)} ready for the queue; "
+                    f"{len(manual)} require manual review; "
+                    f"{len(queued_reconciles)} already active"
+                ),
             })
         return {
             "app": app,
@@ -2947,7 +3001,7 @@ class Stowarr:
         return dict(context)
 
     def apply_safe_category_repairs(
-        self, token: str, app: str, torrent_hashes: list[str]
+        self, token: str, app: str, torrent_hashes: list[str], progress=None
     ) -> dict:
         """Consume an exact batch confirmation and apply only freshly safe repairs."""
         if not self.config.apply:
@@ -2969,6 +3023,12 @@ class Stowarr:
                 raise RuntimeError(
                     "A Move/Reconcile job started before the category repair; build a new plan later"
                 )
+            if progress:
+                progress({
+                    "stage": "validation", "current": 0,
+                    "total": len(torrent_hashes),
+                    "message": "Rebuilding the audit and validating the exact batch",
+                })
             plan = self._safe_category_selection(app, torrent_hashes)
             payload = {
                 "torrentHashes": [item["hash"] for item in plan["category_repairs"]]
@@ -2978,13 +3038,37 @@ class Stowarr:
             self.store.consume_confirmation(
                 token, "safe-category", app, confirmation_fingerprint
             )
-            contexts = [
-                self._sync_category_repair_context(app, item["hash"])
-                for item in plan["category_repairs"]
-            ]
-            results = [
-                self._apply_sync_category_context(context) for context in contexts
-            ]
+            contexts = []
+            total = len(plan["category_repairs"])
+            for index, item in enumerate(plan["category_repairs"], 1):
+                contexts.append(
+                    self._sync_category_repair_context(app, item["hash"])
+                )
+                if progress:
+                    progress({
+                        "stage": "validation", "current": index, "total": total,
+                        "message": (
+                            f"Validated {index} of {total} · "
+                            f'{item["torrent_name"]}'
+                        ),
+                    })
+            results = []
+            if progress:
+                progress({
+                    "stage": "apply", "current": 0, "total": total,
+                    "message": f"All {total} items are safe; applying categories",
+                })
+            for index, context in enumerate(contexts, 1):
+                results.append(self._apply_sync_category_context(context))
+                if progress:
+                    progress({
+                        "stage": "apply", "current": index, "total": total,
+                        "message": (
+                            f"Applied {index} of {total} · "
+                            f'{context["previous_category"] or "none"} → '
+                            f'{context["category"]}'
+                        ),
+                    })
             return {
                 "app": app,
                 "changed": sum(item["changed"] for item in results),

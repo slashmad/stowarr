@@ -1509,7 +1509,8 @@ class EngineTest(unittest.TestCase):
         manager.plan = Mock(side_effect=lambda value: ready if value == "READY" else blocked)
         manager.store = SimpleNamespace(reconcile_queue=lambda: [])
 
-        result = manager.safe_sync_plan("radarr")
+        progress = []
+        result = manager.safe_sync_plan("radarr", progress.append)
 
         self.assertEqual(result["safe_count"], 2)
         self.assertEqual(
@@ -1523,6 +1524,14 @@ class EngineTest(unittest.TestCase):
             {item["hash"] for item in result["manual"]},
             {"BLOCKED", "DUPLICATE"},
         )
+        self.assertEqual(
+            {event["stage"] for event in progress},
+            {"audit", "categories", "reconciles", "manual"},
+        )
+        self.assertEqual(
+            progress[-2]["current"], progress[-2]["total"]
+        )
+        self.assertEqual(progress[-1]["stage"], "manual")
 
     def test_safe_category_batch_validates_every_item_before_mutating(self):
         manager = Stowarr.__new__(Stowarr)
@@ -1556,6 +1565,53 @@ class EngineTest(unittest.TestCase):
             )
 
         manager._apply_sync_category_context.assert_not_called()
+
+    def test_safe_category_batch_reports_real_validation_and_apply_progress(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.config = SimpleNamespace(apply=True)
+        manager._require_write_ready = Mock()
+        manager._move_lock = threading.RLock()
+        manager.store = SimpleNamespace(
+            has_active_queue_work=lambda: False,
+            consume_confirmation=Mock(),
+        )
+        repairs = [
+            {"hash": "FIRST", "torrent_name": "First"},
+            {"hash": "SECOND", "torrent_name": "Second"},
+        ]
+        manager._safe_category_selection = Mock(return_value={
+            "app": "radarr", "category_repairs": repairs,
+        })
+        contexts = [
+            {
+                "app": "radarr", "hash": item["hash"], "pool": "p3",
+                "previous_category": "", "category": "radarr-pool3",
+                "changed": True,
+            }
+            for item in repairs
+        ]
+        manager._sync_category_repair_context = Mock(side_effect=contexts)
+        manager._apply_sync_category_context = Mock(
+            side_effect=lambda context: context
+        )
+        progress = []
+
+        result = manager.apply_safe_category_repairs(
+            "token", "radarr", ["FIRST", "SECOND"], progress.append
+        )
+
+        self.assertEqual(result["changed"], 2)
+        self.assertEqual(
+            [(event["stage"], event["current"], event["total"]) for event in progress],
+            [
+                ("validation", 0, 2),
+                ("validation", 1, 2),
+                ("validation", 2, 2),
+                ("apply", 0, 2),
+                ("apply", 1, 2),
+                ("apply", 2, 2),
+            ],
+        )
 
     def test_qbittorrent_search_does_not_consult_arr(self):
         manager = Stowarr.__new__(Stowarr)
