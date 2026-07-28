@@ -276,7 +276,7 @@ class StoreTest(unittest.TestCase):
                 ("move", third["public_id"]),
             )
 
-    def test_queue_cleanup_keeps_running_work_and_history(self):
+    def test_queue_cleanup_only_removes_finished_work_and_keeps_history(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory) / "state.db")
             finished = store.enqueue_move("finished", "p1", {}, "finished", {})
@@ -290,11 +290,31 @@ class StoreTest(unittest.TestCase):
 
             running = store.claim_next_move()
             queued = store.enqueue_move("queued", "p1", {}, "queued", {})
-            self.assertEqual(store.clear_move_queue(), 2)
+            self.assertEqual(store.clear_move_queue(), 1)
             remaining = store.move_queue()
-            self.assertEqual([item["public_id"] for item in remaining], [running["public_id"]])
-            self.assertNotEqual(remaining[0]["public_id"], queued["public_id"])
+            self.assertEqual(
+                [item["public_id"] for item in remaining],
+                [running["public_id"], queued["public_id"]],
+            )
             self.assertEqual(store.recent()[0]["id"], operation_id)
+
+    def test_reconcile_queue_cleanup_keeps_waiting_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            finished = store.enqueue_reconcile(
+                "finished", {"auxiliaryFiles": []}, "finished", {}
+            )
+            store.claim_next_operation()
+            store.finish_reconcile(finished["id"], "FAILED")
+            waiting = store.enqueue_reconcile(
+                "waiting", {"auxiliaryFiles": []}, "waiting", {}
+            )
+
+            self.assertEqual(store.clear_reconcile_queue(), 1)
+            self.assertEqual(
+                [item["public_id"] for item in store.reconcile_queue()],
+                [waiting["public_id"]],
+            )
 
     def test_restart_marks_queue_and_history_and_pauses_later_work(self):
         with tempfile.TemporaryDirectory() as directory:
