@@ -1675,6 +1675,17 @@
   font-size: 12px;
 }
 
+.recovery-resolution label small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.recovery-resolution-actions {
+  align-items: end;
+  display: flex;
+  gap: 8px;
+}
+
 .recovery-note {
   background: #1b1d1f;
   border: 1px solid #555a60;
