@@ -1390,6 +1390,31 @@
   margin: 0 20px 18px;
 }
 
+.safe-workflow-confirmation {
+  background: #1c2e3f;
+  border: 1px solid #426989;
+  border-left: 3px solid var(--blue);
+  margin: 0 20px 18px;
+  padding: 14px 16px;
+}
+
+.safe-workflow-confirmation h3 {
+  font-size: 16px;
+  margin: 0 0 6px;
+}
+
+.safe-workflow-confirmation p {
+  color: var(--muted);
+  line-height: 1.45;
+  margin: 0 0 12px;
+}
+
+.safe-workflow-confirmation .confirm-details {
+  margin: 0;
+  max-height: 190px;
+  overflow: auto;
+}
+
 .sync-status-filter .badge {
   pointer-events: none;
 }

@@ -45,7 +45,7 @@ async function changePassword(event){event.preventDefault();const form=event.cur
 function toast(message){const node=$('#toast');node.textContent=message;node.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>node.classList.remove('show'),2600)}
 function confirmAction({title,message='',details=[],confirmLabel='Confirm',danger=false}){const dialog=$('#confirm-dialog');$('#confirm-title').textContent=title;$('#confirm-message').textContent=message;$('#confirm-details').innerHTML=details.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('');const accept=$('#confirm-accept');accept.textContent=confirmLabel;accept.className=danger?'danger':'primary';if(dialog.open)dialog.close();dialog.showModal();return new Promise(resolve=>{let settled=false;const finish=result=>{if(settled)return;settled=true;dialog.removeEventListener('cancel',onCancel);dialog.removeEventListener('close',onClose);$('#confirm-cancel').removeEventListener('click',onCancel);$('#confirm-close').removeEventListener('click',onCancel);accept.removeEventListener('click',onAccept);if(dialog.open)dialog.close();resolve(result)};const onCancel=event=>{event?.preventDefault();finish(false)};const onClose=()=>finish(false);const onAccept=()=>finish(true);dialog.addEventListener('cancel',onCancel);dialog.addEventListener('close',onClose);$('#confirm-cancel').addEventListener('click',onCancel);$('#confirm-close').addEventListener('click',onCancel);accept.addEventListener('click',onAccept)})}
 function startSafeWorkflow(title,summary,steps){
-  state.safeWorkflow={title,summary,steps:steps.map(step=>({...step,current:0,total:1,message:step.description,status:'remaining'})),terminal:false,error:''};
+  state.safeWorkflow={title,summary,steps:steps.map(step=>({...step,current:0,total:1,message:step.description,status:'remaining'})),terminal:false,error:'',confirmation:null};
   state.safeWorkflow.steps[0].status='active';
   renderSafeWorkflow();
   const dialog=$('#safe-workflow-dialog');
@@ -75,6 +75,15 @@ function finishSafeWorkflow(summary){
   if(!state.safeWorkflow)return;
   state.safeWorkflow.steps.forEach(step=>{step.status='complete';step.current=step.total||1;step.total=step.total||1});
   state.safeWorkflow.summary=summary;
+  state.safeWorkflow.confirmation=null;
+  state.safeWorkflow.terminal=true;
+  renderSafeWorkflow();
+}
+function confirmSafeWorkflowPhase({summary,title,message,details,confirmLabel,onConfirm}){
+  if(!state.safeWorkflow)return;
+  state.safeWorkflow.steps.forEach(step=>{step.status='complete';step.current=step.total||1;step.total=step.total||1});
+  state.safeWorkflow.summary=summary;
+  state.safeWorkflow.confirmation={title,message,details,confirmLabel,onConfirm};
   state.safeWorkflow.terminal=true;
   renderSafeWorkflow();
 }
@@ -83,6 +92,7 @@ function failSafeWorkflow(error){
   const active=state.safeWorkflow.steps.find(step=>step.status==='active');
   if(active)active.status='failed';
   state.safeWorkflow.error=error;
+  state.safeWorkflow.confirmation=null;
   state.safeWorkflow.summary='The workflow stopped safely';
   state.safeWorkflow.terminal=true;
   renderSafeWorkflow();
@@ -102,14 +112,35 @@ function renderSafeWorkflow(){
   }).join('');
   $('#safe-workflow-error').textContent=workflow.error;
   $('#safe-workflow-error').classList.toggle('hidden',!workflow.error);
+  const confirmation=$('#safe-workflow-confirmation');
+  confirmation.classList.toggle('hidden',!workflow.confirmation);
+  if(workflow.confirmation){
+    $('#safe-workflow-confirm-title').textContent=workflow.confirmation.title;
+    $('#safe-workflow-confirm-message').textContent=workflow.confirmation.message;
+    $('#safe-workflow-confirm-details').innerHTML=workflow.confirmation.details.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join('');
+  }else{
+    $('#safe-workflow-confirm-details').innerHTML='';
+  }
   $('#safe-workflow-close').disabled=!workflow.terminal;
-  $('#safe-workflow-done').disabled=!workflow.terminal;
+  const cancel=$('#safe-workflow-cancel');
+  const done=$('#safe-workflow-done');
+  cancel.classList.toggle('hidden',!workflow.confirmation);
+  done.textContent=workflow.confirmation?.confirmLabel||'Close';
+  done.disabled=!workflow.terminal;
 }
 function closeSafeWorkflow(){
   if(!state.safeWorkflow?.terminal)return;
   const dialog=$('#safe-workflow-dialog');
   if(dialog.open)dialog.close();
   state.safeWorkflow=null;
+}
+async function continueSafeWorkflow(){
+  const confirmation=state.safeWorkflow?.confirmation;
+  if(!confirmation){closeSafeWorkflow();return}
+  state.safeWorkflow.confirmation=null;
+  state.safeWorkflow.terminal=false;
+  renderSafeWorkflow();
+  await confirmation.onConfirm();
 }
 const MOVE_PROGRESS=[['MOVE_PLANNED','Plan accepted','The operation is bound to the reviewed torrent and destination.'],['MOVE_PAUSED','Torrent paused','Writes are stopped before the storage path changes.'],['MOVE_ISOLATED','Torrent isolated','A temporary Stowarr category prevents *Arr cleanup during the transaction.'],['MOVE_RELOCATING','Torrent data relocating','qBittorrent moves its tracked files to the destination pool.'],['MOVE_RECHECKING','qBittorrent rechecking','Stowarr observes qBittorrent enter checking and follows its reported progress.'],['MOVE_QBIT_COMPLETE','Torrent content verified','The recheck finished and every selected qBittorrent file is visible.'],['MOVE_ARCHIVE_VERIFYING','Archive integrity verifying','Every required archive set is tested at the destination before extraction.'],['MOVE_ARCHIVE_VERIFIED','Archive integrity verified','Every required archive set passed its integrity and manifest checks.'],['MOVE_EXTRACTING','Archive media extracting','Extraction, hashing, and publication progress are reported separately.'],['MOVE_EXTRACTED','Archive media verified','Archive-derived media has been extracted and hash-verified.'],['MOVE_ADDITIONAL_VERIFYING','Additional files verifying','Selected subtitles, metadata, and artwork are being verified.'],['MOVE_ADDITIONAL_VERIFIED','Additional files verified','Selected subtitles, metadata, and artwork are copied and hash-verified.'],['MOVE_LIBRARY_VERIFYING','Library files verifying','Media hashes and hardlink destinations are being verified.'],['MOVE_LIBRARY_LINKED','Library files created','Verified hardlinks or extracted media are created on the destination pool.'],['MOVE_LIBRARY_AUXILIARY','Library sidecars copied','Selected subtitles, metadata, and artwork are present in the new library.'],['MOVE_ARR_UPDATED','*Arr route updated','The movie or series root folder and pool tag now point at the destination.'],['MOVE_ARR_RESCANNING','*Arr library rescanning','Stowarr waits for the Radarr or Sonarr rescan command to finish.'],['MOVE_ARR_RESCANNED','*Arr rescan verified','Radarr or Sonarr confirms every managed file at its new path.'],['MOVE_OLD_LIBRARY_REMOVED','Source library finalized','A distinct stale source folder is removed after verification; the destination folder is always kept.'],['MOVE_DERIVATIVE_CLEANUP','Derived output cleanup','Recognized Unpackerr output is removed only after its media hash matches the published library file.'],['MOVE_ROUTE_COMMITTED','Final route committed','The destination category is assigned only after the library update succeeds.'],['MOVE_RESUMING','Torrent resuming','qBittorrent is instructed to continue from the verified destination.'],['MOVE_SEEDING','Seeding verified','qBittorrent confirms an active or queued upload state at 100% progress.'],['COMPLETE','Move complete','qBittorrent is seeding and the *Arr library agrees.']];
 const RECONCILE_PROGRESS=[['PLANNED','Plan accepted','The reviewed repair plan has been registered.'],['RECONCILE_VERIFYING','Library files verifying','Source content is hash-verified before links or copies are created.'],['LINKED','Library files created','Verified media is present on the authoritative pool.'],['AUXILIARY_COPIED','Sidecars copied','Selected subtitles, artwork, and metadata have been verified.'],['ARR_UPDATED','*Arr route updated','The movie or series points at the authoritative pool.'],['ARR_RESCANNING','*Arr library rescanning','Stowarr waits for Radarr or Sonarr to finish.'],['ARR_RESCANNED','*Arr rescan verified','Managed files are confirmed at their expected paths.'],['SOURCE_UNLINKED','Stale source removed','Verified obsolete files are removed last.'],['COMPLETE','Reconcile complete','The library and qBittorrent agree.']];
@@ -841,6 +872,47 @@ const safePlanSteps=()=>[
 async function fetchSafeSyncPlan(app,onProgress){
   return streamApi(`/api/sync/${encodeURIComponent(app)}/safe-plan/progress`,{},onProgress);
 }
+function offerSafePlanConfirmation(app,plan,prefix=''){
+  const repairs=plan.category_repairs||[];
+  const candidates=plan.reconcile_candidates||[];
+  const manual=plan.manual||[];
+  const summary=[prefix,`${plan.safe_count} safe actions found; ${manual.length} remain manual`].filter(Boolean).join(' · ');
+  if(repairs.length){
+    confirmSafeWorkflowPhase({
+      summary,
+      title:`Review ${repairs.length} safe category ${repairs.length===1?'fix':'fixes'}`,
+      message:'No changes have been made. Confirm to revalidate the complete batch, then process each torrent one at a time. Reconcile will be planned again after categories are current.',
+      details:[
+        ['Next phase',`${repairs.length} qBittorrent category ${repairs.length===1?'fix':'fixes'}`],
+        ['Afterwards',`${candidates.length} current Reconcile ${candidates.length===1?'candidate':'candidates'} will be discarded and rebuilt`],
+        ['Manual review',`${manual.length} ${manual.length===1?'item remains':'items remain'} excluded`],
+        ...repairs.slice(0,8).map(item=>[item.torrent_name,`${item.current_category||'none'} → ${item.category}`]),
+        ...(repairs.length>8?[['Additional category fixes',String(repairs.length-8)]]:[]),
+      ],
+      confirmLabel:`Confirm ${repairs.length} category ${repairs.length===1?'fix':'fixes'}`,
+      onConfirm:()=>applySafeCategories({app,plan,confirmed:true}),
+    });
+    return;
+  }
+  if(candidates.length){
+    confirmSafeWorkflowPhase({
+      summary,
+      title:`Review ${candidates.length} safe Reconcile ${candidates.length===1?'job':'jobs'}`,
+      message:'No jobs have been queued. Confirm to freshly authorize each problem one at a time; changed or ambiguous titles are skipped and accepted jobs are appended to the shared FIFO queue.',
+      details:[
+        ['Next phase',`${candidates.length} Reconcile ${candidates.length===1?'candidate':'candidates'}`],
+        ['Queue behavior','Each accepted title is added after existing Move and Reconcile work'],
+        ['Manual review',`${manual.length} ${manual.length===1?'item remains':'items remain'} excluded`],
+        ...candidates.slice(0,8).map(item=>[item.torrent_name,`${item.target_pool} · ${item.auxiliary_count} auxiliary files`]),
+        ...(candidates.length>8?[['Additional Reconcile candidates',String(candidates.length-8)]]:[]),
+      ],
+      confirmLabel:`Confirm ${candidates.length} Reconcile ${candidates.length===1?'job':'jobs'}`,
+      onConfirm:()=>queueSafeReconciles({app,plan,confirmed:true}),
+    });
+    return;
+  }
+  finishSafeWorkflow(summary||'No safe automated actions are currently available');
+}
 async function planSafeSyncFixes(){
   const app=state.syncApp;
   const button=$('#plan-safe-sync');
@@ -850,7 +922,7 @@ async function planSafeSyncFixes(){
     const plan=await fetchSafeSyncPlan(app,updateSafeWorkflow);
     state.safeSyncPlans[app]=plan;
     if(state.syncApp===app)renderSafeSyncPlan(plan);
-    finishSafeWorkflow(`${plan.safe_count} safe actions found; ${plan.manual.length} remain manual`);
+    offerSafePlanConfirmation(app,plan);
     toast(`${plan.safe_count} safe assisted action${plan.safe_count===1?'':'s'} found`);
   }catch(error){
     failSafeWorkflow(error.message);
@@ -859,12 +931,12 @@ async function planSafeSyncFixes(){
     if(button?.isConnected)button.disabled=false;
   }
 }
-async function applySafeCategories(){
-  const app=state.syncApp;
-  const plan=state.safeSyncPlans[app];
+async function applySafeCategories(options={}){
+  const app=options.app||state.syncApp;
+  const plan=options.plan||state.safeSyncPlans[app];
   const repairs=plan?.category_repairs||[];
   if(!repairs.length)return;
-  if(!await confirmAction({title:`Apply ${repairs.length} safe category ${repairs.length===1?'fix':'fixes'}?`,message:'Before changing qBittorrent, Stowarr will rebuild the audit and verify every exact hash association, download path, pool route, and category destination. If any item changed, the entire batch is rejected.',details:repairs.slice(0,10).map(item=>[item.torrent_name,`${item.current_category||'none'} → ${item.category}`]),confirmLabel:'Apply safe fixes'}))return;
+  if(!options.confirmed&&!await confirmAction({title:`Apply ${repairs.length} safe category ${repairs.length===1?'fix':'fixes'}?`,message:'Before changing qBittorrent, Stowarr will rebuild the audit and verify every exact hash association, download path, pool route, and category destination. If any item changed, the entire batch is rejected.',details:repairs.slice(0,10).map(item=>[item.torrent_name,`${item.current_category||'none'} → ${item.category}`]),confirmLabel:'Apply safe fixes'}))return;
   const hashes=repairs.map(item=>item.hash);
   const button=$('#apply-safe-categories');
   button.disabled=true;
@@ -888,18 +960,19 @@ async function applySafeCategories(){
     state.safeSyncPlans[app]=nextPlan;
     if(state.syncApp===app)renderSafeSyncPlan(nextPlan);
     updateSafeWorkflow({stage:'rebuild',current:1,total:1,message:`${nextPlan.safe_count} safe actions remain after category repair`});
-    finishSafeWorkflow(`${result.changed} categories changed; the refreshed safe plan is ready`);
+    offerSafePlanConfirmation(app,nextPlan,`${result.changed} ${result.changed===1?'category':'categories'} changed`);
   }catch(error){
     failSafeWorkflow(`${error.message}. Any category changes already shown as complete are retained; rerun the audit before continuing.`);
     toast(`Category workflow stopped: ${error.message}`);
     button.disabled=false;
   }
 }
-async function queueSafeReconciles(){
-  const app=state.syncApp;
-  const candidates=state.safeSyncPlans[app]?.reconcile_candidates||[];
+async function queueSafeReconciles(options={}){
+  const app=options.app||state.syncApp;
+  const plan=options.plan||state.safeSyncPlans[app];
+  const candidates=plan?.reconcile_candidates||[];
   if(!candidates.length)return;
-  if(!await confirmAction({title:`Queue ${candidates.length} safe Reconcile ${candidates.length===1?'job':'jobs'}?`,message:'Each candidate gets a fresh exact plan and confirmation. Changed or ambiguous candidates are skipped; accepted jobs enter the existing shared Move/Reconcile FIFO queue.',details:candidates.slice(0,10).map(item=>[item.torrent_name,`${item.target_pool} · ${item.auxiliary_count} auxiliary files`]),confirmLabel:'Queue safe reconciles'}))return;
+  if(!options.confirmed&&!await confirmAction({title:`Queue ${candidates.length} safe Reconcile ${candidates.length===1?'job':'jobs'}?`,message:'Each candidate gets a fresh exact plan and confirmation. Changed or ambiguous candidates are skipped; accepted jobs enter the existing shared Move/Reconcile FIFO queue.',details:candidates.slice(0,10).map(item=>[item.torrent_name,`${item.target_pool} · ${item.auxiliary_count} auxiliary files`]),confirmLabel:'Queue safe reconciles'}))return;
   const button=$('#queue-safe-reconciles');
   button.disabled=true;
   startSafeWorkflow(`Queue ${candidates.length} safe Reconcile ${candidates.length===1?'job':'jobs'}`,'Every candidate is freshly authorized before it enters the shared FIFO',[
@@ -989,7 +1062,8 @@ document.addEventListener('click',e=>{const details=e.target.closest('.inspect-o
 $('#operation-dialog').addEventListener('cancel',e=>{e.preventDefault();if(state.operationTracking&&!terminalOperation(state.currentOperation))hideOperationTracking();else if(!$('#operation-done').disabled)finishOperationTracking()});
 $('#safe-workflow-dialog').addEventListener('cancel',e=>{e.preventDefault();closeSafeWorkflow()});
 $('#safe-workflow-close').addEventListener('click',closeSafeWorkflow);
-$('#safe-workflow-done').addEventListener('click',closeSafeWorkflow);
+$('#safe-workflow-cancel').addEventListener('click',closeSafeWorkflow);
+$('#safe-workflow-done').addEventListener('click',continueSafeWorkflow);
 $('#connections-form').addEventListener('submit',saveConnections);
 document.addEventListener('click',event=>{
   if(event.target.closest('#open-routing-guide'))refreshRoutingGuide()
