@@ -185,6 +185,7 @@ const INDETERMINATE_PROGRESS_STATES=new Set(['MOVE_RELOCATING','MOVE_ARR_RESCANN
 const operationKindLabel=kind=>kind==='reconcile'?'Reconcile':kind==='category'?'Category repair':'Move';
 function resetOperationSections(){state.operationSections={completed:false,remaining:false}}
 const terminalOperation=operation=>Boolean(operation&&['COMPLETE','FAILED','BLOCKED','DRY_RUN','RECOVERY_REQUIRED'].includes(operation.state));
+const QUEUE_TERMINAL_STATES=new Set(['COMPLETE','FAILED','CANCELLED','INTERRUPTED']);
 function resetOperationLog(){const panel=$('#operation-log-panel');panel.open=false}
 function renderOperationMinimized(){
   const launcher=$('#operation-minimized');
@@ -609,7 +610,7 @@ function renderQueue(){
       const route=kind==='move'?`${esc(detail.current_pool||'—')} → ${esc(item.target_pool)}`:esc(detail.target_pool||'—');
       return `<tr data-queue-public-id="${esc(item.public_id)}"><td><span class="queue-position"><code>${esc(item.public_id)}</code><small>${esc(positionLabel)}</small></span></td><td class="queue-torrent"><strong>${esc(detail.torrent_name||item.torrent_hash)}</strong><code>${esc(item.torrent_hash)}</code>${error}</td><td>${route}</td><td>${badge(item.state)}</td><td>${operation}</td><td>${fmtTime(item.updated_at)}</td><td>${action}</td></tr>`;
     }).join(''):`<tr><td colspan="7" class="empty">The ${kind==='move'?'Move':'Reconcile'} queue is empty</td></tr>`;
-    const removable=rows.filter(item=>item.state!=='RUNNING').length;
+    const removable=rows.filter(item=>QUEUE_TERMINAL_STATES.has(item.state)).length;
     const clearButton=$(`.clear-queue[data-kind="${kind}"]`);
     if(clearButton)clearButton.disabled=!removable;
   };
@@ -729,12 +730,10 @@ async function cancelQueue(id,kind='move'){
 async function clearQueue(kind){
   const label=kind==='reconcile'?'Reconcile':'Move';
   const rows=kind==='reconcile'?state.reconcileQueue:state.queue;
-  const finished=rows.filter(item=>['COMPLETE','FAILED','CANCELLED','INTERRUPTED'].includes(item.state)).length;
-  const queued=rows.filter(item=>item.state==='QUEUED').length;
-  const count=finished+queued;
-  if(!count)return;
-  const message=`This removes ${finished} finished and ${queued} waiting queue entries. Running work and Operation History are always kept.`;
-  if(!await confirmAction({title:`Clear ${label} queue?`,message,details:[['Queue',label],['Entries removed',String(count)]],confirmLabel:'Clear queue',danger:true}))return;
+  const finished=rows.filter(item=>QUEUE_TERMINAL_STATES.has(item.state)).length;
+  if(!finished)return;
+  const message=`This removes ${finished} finished queue ${finished===1?'entry':'entries'}. Waiting and running work and Operation History are always kept.`;
+  if(!await confirmAction({title:`Clear finished ${label} jobs?`,message,details:[['Queue',label],['Finished entries removed',String(finished)]],confirmLabel:'Clear finished',danger:true}))return;
   const endpoint=kind==='reconcile'?'reconcile-queue':'queue';
   try{const result=await api(`/api/${endpoint}`,{method:'DELETE'});await refreshQueue();toast(`${result.deleted} ${label} queue ${result.deleted===1?'entry':'entries'} removed`)}catch(error){toast(`${label} queue was not cleared: ${error.message}`)}
 }

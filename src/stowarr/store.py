@@ -516,7 +516,8 @@ class Store:
         with self.lock:
             # The table is allowlisted above.
             cursor = self.db.execute(
-                f"DELETE FROM {table} WHERE state!='RUNNING'"  # nosec
+                f"""DELETE FROM {table}
+                WHERE state IN ('COMPLETE','FAILED','CANCELLED','INTERRUPTED')"""  # nosec
             )
             self.db.commit()
             return int(cursor.rowcount)

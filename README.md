@@ -1,53 +1,62 @@
 # Stowarr
 
-Stowarr keeps qBittorrent, Radarr, and Sonarr consistent when media is spread
-across multiple storage pools. qBittorrent's torrent `save_path` is the source
-of truth for the authoritative pool.
+Stowarr is a self-hosted repair and storage-pool migration tool for
+qBittorrent, Radarr, and Sonarr. It finds disagreements between torrent data
+and *Arr libraries, repairs verified library mappings, and moves seeding data
+between storage pools without treating filenames or paths as proof of content.
 
-## Development checks
+> [!WARNING]
+> Stowarr is currently a beta release. It can move, link, copy, extract, and
+> delete media after verification. Test the deployment against your own path,
+> permission, hardlink, and backup strategy before relying on Write mode.
 
-Static analysis is installed inside the project rather than globally:
+## Why Stowarr?
 
-```bash
-python -m venv .venv
-.venv/bin/pip install -e '.[dev]'
-npm ci
-scripts/bootstrap-analysis-tools.sh
-```
+Multi-pool media installations can drift over time:
 
-The bootstrap script installs checksum-pinned ShellCheck, actionlint, and
-Hadolint binaries under the ignored `.tools/` directory; no system-wide
-installation is required. Run the complete repository check:
+- qBittorrent seeds a release from one pool while Radarr or Sonarr points to
+  another;
+- a library import or manual move breaks the expected hardlink;
+- a torrent category routes to the wrong download root;
+- packed releases leave extracted media detached from their archive source; or
+- duplicate and ambiguous *Arr history makes an automatic repair unsafe.
 
-```bash
-scripts/check.sh
-```
+Stowarr treats qBittorrent's exact torrent identity and `save_path` as the
+authoritative pool selection, then requires current *Arr mappings and
+file-content verification before changing anything.
 
-MyPy currently checks every Python module, with a temporary gradual-typing
-override for `stowarr.engine`. Ruff, Bandit, ESLint, and the test suite cover
-that module normally. The full check also covers HTML, CSS, shell scripts,
-GitHub Actions workflows, Dockerfiles, Compose and JSON syntax, plus Python
-and npm dependency advisories.
+## What it does
 
-## Workflows
-
-Stowarr deliberately separates discovery, repair, and relocation:
+Stowarr separates inspection, repair, and relocation into three workflows:
 
 | Workflow | Purpose | Changes qBittorrent save path |
 | --- | --- | --- |
-| **Sync** | Compare qBittorrent hashes with Radarr or Sonarr | No |
-| **Reconcile** | Repair library paths and hardlinks on the pool already selected by qBittorrent | No |
-| **Move** | Relocate torrent data through qBittorrent, verify it, and rebuild the library on another pool | Yes |
+| **Sync** | Audit hashes, categories, save paths, pools, and *Arr library paths | No |
+| **Reconcile** | Repair a verified library path or hardlink on qBittorrent's current pool | No |
+| **Move** | Relocate torrent data through qBittorrent and rebuild the verified library on another pool | Yes |
 
 Radarr movies are resolved through `downloadId → movieId → movieFile`. Sonarr
 downloads are resolved through `downloadId → seriesId/episodeId → episodeFile`.
 Incomplete or ambiguous mappings are blocked instead of being expanded to
 unrelated files.
 
-## Safety model
+The WebUI also provides:
+
+- separate Move and Reconcile queue views backed by one global FIFO execution
+  slot;
+- live, minimizable progress with named verification stages;
+- Safe assisted Sync repairs for unambiguous category fixes and freshly
+  revalidated Reconcile candidates;
+- persistent History with short public job IDs and execution logs;
+- read-only recovery diagnosis after interrupted operations; and
+- routing diagnostics for qBittorrent categories, *Arr download clients, tags,
+  and root folders.
+
+## Safety by design
 
 - Fresh installations start in dry-run mode.
-- Every destructive request requires an explicit, single-use confirmation.
+- Every mutation requires an explicit, single-use confirmation bound to the
+  exact current plan and selected payload.
 - Confirmation tokens expire after ten minutes and are bound to the exact plan
   and selected payload.
 - Reconcile never pauses or relocates torrent data.
@@ -70,9 +79,26 @@ Archive-backed cross-pool execution uses qBittorrent recheck, archive integrity
 testing, isolated extraction, SHA-256 comparison, and a completed *Arr rescan
 before any old derived media is removed.
 
-## Quick start with Docker Compose
+If Stowarr or its host stops during a transaction, the operation is never
+silently replayed or rolled back. Later writes remain paused until the operator
+reviews the recorded stage, runs read-only diagnosis, inspects external state,
+and explicitly acknowledges recovery.
 
-The Compose file uses public multi-architecture images for `linux/amd64` and
+## Requirements
+
+- qBittorrent plus Radarr and/or Sonarr
+- Docker Compose or another container platform
+- the same absolute media paths visible to Stowarr, qBittorrent, and *Arr
+- filesystem support for hardlinks when direct torrent media should be linked
+  into a library
+- one `stowarr-api` replica for each state database and media set
+
+Stowarr supports multiple Sonarr root families below each pool, such as both
+`series` and `anime`.
+
+## Quick start
+
+Public multi-architecture images are available for `linux/amd64` and
 `linux/arm64`:
 
 - `ghcr.io/slashmad/stowarr-api:latest`
@@ -85,20 +111,20 @@ cp config/config.example.json config/config.json
 cp .env.example .env
 ```
 
-Before starting, edit `.env`:
+Edit `.env` and match the numeric identity to the user or shared media group
+used by qBittorrent, Radarr, and Sonarr:
 
 ```dotenv
-# Runtime ownership for a typical Docker host. Match these IDs to the owner or
-# shared media group on the host.
 PUID=1000
 PGID=1000
 UMASK=002
 
-# Optional bootstrap override. Leave blank to generate an API key in the API log.
+# Leave blank to generate credentials on first startup.
 STOWARR_API_TOKEN=
 STOWARR_ADMIN_PASSWORD=
 STOWARR_AUTH_METHOD=forms
-STOWARR_EXTERNAL_USER_HEADER=X-Forwarded-User
+
+# Start read-only.
 STOWARR_APPLY=false
 STOWARR_MEDIA_MOUNT_MODE=ro
 
@@ -109,8 +135,8 @@ POOL2_CONTAINER_PATH=/data/pool2
 ```
 
 The container paths must match the absolute media paths visible to
-qBittorrent, Radarr, and Sonarr. Adjust the pool definitions in
-`config/config.json` to use those same container paths.
+qBittorrent, Radarr, and Sonarr. Configure the same paths, pool categories,
+tags, and *Arr roots in `config/config.json`.
 
 Stowarr starts as root only long enough to make `/state` writable, then drops
 to the numeric `PUID:PGID` before starting the API. It never recursively changes
@@ -131,48 +157,30 @@ Verify the configured identity against the actual user and group selected for
 the installed TrueNAS apps instead of assuming that every installation uses
 the defaults.
 
-Start Stowarr:
-
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-On first startup, Stowarr creates the `admin` WebUI account. It also creates a
-separate API key when `STOWARR_API_TOKEN` is empty. Retrieve any generated
-credentials from the API container log:
+On first startup, Stowarr creates the `admin` WebUI account and a separate API
+key when the corresponding environment values are empty. Retrieve generated
+credentials from the API log:
 
 ```bash
 docker compose logs stowarr-api
 ```
 
-Only a scrypt password hash is persisted in the state database. The generated
-cleartext password is written to the startup log and is not returned by any
-API. It can be replaced from Settings after signing in.
-
-If `STOWARR_API_TOKEN` is empty, the generated API key is persisted in the
-state volume and printed only when it is first created. An explicit environment
-value overrides the persisted key. The built-in default is never a shared or
-predictable credential.
-
-API examples below read the key from `STOWARR_API_TOKEN`. If Stowarr generated
-the key, copy it from the first-start log into your current shell without
-writing it to the repository:
-
-```bash
-read -rsp "Stowarr API key: " STOWARR_API_TOKEN && export STOWARR_API_TOKEN
-echo
-```
-
-If the password is lost, replace it from inside the API container. Omitting
-`--password` generates a new random password and prints it once:
+The cleartext password and generated API key are printed only when created.
+Only their secure persisted forms remain in the state volume. Reset a lost
+password from the API container; omitting `--password` generates a new random
+value:
 
 ```bash
 docker compose exec stowarr-api stowarr reset-password
 ```
 
-Open `http://127.0.0.1:8787` and sign in. Service connections can be configured
-together or one at a time from Settings:
+Open `http://127.0.0.1:8787`, sign in, and configure service connections under
+**Settings**:
 
 - qBittorrent URL and API key, or legacy username/password fallback;
 - Radarr URL and API key;
@@ -204,6 +212,48 @@ RADARR_API_KEY=
 SONARR_API_KEY=
 ```
 
+## Dry run and Write mode
+
+The default deployment is intentionally non-destructive:
+
+```dotenv
+STOWARR_APPLY=false
+STOWARR_MEDIA_MOUNT_MODE=ro
+```
+
+A confirmed operation is recorded as `DRY_RUN` and cannot modify media. To
+enable Write mode, make the media mount writable and recreate the API
+container:
+
+```dotenv
+STOWARR_APPLY=true
+STOWARR_MEDIA_MOUNT_MODE=rw
+```
+
+```bash
+docker compose up -d --force-recreate stowarr-api
+```
+
+Write mode does not bypass confirmations or safety checks. It can also be
+toggled under **Settings → Execution mode** after Stowarr validates every
+configured and discovered write destination. Container identity, bind mounts,
+mount mode, listener ports, and environment-provided secrets remain deployment
+settings that require a container recreate.
+
+## Safe assisted Sync repair
+
+After a Sync audit, **Plan safe fixes** classifies problems into:
+
+1. category changes that can be proven from the exact torrent path and
+   configured pool route;
+2. root mismatches with a fresh, ready Reconcile plan; and
+3. ambiguous items that remain manual.
+
+Planning is read-only. Category changes and Reconcile queue insertion are
+separate confirmed phases. Category repairs run first because they invalidate
+the earlier audit; Stowarr then refreshes the audit and rebuilds every Reconcile
+candidate before offering the next confirmation.
+
 ## Pool routing
 
 Each pool defines:
@@ -234,41 +284,6 @@ Tags restrict which movie or series may use a download client. Tags do not set
 the download path themselves. Stowarr's routing diagnostics compare the *Arr
 download clients, categories, tags, root folders, and qBittorrent category save
 paths.
-
-## Dry run and Write mode
-
-The default configuration is intentionally non-destructive:
-
-```dotenv
-STOWARR_APPLY=false
-STOWARR_MEDIA_MOUNT_MODE=ro
-```
-
-Build and inspect plans in this mode first. A confirmed operation is recorded
-as `DRY_RUN` and cannot modify media.
-
-After validating the paths, permissions, and plans, enable **Write mode** by
-changing both deployment settings and recreating the API container:
-
-```dotenv
-STOWARR_APPLY=true
-STOWARR_MEDIA_MOUNT_MODE=rw
-```
-
-```bash
-docker compose up -d --force-recreate stowarr-api
-```
-
-Write access does not remove the confirmation requirement. The WebUI and API
-still require an explicit plan confirmation for every destructive operation.
-
-The execution mode can also be changed under **Settings → Execution mode**.
-Stowarr validates that every configured pool is writable before enabling Write
-mode and stores the runtime choice in its SQLite state. Docker boundary settings
-such as `PUID`, `PGID`, `UMASK`, bind mounts, mount mode, listener ports, and an
-environment-provided API key remain deployment settings and require a Compose
-recreate. Settings displays both the configured and effective process identity
-so a platform-level user override is visible.
 
 ## Move transaction
 
@@ -303,26 +318,28 @@ The Move confirmation fingerprint includes the destination pool, full plan,
 and every additional-file action. A stale or altered plan cannot reuse an old
 confirmation token.
 
-### Move queue
+## Queue and restart recovery
 
-The WebUI can either start a confirmed Move immediately or add it to the
-persistent **Move queue**. Queued transactions run one at a time in FIFO order,
-so qBittorrent relocation, rechecks, library updates, and cleanup cannot overlap
-between Move operations.
+Move and Reconcile are displayed separately but share one global FIFO execution
+slot. This prevents qBittorrent, *Arr, and filesystem mutations from
+overlapping. A direct submission joins the end of the same FIFO whenever
+another operation is active.
 
-Each queued entry stores the reviewed destination and additional-file actions,
-then rebuilds the plan immediately before execution. If the current qBittorrent,
-filesystem, or *Arr state no longer matches the confirmation fingerprint, the
-entry fails before changing anything and must be reviewed again. A waiting
-entry can be cancelled from the Queue page; a running entry cannot be cancelled
-mid-transaction.
+Every queued entry stores the reviewed selections and rebuilds its plan
+immediately before execution. If qBittorrent, filesystem, or *Arr state no
+longer matches the confirmation fingerprint, it fails before mutation and must
+be reviewed again.
 
-Waiting entries survive normal container restarts. If Stowarr restarts while a
-Move is already running, that entry becomes **Interrupted** and is never
-automatically replayed. The Queue recovery panel pauses later writes, provides
-read-only qBittorrent, *Arr, and filesystem diagnosis, and requires an explicit
-review note before work resumes. Run only one `stowarr-api` replica against a
-state database and media set.
+- Waiting jobs can be cancelled individually.
+- Running jobs cannot be cancelled mid-transaction.
+- **Clear** removes only terminal queue rows; waiting and running jobs remain.
+- Operation History is independent from queue cleanup.
+
+Waiting entries survive normal container restarts. If Stowarr restarts during
+an operation, that entry becomes **Interrupted** and is never automatically
+replayed. The Queue recovery panel pauses later writes, provides read-only
+qBittorrent, *Arr, and filesystem diagnosis, and requires an explicit review
+note before work resumes.
 
 The WebUI **Guide** page summarizes every page and action button.
 
@@ -468,6 +485,27 @@ manually delete old derived output while a Move is running.
 
 ## Development
 
+Install repository-local development and analysis tools:
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+npm ci
+scripts/bootstrap-analysis-tools.sh
+```
+
+The bootstrap script installs checksum-pinned ShellCheck, actionlint, and
+Hadolint binaries under the ignored `.tools/` directory. Run the complete
+repository check:
+
+```bash
+scripts/check.sh
+```
+
+It covers Python tests, Ruff, MyPy, Bandit, JavaScript, HTML, CSS, shell
+scripts, GitHub Actions, Dockerfiles, Compose and JSON syntax, dependency
+advisories, and secret scanning where applicable.
+
 Build local images:
 
 ```bash
@@ -480,9 +518,9 @@ Run the test suite:
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-Pull requests run the test suite, syntax checks, Compose validation, container
-builds, and Gitleaks. Merges to `main` publish both multi-architecture GHCR
-images with provenance and SBOM attestations.
+Pull requests run analysis, tests, Compose validation, container builds, and
+secret scanning. Merges to `main` publish both multi-architecture GHCR images
+with provenance and SBOM attestations.
 
 ## Versioning
 
