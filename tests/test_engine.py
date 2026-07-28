@@ -1429,6 +1429,8 @@ class EngineTest(unittest.TestCase):
         manager.store = SimpleNamespace(
             has_active_queue_work=lambda: False,
             security_event=lambda *args: security_events.append(args),
+            record=Mock(return_value=17),
+            update=Mock(),
         )
         manager._move_lock = threading.RLock()
 
@@ -1436,8 +1438,11 @@ class EngineTest(unittest.TestCase):
 
         self.assertTrue(result["changed"])
         self.assertEqual(result["category"], "radarr-pool3")
+        self.assertEqual(result["operation_id"], 17)
         self.assertEqual(changed, [("ABC123", "radarr-pool3")])
         self.assertEqual(security_events[0][0], "sync-category-repaired")
+        self.assertEqual(manager.store.record.call_args.kwargs["kind"], "category")
+        self.assertEqual(manager.store.update.call_args.args[1], "COMPLETE")
 
     def test_sync_category_repair_is_rejected_while_recovery_is_required(self):
         manager = Stowarr.__new__(Stowarr)
@@ -1541,6 +1546,8 @@ class EngineTest(unittest.TestCase):
         manager.store = SimpleNamespace(
             has_active_queue_work=lambda: False,
             consume_confirmation=Mock(),
+            record=Mock(return_value=23),
+            update=Mock(),
         )
         manager._safe_category_selection = Mock(return_value={
             "app": "radarr",
@@ -1574,6 +1581,8 @@ class EngineTest(unittest.TestCase):
         manager.store = SimpleNamespace(
             has_active_queue_work=lambda: False,
             consume_confirmation=Mock(),
+            record=Mock(return_value=23),
+            update=Mock(),
         )
         repairs = [
             {"hash": "FIRST", "torrent_name": "First"},
@@ -1585,6 +1594,7 @@ class EngineTest(unittest.TestCase):
         contexts = [
             {
                 "app": "radarr", "hash": item["hash"], "pool": "p3",
+                "torrent_name": item["torrent_name"],
                 "previous_category": "", "category": "radarr-pool3",
                 "changed": True,
             }
@@ -1601,6 +1611,10 @@ class EngineTest(unittest.TestCase):
         )
 
         self.assertEqual(result["changed"], 2)
+        self.assertEqual(result["operation_id"], 23)
+        manager.store.record.assert_called_once()
+        self.assertEqual(manager.store.record.call_args.kwargs["kind"], "category")
+        self.assertEqual(manager.store.update.call_args.args[1], "COMPLETE")
         self.assertEqual(
             [(event["stage"], event["current"], event["total"]) for event in progress],
             [
@@ -1611,6 +1625,74 @@ class EngineTest(unittest.TestCase):
                 ("apply", 1, 2),
                 ("apply", 2, 2),
             ],
+        )
+
+    def test_category_batch_failure_after_write_requires_recovery(self):
+        manager = Stowarr.__new__(Stowarr)
+        manager.store = SimpleNamespace(
+            record=Mock(return_value=31),
+            update=Mock(),
+        )
+        contexts = [
+            {
+                "app": "radarr", "hash": "FIRST", "torrent_name": "First",
+                "pool": "p3", "previous_category": "",
+                "category": "radarr-pool3", "changed": True,
+            },
+            {
+                "app": "radarr", "hash": "SECOND", "torrent_name": "Second",
+                "pool": "p3", "previous_category": "",
+                "category": "radarr-pool3", "changed": True,
+            },
+        ]
+        manager._apply_sync_category_context = Mock(side_effect=[
+            contexts[0],
+            RuntimeError("qBittorrent connection was lost"),
+        ])
+
+        with self.assertRaisesRegex(RuntimeError, "connection was lost"):
+            manager._apply_recorded_category_contexts("radarr", contexts)
+
+        self.assertEqual(manager.store.update.call_args.args[1], "RECOVERY_REQUIRED")
+        failure = manager.store.update.call_args.args[2]
+        self.assertTrue(failure["recovery"]["required"])
+        self.assertEqual(failure["failed_after"], "CATEGORY_APPLYING")
+
+    def test_category_recovery_diagnosis_checks_every_selected_hash(self):
+        operation = {
+            "id": 8,
+            "public_id": "C4T3G",
+            "torrent_hash": "first",
+            "app": "sonarr",
+            "kind": "category",
+            "state": "RECOVERY_REQUIRED",
+            "detail": {
+                "category_repairs": [
+                    {"hash": "first", "category": "sonarr-pool3"},
+                    {"hash": "second", "category": "sonarr-pool3"},
+                ],
+                "recovery": {"previous_state": "CATEGORY_APPLYING"},
+            },
+        }
+        manager = Stowarr.__new__(Stowarr)
+        manager.store = SimpleNamespace(
+            operation_by_public_id=lambda public_id: operation
+        )
+        manager.qbit = SimpleNamespace(
+            torrent=lambda torrent_hash: {
+                "hash": torrent_hash,
+                "category": "sonarr-pool3",
+            }
+        )
+
+        result = manager.diagnose_recovery("C4T3G")
+
+        diagnosis = result["diagnosis"]
+        self.assertTrue(diagnosis["read_only"])
+        self.assertEqual(diagnosis["qbittorrent"]["matching"], 2)
+        self.assertEqual(
+            diagnosis["recommendation"]["code"],
+            "CATEGORY_BATCH_APPEARS_COMPLETE",
         )
 
     def test_qbittorrent_search_does_not_consult_arr(self):

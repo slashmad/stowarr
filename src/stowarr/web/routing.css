@@ -630,6 +630,14 @@
   border-left-color: #cf5555;
 }
 
+.safe-workflow-minimized {
+  z-index: 30;
+}
+
+#operation-minimized:not(.hidden) + .safe-workflow-minimized {
+  bottom: 92px;
+}
+
 .operation-minimized > span:last-child {
   display: grid;
   gap: 3px;
@@ -1388,6 +1396,41 @@
 
 .safe-workflow-dialog > .alert {
   margin: 0 20px 18px;
+}
+
+.category-operation-results {
+  border: 1px solid #3b4045;
+  margin-top: 12px;
+}
+
+.category-operation-results summary {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  font-weight: 700;
+  justify-content: space-between;
+  padding: 12px 14px;
+}
+
+.category-operation-results summary span,
+.category-operation-results small {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.category-operation-results ol {
+  list-style: none;
+  margin: 0;
+  max-height: 280px;
+  overflow: auto;
+  padding: 0;
+}
+
+.category-operation-results li {
+  border-top: 1px solid #34383c;
+  display: grid;
+  gap: 4px;
+  padding: 10px 14px;
 }
 
 .safe-workflow-confirmation {
