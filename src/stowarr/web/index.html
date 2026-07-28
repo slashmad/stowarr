@@ -263,11 +263,20 @@
     <div id="safe-workflow-overall" class="operation-overall"></div>
     <ol id="safe-workflow-steps" class="safe-workflow-steps"></ol>
     <div id="safe-workflow-error" class="alert inline-alert hidden"></div>
-    <div class="confirm-actions"><button id="safe-workflow-done" class="primary" type="button" disabled>Close</button></div>
+    <section id="safe-workflow-confirmation" class="safe-workflow-confirmation hidden">
+      <h3 id="safe-workflow-confirm-title">Confirm next phase</h3>
+      <p id="safe-workflow-confirm-message"></p>
+      <dl id="safe-workflow-confirm-details" class="confirm-details"></dl>
+    </section>
+    <div class="confirm-actions"><button id="safe-workflow-cancel" class="secondary hidden" type="button">Not now</button><button id="safe-workflow-done" class="primary" type="button" disabled>Close</button></div>
   </dialog>
   <button id="operation-minimized" class="operation-minimized hidden" type="button" aria-label="Show operation details">
     <span id="operation-minimized-dot" class="dot warn"></span>
     <span><strong id="operation-minimized-title">Move in progress…</strong><small id="operation-minimized-summary">Open operation details</small></span>
+  </button>
+  <button id="safe-workflow-minimized" class="operation-minimized safe-workflow-minimized hidden" type="button" aria-label="Show Safe workflow">
+    <span id="safe-workflow-minimized-dot" class="dot warn"></span>
+    <span><strong id="safe-workflow-minimized-title">Safe workflow in progress…</strong><small id="safe-workflow-minimized-summary">Open workflow details</small></span>
   </button>
   <div id="toast" role="status"></div>
   <script src="/assets/app.js"></script>

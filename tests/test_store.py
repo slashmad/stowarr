@@ -435,3 +435,34 @@ class StoreTest(unittest.TestCase):
                 operation["detail"]["recovery"]["previous_state"],
                 "ARR_RESCANNING",
             )
+
+    def test_restart_marks_category_batch_for_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "state.db")
+            operation_id = store.record(
+                "first",
+                "sonarr",
+                "CATEGORY_APPLYING",
+                {
+                    "torrent_name": "2 safe category fixes",
+                    "category_repairs": [
+                        {"hash": "first", "category": "sonarr-pool3"},
+                        {"hash": "second", "category": "sonarr-pool3"},
+                    ],
+                },
+                kind="category",
+            )
+
+            recovered = store.recover_interrupted_operations()
+
+            self.assertEqual(recovered["queue_count"], 0)
+            self.assertEqual(recovered["operation_count"], 1)
+            operation = next(
+                item for item in store.recovery_required()
+                if item["id"] == operation_id
+            )
+            self.assertEqual(operation["kind"], "category")
+            self.assertEqual(
+                operation["detail"]["recovery"]["previous_state"],
+                "CATEGORY_APPLYING",
+            )

@@ -615,6 +615,55 @@ class Stowarr:
             "operation_state": (detail.get("recovery") or {}).get("previous_state")
             or detail.get("failed_after"),
         }
+        if operation["kind"] == "category":
+            repairs = []
+            for item in detail.get("category_repairs", []):
+                actual = None
+                error = ""
+                try:
+                    torrent = self.qbit.torrent(item["hash"]) if self.qbit else None
+                    actual = str((torrent or {}).get("category") or "")
+                    if torrent is None:
+                        error = "Torrent not found in qBittorrent"
+                except Exception as exc:
+                    error = str(exc)
+                repairs.append({
+                    **item,
+                    "actual_category": actual,
+                    "matches_expected": actual == item.get("category"),
+                    "error": error,
+                })
+            complete = bool(repairs) and all(
+                item["matches_expected"] for item in repairs
+            )
+            facts["qbittorrent"] = {
+                "available": self.qbit is not None,
+                "repairs": repairs,
+                "matching": sum(item["matches_expected"] for item in repairs),
+                "total": len(repairs),
+            }
+            facts["filesystem"] = {"paths": []}
+            facts["arr"] = {
+                "available": False,
+                "app": operation.get("app"),
+                "error": "Category recovery does not mutate or inspect *Arr",
+            }
+            facts["recommendation"] = {
+                "code": (
+                    "CATEGORY_BATCH_APPEARS_COMPLETE"
+                    if complete else "CATEGORY_BATCH_REQUIRES_AUDIT"
+                ),
+                "safe_action": "manual_acknowledgement_then_fresh_audit",
+                "summary": (
+                    "Every selected qBittorrent category now matches the confirmed "
+                    "batch. Acknowledge recovery and run a fresh Sync audit."
+                    if complete else
+                    "The confirmed category batch is incomplete or could not be "
+                    "fully inspected. Correct qBittorrent manually, acknowledge "
+                    "recovery, and run a fresh Sync audit; do not replay the batch."
+                ),
+            }
+            return {"operation": operation, "diagnosis": facts}
 
         torrent = None
         torrent_files: list[dict] = []
@@ -2977,6 +3026,7 @@ class Stowarr:
         return {
             "app": app,
             "hash": torrent_hash,
+            "torrent_name": str(torrent.get("name") or torrent_hash),
             "pool": pool.name,
             "previous_category": current_category,
             "category": expected_category,
@@ -2999,6 +3049,105 @@ class Stowarr:
                 },
             )
         return dict(context)
+
+    def _apply_recorded_category_contexts(
+        self, app: str, contexts: list[dict], progress=None
+    ) -> dict:
+        """Apply one confirmed category batch and retain it in History."""
+        total = len(contexts)
+        detail = {
+            "torrent_name": (
+                f"{total} safe category {'fix' if total == 1 else 'fixes'}"
+            ),
+            "category_repairs": [
+                {
+                    "hash": item["hash"],
+                    "torrent_name": item["torrent_name"],
+                    "pool": item["pool"],
+                    "previous_category": item["previous_category"],
+                    "category": item["category"],
+                }
+                for item in contexts
+            ],
+            "batch_size": total,
+            "progress": {
+                "state": "CATEGORY_APPLYING",
+                "percent": 0,
+                "message": f"Applying 0 of {total} validated category fixes",
+            },
+        }
+        operation_id = self.store.record(
+            contexts[0]["hash"], app, "CATEGORY_APPLYING", detail,
+            kind="category",
+        )
+        results = []
+        mutation_started = False
+        try:
+            for index, context in enumerate(contexts, 1):
+                mutation_started = mutation_started or bool(context["changed"])
+                results.append(self._apply_sync_category_context(context))
+                detail = {
+                    **detail,
+                    "results": results,
+                    "progress": {
+                        "state": "CATEGORY_APPLYING",
+                        "percent": round(index * 100 / max(1, total)),
+                        "current": context["torrent_name"],
+                        "message": (
+                            f"Applied {index} of {total} · "
+                            f'{context["previous_category"] or "none"} → '
+                            f'{context["category"]}'
+                        ),
+                    },
+                }
+                self.store.update(operation_id, "CATEGORY_APPLYING", detail)
+                if progress:
+                    progress({
+                        "stage": "apply", "current": index, "total": total,
+                        "message": detail["progress"]["message"],
+                    })
+        except Exception as error:
+            uncertain = mutation_started
+            failed_detail = {
+                **detail,
+                "error": str(error),
+                "failed_after": "CATEGORY_APPLYING",
+                "recovery": (
+                    {
+                        "required": True,
+                        "reason": (
+                            "A qBittorrent category request failed after the batch "
+                            "started. Inspect every selected category before allowing "
+                            "more writes."
+                        ),
+                    }
+                    if uncertain else None
+                ),
+            }
+            self.store.update(
+                operation_id,
+                "RECOVERY_REQUIRED" if uncertain else "FAILED",
+                failed_detail,
+            )
+            raise
+        changed = sum(item["changed"] for item in results)
+        complete_detail = {
+            **detail,
+            "results": results,
+            "changed": changed,
+            "progress": {
+                "state": "COMPLETE",
+                "percent": 100,
+                "message": f"{changed} qBittorrent categories changed",
+            },
+        }
+        self.store.update(operation_id, "COMPLETE", complete_detail)
+        return {
+            "app": app,
+            "changed": changed,
+            "results": results,
+            "operation_id": operation_id,
+        }
 
     def apply_safe_category_repairs(
         self, token: str, app: str, torrent_hashes: list[str], progress=None
@@ -3052,28 +3201,14 @@ class Stowarr:
                             f'{item["torrent_name"]}'
                         ),
                     })
-            results = []
             if progress:
                 progress({
                     "stage": "apply", "current": 0, "total": total,
                     "message": f"All {total} items are safe; applying categories",
                 })
-            for index, context in enumerate(contexts, 1):
-                results.append(self._apply_sync_category_context(context))
-                if progress:
-                    progress({
-                        "stage": "apply", "current": index, "total": total,
-                        "message": (
-                            f"Applied {index} of {total} · "
-                            f'{context["previous_category"] or "none"} → '
-                            f'{context["category"]}'
-                        ),
-                    })
-            return {
-                "app": app,
-                "changed": sum(item["changed"] for item in results),
-                "results": results,
-            }
+            return self._apply_recorded_category_contexts(
+                app, contexts, progress
+            )
         finally:
             self._move_lock.release()
 
@@ -3090,7 +3225,8 @@ class Stowarr:
             raise RuntimeError("Wait for the active Move/Reconcile operation to finish before changing a category")
         try:
             context = self._sync_category_repair_context(app, torrent_hash)
-            return self._apply_sync_category_context(context)
+            result = self._apply_recorded_category_contexts(app, [context])
+            return {**result["results"][0], "operation_id": result["operation_id"]}
         finally:
             self._move_lock.release()
 

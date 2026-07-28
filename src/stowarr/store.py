@@ -735,13 +735,13 @@ class Store:
         no later work may run until every uncertain operation is acknowledged.
         """
         now = int(time.time())
-        selected_kinds = kinds or {"move", "reconcile"}
-        unknown = selected_kinds - {"move", "reconcile"}
+        selected_kinds = kinds or {"move", "reconcile", "category"}
+        unknown = selected_kinds - {"move", "reconcile", "category"}
         if unknown:
             raise ValueError(f"Unknown operation kinds: {', '.join(sorted(unknown))}")
         interrupted: list[dict] = []
         with self.lock:
-            for kind in sorted(selected_kinds):
+            for kind in sorted(selected_kinds & {"move", "reconcile"}):
                 table = "move_queue" if kind == "move" else "reconcile_queue"
                 # The table is selected from the allowlist above.
                 rows = self.db.execute(
