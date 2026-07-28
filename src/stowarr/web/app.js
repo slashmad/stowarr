@@ -653,7 +653,7 @@ function renderRecovery(){
         :arr.error||'No exact *Arr mapping found'
       :'Not checked';
     const diagnosisMarkup=diagnosis?`<div class="recovery-diagnosis ${recommendation?.safe_action==='manual'?'manual':'candidate'}"><strong>${esc(recommendation?.summary||'Inspection complete')}</strong><dl><dt>qBittorrent</dt><dd>${esc(qbitSummary)}</dd><dt>*Arr</dt><dd>${esc(arrSummary)}</dd><dt>Result</dt><dd>${esc(String(recommendation?.code||'manual review').replaceAll('_',' '))}</dd></dl><p>This diagnosis is read-only and does not replace a qBittorrent force recheck or a manual file-content inspection.</p></div>`:'';
-    return `<section class="recovery-operation" data-recovery-public-id="${esc(operation.public_id)}"><header><div><span>${badge(operation.kind)}</span><strong>${esc(operation.public_id)} · ${esc(detail.torrent_name||operation.torrent_hash)}</strong><small>Interrupted after ${esc(String(prior).replaceAll('_',' '))}</small></div><button type="button" class="secondary compact diagnose-recovery" data-public-id="${esc(operation.public_id)}">${diagnosis?'Diagnose again':'Diagnose current state'}</button></header>${diagnosisMarkup}<div class="recovery-resolution ${diagnosis?'':'hidden'}"><label><span>Manual inspection / repair note</span><input class="recovery-note" data-public-id="${esc(operation.public_id)}" value="${esc(notes.get(operation.public_id)||'')}" placeholder="Example: qBittorrent force recheck passed; Radarr path and target files verified"></label><button type="button" class="danger compact resolve-recovery" data-public-id="${esc(operation.public_id)}">Acknowledge and resume when clear</button></div></section>`;
+    return `<section class="recovery-operation" data-recovery-public-id="${esc(operation.public_id)}"><header><div><span>${badge(operation.kind)}</span><strong>${esc(operation.public_id)} · ${esc(detail.torrent_name||operation.torrent_hash)}</strong><small>Interrupted after ${esc(String(prior).replaceAll('_',' '))}</small></div><button type="button" class="secondary compact diagnose-recovery" data-public-id="${esc(operation.public_id)}">${diagnosis?'Diagnose again':'Diagnose current state'}</button></header>${diagnosisMarkup}<div class="recovery-resolution ${diagnosis?'':'hidden'}"><label><span>Manual inspection / repair note</span><input class="recovery-note" data-public-id="${esc(operation.public_id)}" value="${esc(notes.get(operation.public_id)||'')}" placeholder="Briefly describe what you inspected or repaired"><small>No fixed phrase is required.</small></label><div class="recovery-resolution-actions"><button type="button" class="secondary compact recovery-note-preset" data-public-id="${esc(operation.public_id)}">Force recheck passed</button><button type="button" class="danger compact resolve-recovery" data-public-id="${esc(operation.public_id)}">Acknowledge and resume when clear</button></div></div></section>`;
   }).join('');
 }
 
@@ -687,6 +687,10 @@ async function resolveRecovery(publicId){
 }
 
 function automaticallyTrackRunningQueue(){
+  if(state.recovery?.required){
+    if(state.operationTracking)finishOperationTracking();
+    return;
+  }
   const runningMove=(state.queue||[]).find(item=>item.state==='RUNNING');
   const runningReconcile=(state.reconcileQueue||[]).find(item=>item.state==='RUNNING');
   const running=runningMove||runningReconcile;
@@ -1164,6 +1168,14 @@ document.addEventListener('click',event=>{
   if(diagnose)diagnoseRecovery(diagnose.dataset.publicId);
   const resolve=event.target.closest('.resolve-recovery');
   if(resolve)resolveRecovery(resolve.dataset.publicId);
+  const recoveryPreset=event.target.closest('.recovery-note-preset');
+  if(recoveryPreset){
+    const input=$(`.recovery-note[data-public-id="${CSS.escape(recoveryPreset.dataset.publicId)}"]`);
+    if(input){
+      input.value='qBittorrent force recheck passed';
+      input.focus();
+    }
+  }
   const cancel=event.target.closest('.cancel-queue');
   if(cancel)cancelQueue(cancel.dataset.queueId,cancel.dataset.kind);
 });
