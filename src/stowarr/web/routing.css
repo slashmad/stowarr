@@ -1722,11 +1722,42 @@
   white-space: nowrap;
 }
 
+.primary-media {
+  padding: 18px 20px 20px;
+}
+
+.primary-media-head {
+  align-items: flex-start;
+  display: flex;
+  gap: 20px;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.primary-media-head > div:first-child,
+.auxiliary-head {
+  display: grid;
+  gap: 5px;
+}
+
+.primary-media-head small,
+.auxiliary-head small {
+  color: #9a9da2;
+}
+
+.section-kicker {
+  color: #62a8e5;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
 .pair-summary {
   align-items: center;
   display: flex;
   gap: 12px;
-  margin-bottom: 16px;
+  white-space: nowrap;
 }
 
 .pair-summary strong {
@@ -1945,6 +1976,12 @@
   background: #202225;
   border-top: 1px solid #3b3e43;
   padding: 16px 20px;
+}
+
+.auxiliary-head {
+  border-bottom: 1px solid #35383c;
+  margin-bottom: 16px;
+  padding-bottom: 14px;
 }
 
 .check-option {
