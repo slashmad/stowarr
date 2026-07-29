@@ -177,9 +177,15 @@ class ArrClientTest(unittest.TestCase):
                 if path == "/api/v3/series":
                     return [{"id": 7, "title": "Series", "path": "/series/Series"}]
                 if path == "/api/v3/episodefile":
-                    return [{"id": 700, "path": "/series/Series/Season 01/S01E01.mkv", "size": 100}]
+                    return [
+                        {"id": 700, "path": "/series/Series/Season 01/S01E01.mkv", "size": 100},
+                        {"id": 701, "path": "/series/Series/Season 01/S01E02.mkv", "size": 101},
+                    ]
                 if path == "/api/v3/episode":
-                    return [{"id": 70, "episodeFileId": 700}]
+                    return [
+                        {"id": 70, "episodeFileId": 700},
+                        {"id": 71, "episodeFileId": 701},
+                    ]
                 raise AssertionError(path)
 
         client = ArrClient(Service("http://unused", api_key="unused"), "sonarr")
@@ -188,10 +194,16 @@ class ArrClientTest(unittest.TestCase):
         mapping = client.library_mapping(["/series/Series/Season 01/S01E01.mkv"])
         self.assertTrue(mapping["mappingComplete"])
         self.assertEqual(mapping["files"][0]["episodeIds"], [70])
-        self.assertIsNone(client.library_mapping([
-            "/series/Series/Season 01/S01E01.mkv",
-            "/series/Series/Season 01/S01E02.mkv",
-        ]))
+        self.assertEqual(
+            [record["id"] for record in mapping["allFiles"]], [700, 701]
+        )
+        self.assertEqual(mapping["allFiles"][1]["episodeIds"], [71])
+        self.assertIsNone(
+            client.library_mapping([
+                "/series/Series/Season 01/S01E01.mkv",
+                "/series/Series/Season 01/S01E03.mkv",
+            ])
+        )
 
 
 class QBittorrentClientTest(unittest.TestCase):

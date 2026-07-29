@@ -740,6 +740,26 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(len(sidecars), 1)
             self.assertEqual(sidecars[0].status, "linked")
 
+    def test_torrent_sidecars_classify_a_missing_reported_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download = root / "download"
+            target = root / "library" / "Movie (2020)"
+            target.mkdir(parents=True)
+            (target / "Movie.nfo").write_bytes(b"metadata")
+            files = [{
+                "name": "Release/Movie.nfo",
+                "size": 8,
+                "priority": 1,
+            }]
+
+            sidecars = Stowarr._torrent_sidecars(
+                {"save_path": str(download)}, files, target
+            )
+
+            self.assertEqual(len(sidecars), 1)
+            self.assertEqual(sidecars[0].status, "source-missing")
+
     def test_reconcile_selection_rejects_an_already_correct_noop(self):
         plan = Plan(
             "hash", "Movie.2020", "radarr", "p1", 20, "Movie",
@@ -764,6 +784,22 @@ class EngineTest(unittest.TestCase):
             Stowarr._validate_reconcile_selection(
                 plan, ["/downloads/Movie.2020/Movie.nfo"]
             )
+
+    def test_reconcile_selection_counts_a_pending_item_root_change_as_work(self):
+        plan = Plan(
+            "hash", "Movie.2020", "radarr", "p3", 20, "Movie",
+            "/p1/movies/Movie (2020)", "/p3/movies/Movie (2020)",
+            [FilePair(
+                "/p3/movies/Movie (2020)/Movie.mkv",
+                "/p3/movies/Movie (2020)/Movie.mkv",
+                "/p3/download/Movie.2020/Movie.mkv",
+                100, "linked", "hardlink",
+            )],
+            "ready",
+        ).json()
+
+        Stowarr._validate_reconcile_selection(plan, [])
+        self.assertTrue(Stowarr._reconcile_has_primary_work(plan))
 
     def test_torrent_sidecars_block_flattened_name_conflicts(self):
         files = [
@@ -2233,6 +2269,106 @@ class EngineTest(unittest.TestCase):
                 plan.error_details["recommended_move_pool"], "p1"
             )
             self.assertEqual(plan.pairs, [])
+
+    def test_move_plan_blocks_partial_sonarr_series_before_relocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            p1 = Pool(
+                "p1", root / "p1", (root / "p1" / "download",),
+                root / "p1" / "movies", root / "p1" / "series",
+                "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+            )
+            p3 = Pool(
+                "p3", root / "p3", (root / "p3" / "download",),
+                root / "p3" / "movies", root / "p3" / "series",
+                "radarr-p3", "sonarr-p3", "radarr-p3", "sonarr-p3",
+            )
+            current_series = p1.sonarr_root / "Archer (2009)"
+            current_episode = current_series / "Season 1" / "Archer.S01E01.mkv"
+            other_episode = current_series / "Season 6" / "Archer.S06E01.mkv"
+            download_episode = (
+                p1.download_roots[0] / "Archer.S01" / "Archer.S01E01.mkv"
+            )
+            for path, content in (
+                (current_episode, b"season one"),
+                (other_episode, b"season six"),
+                (download_episode, b"season one"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            p3.prefix.mkdir(parents=True)
+            selected = {
+                "id": 101,
+                "path": str(current_episode),
+                "relativePath": "Season 1/Archer.S01E01.mkv",
+                "size": current_episode.stat().st_size,
+                "episodeIds": [1],
+            }
+            other = {
+                "id": 601,
+                "path": str(other_episode),
+                "relativePath": "Season 6/Archer.S06E01.mkv",
+                "size": other_episode.stat().st_size,
+                "episodeIds": [60],
+            }
+            torrent = {
+                "hash": "ARCHER-MOVE",
+                "name": "Archer.S01",
+                "category": "sonarr-p1",
+                "save_path": str(p1.download_roots[0]),
+                "total_size": download_episode.stat().st_size,
+                "progress": 1,
+                "state": "pausedUP",
+            }
+            mapping = {
+                "app": "sonarr",
+                "item": {
+                    "id": 51, "title": "Archer",
+                    "path": str(current_series),
+                },
+                "files": [selected],
+                "allFiles": [selected, other],
+                "mappingComplete": True,
+            }
+            manager = Stowarr.__new__(Stowarr)
+            manager.qbit = SimpleNamespace(
+                torrent=lambda torrent_hash: torrent,
+                files=lambda torrent_hash: [{
+                    "name": "Archer.S01/Archer.S01E01.mkv",
+                    "size": download_episode.stat().st_size,
+                    "priority": 1,
+                }],
+            )
+            manager.config = SimpleNamespace(
+                pools=(p1, p3),
+                pool_for_path=lambda path: (
+                    p1 if Path(path).is_relative_to(p1.prefix) else p3
+                ),
+                pool_for_category=lambda category: (p1, "sonarr"),
+            )
+            manager.arr = {"sonarr": SimpleNamespace(
+                download_mapping=lambda torrent_hash: mapping,
+                root_folders=lambda: [
+                    {"path": str(p1.sonarr_root)},
+                    {"path": str(p3.sonarr_root)},
+                ],
+            )}
+            manager.archive_extractor = SimpleNamespace(available=lambda: True)
+            manager._move_inventory = Mock(return_value=([], []))
+
+            plan = manager.move_plan("ARCHER-MOVE", "p3")
+
+            self.assertEqual(plan.status, "blocked")
+            self.assertEqual(
+                plan.error_code, "SONARR_PARTIAL_SERIES_POOL_CHANGE"
+            )
+            self.assertEqual(plan.current_save_path, str(p1.download_roots[0]))
+            self.assertEqual(plan.target_pool, "p3")
+
+            mapping["allFiles"] = [selected]
+            complete_plan = manager.move_plan("ARCHER-MOVE", "p3")
+
+            self.assertEqual(complete_plan.status, "ready")
 
     def test_sonarr_complete_series_plan_may_create_missing_target_folders(self):
         with tempfile.TemporaryDirectory() as directory:
