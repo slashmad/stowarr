@@ -1155,7 +1155,10 @@ class Stowarr:
         result = []
         for item in files:
             path = save_path / item["name"]
-            if path.suffix.lower() in VIDEO_EXTENSIONS:
+            if (
+                int(item.get("priority", 1)) > 0
+                and path.suffix.lower() in VIDEO_EXTENSIONS
+            ):
                 result.append((path, int(item["size"])))
         return result
 
@@ -1163,9 +1166,15 @@ class Stowarr:
     def _torrent_sidecars(torrent: dict, files: list[dict], target_item: Path) -> list[AuxiliaryFile]:
         save_path = Path(torrent["save_path"])
         result = []
+        by_target: dict[Path, AuxiliaryFile] = {}
         for item in files:
             source = save_path / item["name"]
-            if source.suffix.lower() in VIDEO_EXTENSIONS or is_archive(source) or source.name.startswith(".!qB"):
+            if (
+                int(item.get("priority", 1)) <= 0
+                or source.suffix.lower() in VIDEO_EXTENSIONS
+                or is_archive(source)
+                or source.name.startswith(".!qB")
+            ):
                 continue
             target = target_item / source.name
             if not target.exists():
@@ -1174,12 +1183,16 @@ class Stowarr:
                 status = "target-exists-same-size"
             else:
                 status = "target-conflict"
-            result.append(
-                AuxiliaryFile(
-                    str(source), str(target), int(item["size"]), status,
-                    "qbittorrent", "hardlink", sidecar_kind(source),
-                )
+            previous = by_target.get(target)
+            if previous:
+                previous.status = "torrent-name-conflict"
+                status = "torrent-name-conflict"
+            candidate = AuxiliaryFile(
+                str(source), str(target), int(item["size"]), status,
+                "qbittorrent", "hardlink", sidecar_kind(source),
             )
+            result.append(candidate)
+            by_target[target] = candidate
         return result
 
     @staticmethod
@@ -2248,7 +2261,24 @@ class Stowarr:
         )
         mapping = self.arr[app].download_mapping(torrent_hash) or mapping_hint
         if not mapping:
-            all_items = getattr(self.arr[app], "all_items", lambda: [])()
+            all_items = list(
+                getattr(self.arr[app], "all_items", lambda: [])()
+            )
+            history_for_downloads = getattr(
+                self.arr[app], "history_for_downloads", None
+            )
+            history_item_id = None
+            if callable(history_for_downloads):
+                history_item_id = history_for_downloads({
+                    torrent_hash.casefold()
+                }).get(torrent_hash.casefold())
+            current_item_ids = {
+                int(item["id"]) for item in all_items if item.get("id") is not None
+            }
+            history_item_missing = bool(
+                history_item_id
+                and int(history_item_id) not in current_item_ids
+            )
             candidates = [
                 {
                     "id": item.get("id"),
@@ -2261,16 +2291,38 @@ class Stowarr:
             issues = []
             if category_issue:
                 issues.append(category_issue)
+            identity_code = (
+                "ARR_HISTORY_ITEM_MISSING"
+                if history_item_missing
+                else "ARR_DOWNLOAD_HISTORY_MISSING"
+            )
+            if history_item_missing:
+                identity_summary = (
+                    f"{app.capitalize()} history associates this hash with item "
+                    f"#{history_item_id}, but that item no longer exists"
+                )
+            else:
+                identity_summary = (
+                    f"{app.capitalize()} has no history record that associates this "
+                    "exact qBittorrent hash with a current library item"
+                )
+            if app == "radarr" and not candidates:
+                identity_action = (
+                    "Add the intended movie with Radarr Add New, select the root on "
+                    f"{pool.name}, and do not start another download. Then use Radarr "
+                    "Manual Import to associate the existing qBittorrent release, "
+                    "refresh/rescan the movie, and rerun the audit."
+                )
+            else:
+                identity_action = (
+                    f"Verify the intended item in {app.capitalize()}, then use "
+                    f"{app.capitalize()} Manual Import to associate the existing "
+                    "qBittorrent release. Refresh/rescan it and rerun the audit."
+                )
             issues.append({
-                "code": "ARR_DOWNLOAD_HISTORY_MISSING",
-                "summary": (
-                    f'{app.capitalize()} has no history record that associates this exact '
-                    "qBittorrent hash with a library item"
-                ),
-                "action": (
-                    f'Use {app.capitalize()} Manual Import to associate the intended release, '
-                    "then refresh/rescan the item and rerun the audit."
-                ),
+                "code": identity_code,
+                "summary": identity_summary,
+                "action": identity_action,
             })
             if has_archives:
                 issues.append({
@@ -2291,10 +2343,12 @@ class Stowarr:
                 if candidates else ""
             )
             return Plan(
-                torrent_hash, torrent["name"], app, pool.name, None, None, None, None, [],
+                torrent_hash, torrent["name"], app, pool.name,
+                int(history_item_id) if history_item_id else None,
+                None, None, None, [],
                 "blocked",
-                f"No matching {app.capitalize()} download history item.{candidate_note}",
-                "ARR_DOWNLOAD_HISTORY_MISSING",
+                f"{identity_summary}.{candidate_note}",
+                identity_code,
                 {
                     "issues": issues,
                     "candidates": candidates,
@@ -2302,6 +2356,7 @@ class Stowarr:
                     "expected_category": expected_category,
                     "save_path": torrent.get("save_path", ""),
                     "contains_archives": has_archives,
+                    "historical_item_id": history_item_id,
                     "action": (
                         f"Resolve every prerequisite below in qBittorrent and {app.capitalize()}, "
                         "then rerun the audit. Stowarr will not reconcile by title alone."
@@ -2398,6 +2453,43 @@ class Stowarr:
             )
         torrent_files = self._torrent_paths(torrent, torrent_records)
         library_files = self._library_files(mapping)
+        missing_library_pair: FilePair | None = None
+        if not library_files:
+            direct_videos = [
+                (path, size)
+                for path, size in torrent_files
+                if path.suffix.casefold() in VIDEO_EXTENSIONS
+            ]
+            if app != "radarr" or has_archives or len(direct_videos) != 1:
+                reason = (
+                    f"{app.capitalize()} does not report any managed media file and "
+                    "Stowarr cannot prove one unique direct torrent video to restore"
+                )
+                return Plan(
+                    torrent_hash, torrent["name"], app, pool.name, item["id"],
+                    item.get("title"), item.get("path"), str(target_item), [],
+                    "blocked", reason, "ARR_MANAGED_MEDIA_MISSING",
+                    {
+                        "issues": [{
+                            "code": "ARR_MANAGED_MEDIA_MISSING",
+                            "summary": reason,
+                            "action": (
+                                "Keep the qBittorrent data intact. Radarr restoration requires "
+                                "exactly one selected direct video; Sonarr requires a complete "
+                                "episode-to-file mapping."
+                            ),
+                        }],
+                        "torrent_video_count": len(direct_videos),
+                        "contains_archives": has_archives,
+                    },
+                )
+            torrent_file, size = direct_videos[0]
+            target = target_item / torrent_file.name
+            missing_library_pair = FilePair(
+                str(target), str(target), str(torrent_file), size,
+                "missing-library", "hardlink",
+            )
+            library_files = [(target, size)]
         if not title_matches(item.get("title", ""), Path(item["path"]).name):
             item_title = item.get("title") or "<unknown>"
             folder_name = Path(item["path"]).name
@@ -2443,6 +2535,10 @@ class Stowarr:
         pairs: list[FilePair] = []
         used: set[Path] = set()
         for source, size in library_files:
+            if missing_library_pair and source == Path(missing_library_pair.source_library):
+                pairs.append(missing_library_pair)
+                used.add(Path(missing_library_pair.torrent_file))
+                continue
             candidates = [(path, item_size) for path, item_size in torrent_files if item_size == size and path not in used]
             relative = source.relative_to(Path(item["path"]))
             target = target_item / relative
@@ -2572,7 +2668,17 @@ class Stowarr:
                 "action": blocked_actions[blocked],
             } if blocked else None,
             auxiliary_files=auxiliary_files,
-            managed_files=mapping.get("files", []),
+            managed_files=mapping.get("files", []) or (
+                [{
+                    "id": None,
+                    "path": missing_library_pair.target_library,
+                    "relativePath": Path(missing_library_pair.target_library).name,
+                    "size": missing_library_pair.size,
+                    "episodeIds": [],
+                    "plannedRestore": True,
+                }]
+                if missing_library_pair else []
+            ),
         )
 
     def sync_audit(self, app: str) -> dict:
@@ -2613,6 +2719,10 @@ class Stowarr:
             expected_roots: tuple[Path, ...] = ()
             expected_category = None
             category_repairable = False
+            title_candidate_count = sum(
+                title_matches(candidate.get("title", ""), torrent["name"])
+                for candidate in items.values()
+            )
             if pool:
                 expected_roots = roots_by_pool[pool.name]
                 item_path = Path(str((item or {}).get("path") or ""))
@@ -2633,8 +2743,20 @@ class Stowarr:
                     "code": "ARR_DOWNLOAD_HISTORY_MISSING",
                     "summary": f"{service} does not associate this exact qBittorrent hash with an item.",
                     "action": (
-                        f"Use {service} Manual Import for the intended release, then refresh/rescan "
-                        "the item. Stowarr will not infer identity from the title alone."
+                        (
+                            "Add the intended movie with Radarr Add New, select the "
+                            f"root on {pool.name if pool else 'the intended pool'}, "
+                            "and do not start another download. Then use Radarr "
+                            "Manual Import to associate the existing qBittorrent "
+                            "release and rerun the audit."
+                        )
+                        if app == "radarr" and not title_candidate_count
+                        else (
+                            f"Verify the intended item in {service}, use {service} "
+                            "Manual Import to associate the existing qBittorrent "
+                            "release, then refresh/rescan it and rerun the audit. "
+                            "Stowarr will not infer identity from the title alone."
+                        )
                     ),
                 })
             elif not item:
@@ -2643,8 +2765,18 @@ class Stowarr:
                     "code": "ARR_HISTORY_ITEM_MISSING",
                     "summary": f"{service} history points to an item that no longer exists.",
                     "action": (
-                        f"Remove the stale association or restore the intended item in {service}, "
-                        "then manually import and rescan it."
+                        (
+                            "Add the intended movie with Radarr Add New, select the "
+                            f"root on {pool.name if pool else 'the intended pool'}, "
+                            "and do not start another download. Then manually import "
+                            "the existing qBittorrent release, rescan, and rerun the audit."
+                        )
+                        if app == "radarr" and not title_candidate_count
+                        else (
+                            f"Verify or restore the intended item in {service}, then "
+                            "manually import the existing qBittorrent release, rescan, "
+                            "and rerun the audit."
+                        )
                     ),
                 })
             elif not pool:
@@ -2708,6 +2840,69 @@ class Stowarr:
                         "exact torrent-to-library mapping and no competing torrent exists."
                     ),
                 })
+            elif app == "radarr":
+                movie_file = item.get("movieFile") or {}
+                relative = str(movie_file.get("relativePath") or "")
+                recorded_path = str(movie_file.get("path") or "")
+                library_path = Path(
+                    recorded_path
+                    or str(Path(str(item.get("path") or "")) / relative)
+                )
+                if (
+                    not movie_file
+                    or not (recorded_path or relative)
+                    or not library_path.is_file()
+                ):
+                    status = "missing-library-file"
+                    reason = (
+                        "Radarr does not manage a visible movie file for this download"
+                    )
+                    issues.append({
+                        "code": "ARR_MANAGED_MEDIA_MISSING",
+                        "summary": reason,
+                        "action": (
+                            "Build a Reconcile plan. Stowarr can restore one uniquely "
+                            "identified direct qBittorrent video and its sidecars after "
+                            "force recheck; ambiguous or packed content remains manual."
+                        ),
+                    })
+                else:
+                    library_stat = library_path.stat()
+                    torrent_videos = [
+                        path
+                        for path, size in self._torrent_paths(
+                            torrent, self.qbit.files(torrent["hash"])
+                        )
+                        if size == int(
+                            movie_file.get("size") or library_stat.st_size
+                        )
+                        and path.is_file()
+                    ]
+                    hardlinked = any(
+                        (candidate.stat().st_dev, candidate.stat().st_ino)
+                        == (library_stat.st_dev, library_stat.st_ino)
+                        for candidate in torrent_videos
+                    )
+                    if hardlinked:
+                        status, reason = (
+                            "in-sync",
+                            "Hash, category, save path, *Arr root and hardlink agree",
+                        )
+                    else:
+                        status = "hardlink-missing"
+                        reason = (
+                            "Radarr media is not hardlinked to the matched "
+                            "qBittorrent download"
+                        )
+                        issues.append({
+                            "code": "LIBRARY_HARDLINK_MISSING",
+                            "summary": reason,
+                            "action": (
+                                "Build a Reconcile plan. Stowarr will require one exact "
+                                "same-content torrent file before replacing the library "
+                                "entry with a verified hardlink."
+                            ),
+                        })
             else:
                 status, reason = "in-sync", "Hash, category, save path and *Arr root agree"
             rows.append({
@@ -2723,6 +2918,7 @@ class Stowarr:
                 "expected_roots": [str(root) for root in expected_roots],
                 "expected_category": expected_category,
                 "category_repairable": category_repairable,
+                "title_candidate_count": title_candidate_count,
                 "status": status,
                 "reason": reason,
                 "issues": issues,
@@ -2792,7 +2988,7 @@ class Stowarr:
             if item.get("state") in {"QUEUED", "RUNNING"}
         }
         category_repairs = []
-        root_mismatches = []
+        reconcile_issues = []
         reconcile_candidates = []
         queued_reconciles = []
         manual = []
@@ -2812,8 +3008,10 @@ class Stowarr:
                     "category": row["expected_category"],
                 })
                 continue
-            if row["status"] == "root-mismatch":
-                root_mismatches.append(row)
+            if row["status"] in {
+                "root-mismatch", "missing-library-file", "hardlink-missing",
+            }:
+                reconcile_issues.append(row)
                 continue
             manual.append({
                 "hash": row["hash"],
@@ -2827,20 +3025,20 @@ class Stowarr:
                 "stage": "categories", "current": 1, "total": 1,
                 "message": (
                     f"{len(category_repairs)} safe category fixes; "
-                    f"{len(root_mismatches)} root mismatches need fresh plans"
+                    f"{len(reconcile_issues)} repair candidates need fresh plans"
                 ),
             })
-        reconcile_total = len(root_mismatches)
+        reconcile_total = len(reconcile_issues)
         if progress:
             progress({
                 "stage": "reconciles", "current": 0, "total": reconcile_total,
                 "message": (
-                    "No root mismatches need planning"
+                    "No repair candidates need planning"
                     if not reconcile_total
                     else f"Building 0 of {reconcile_total} fresh Reconcile plans"
                 ),
             })
-        for index, row in enumerate(root_mismatches, 1):
+        for index, row in enumerate(reconcile_issues, 1):
             queued = active_reconciles.get(row["hash"].casefold())
             if queued:
                 queued_reconciles.append({
@@ -3455,19 +3653,30 @@ class Stowarr:
 
         videos = []
         mismatches = []
+        pending_restores = []
         for pair in plan.pairs:
             old_library = digest(pair.source_library)
             new_library = digest(pair.target_library)
             torrent = digest(pair.torrent_file) if pair.torrent_file else None
             if pair.strategy == "hardlink":
-                old_matches = bool(torrent["sha256"] and torrent["sha256"] == old_library["sha256"])
+                old_matches = (
+                    None
+                    if pair.status == "missing-library" and not old_library["exists"]
+                    else bool(
+                        torrent["sha256"]
+                        and torrent["sha256"] == old_library["sha256"]
+                    )
+                )
                 new_matches = None if not new_library["exists"] else torrent["sha256"] == new_library["sha256"]
             else:
                 old_matches = None
                 new_matches = None if not new_library["exists"] else old_library["sha256"] == new_library["sha256"]
             if old_matches is False or new_matches is False:
                 mismatches.append(pair.source_library)
+            elif pair.status == "missing-library":
+                pending_restores.append(pair.target_library)
             videos.append({
+                "status": pair.status,
                 "strategy": pair.strategy,
                 "torrent": torrent,
                 "old_library": old_library,
@@ -3482,11 +3691,18 @@ class Stowarr:
             matches = None if not target["exists"] else source["sha256"] == target["sha256"]
             sidecars.append({**asdict(item), "source_hash": source, "target_hash": target, "matches_target": matches})
         return {
-            "status": "mismatch" if mismatches else "verified",
+            "status": (
+                "mismatch"
+                if mismatches
+                else "ready-to-restore"
+                if pending_restores
+                else "verified"
+            ),
             "torrent_hash": torrent_hash,
             "video_files": videos,
             "sidecar_files": sidecars,
             "mismatches": mismatches,
+            "pending_restores": pending_restores,
         }
 
     def reconcile(
@@ -3580,6 +3796,88 @@ class Stowarr:
         created: list[Path] = []
         copied_auxiliary: list[tuple[Path, Path]] = []
         try:
+            restores_missing_library = any(
+                pair.status == "missing-library" for pair in plan.pairs
+            )
+            if restores_missing_library:
+                if progress_callback:
+                    progress_callback(
+                        state_name("RECONCILE_VERIFYING", "MOVE_LIBRARY_VERIFYING"),
+                        0,
+                        message="Force-rechecking qBittorrent before restoring missing media",
+                    )
+                self.qbit.recheck(torrent_hash)
+                self._wait_for_recheck(
+                    torrent_hash,
+                    progress=(
+                        lambda torrent, started: progress_callback(
+                            state_name(
+                                "RECONCILE_VERIFYING", "MOVE_LIBRARY_VERIFYING"
+                            ),
+                            float(torrent.get("progress", 0)) * 100
+                            if started else 0,
+                            qbit_state=torrent.get("state", ""),
+                            message=(
+                                "qBittorrent is verifying torrent pieces"
+                                if started else
+                                "Waiting for qBittorrent to begin verification"
+                            ),
+                        )
+                        if progress_callback else None
+                    ),
+                )
+                self._wait_for_visible_torrent_files(torrent_hash)
+                live_torrent = self.qbit.torrent(torrent_hash)
+                live_pool = (
+                    self.config.pool_for_path(live_torrent.get("save_path", ""))
+                    if live_torrent else None
+                )
+                live_route = (
+                    self.config.pool_for_category(
+                        live_torrent.get("category", "")
+                    )
+                    if live_torrent else None
+                )
+                if (
+                    not live_torrent
+                    or not live_pool
+                    or live_pool.name != plan.target_pool
+                    or not live_route
+                    or live_route[0].name != plan.target_pool
+                    or live_route[1] != plan.app
+                ):
+                    raise RuntimeError(
+                        "qBittorrent route changed during missing-media verification"
+                    )
+                selected_manifest = {
+                    str(Path(live_torrent["save_path"]) / record["name"]): int(
+                        record["size"]
+                    )
+                    for record in self.qbit.files(torrent_hash)
+                    if int(record.get("priority", 1)) > 0
+                }
+                required_sources = {
+                    pair.torrent_file: pair.size
+                    for pair in plan.pairs
+                    if pair.status == "missing-library"
+                }
+                required_sources.update({
+                    item.source: item.size
+                    for item in plan.auxiliary_files or []
+                    if (
+                        item.origin == "qbittorrent"
+                        and item.source in selected_auxiliary
+                    )
+                })
+                changed = [
+                    path for path, size in required_sources.items()
+                    if selected_manifest.get(path) != size
+                ]
+                if changed:
+                    raise RuntimeError(
+                        "One or more selected qBittorrent files changed during "
+                        "missing-media verification"
+                    )
             pair_total = max(len(plan.pairs), 1)
             for pair_index, pair in enumerate(plan.pairs):
                 source = Path(pair.source_library)
@@ -3625,7 +3923,10 @@ class Stowarr:
                         torrent_file, progress=lambda done, total: pair_progress(done, total, "qBittorrent media")
                     ):
                         raise RuntimeError(f"Hash mismatch: {source} != {torrent_file}")
-                elif str(source) not in (relocated_library_sources or set()):
+                elif (
+                    pair.status != "missing-library"
+                    and str(source) not in (relocated_library_sources or set())
+                ):
                     raise RuntimeError(f"Source changed or missing: {source}")
                 if target.exists():
                     target_stat, torrent_stat = target.stat(), torrent_file.stat()
@@ -3716,9 +4017,15 @@ class Stowarr:
                 if resolver:
                     refreshed = resolver(expected_paths)
             refreshed_files = {record.get("id"): Path(record.get("path", "")) for record in (refreshed or {}).get("files", [])}
+            refreshed_paths = set(refreshed_files.values())
             for record in plan.managed_files or []:
                 expected = Path(plan.target_item_path or "") / record["relativePath"]
-                if refreshed_files.get(record.get("id")) != expected:
+                confirmed = (
+                    expected in refreshed_paths
+                    if record.get("id") is None
+                    else refreshed_files.get(record.get("id")) == expected
+                )
+                if not confirmed:
                     raise RuntimeError(
                         f"{plan.app.capitalize()} did not confirm the managed file on its new path: {expected}"
                     )

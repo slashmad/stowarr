@@ -646,6 +646,30 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(sidecars[0].operation, "hardlink")
             self.assertEqual(sidecars[0].target, str(target / "Movie.sv.srt"))
 
+    def test_torrent_sidecars_block_flattened_name_conflicts(self):
+        files = [
+            {"name": "Release/Movie.mkv", "size": 100, "priority": 1},
+            {
+                "name": "Release/Subs-A/Movie.en.srt",
+                "size": 20,
+                "priority": 1,
+            },
+            {
+                "name": "Release/Subs-B/Movie.en.srt",
+                "size": 21,
+                "priority": 1,
+            },
+        ]
+
+        sidecars = Stowarr._torrent_sidecars(
+            {"save_path": "/downloads"}, files, Path("/library/Movie (2020)")
+        )
+
+        self.assertEqual(len(sidecars), 2)
+        self.assertEqual(
+            {item.status for item in sidecars}, {"torrent-name-conflict"}
+        )
+
     def test_archive_detection_covers_multi_part_releases(self):
         self.assertTrue(is_archive(Path("movie.rar")))
         self.assertTrue(is_archive(Path("movie.r00")))
@@ -991,6 +1015,57 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(plan.error_details["contains_archives"])
         self.assertEqual(plan.error_details["candidates"][0]["title"], "Click")
 
+    def test_missing_radarr_title_requires_add_new_before_manual_import(self):
+        pool = Pool(
+            "p3", Path("/p3"), (Path("/p3/download"),),
+            Path("/p3/movies"), Path("/p3/series"),
+            "radarr-pool3", "sonarr-pool3",
+            "radarr-pool3", "sonarr-pool3",
+        )
+        torrent = {
+            "hash": "MISSING", "name": "Missing.Movie.2024.REMUX",
+            "category": "radarr-pool3",
+            "save_path": "/p3/download/Missing.Movie.2024.REMUX",
+        }
+        manager = Stowarr.__new__(Stowarr)
+        manager.qbit = SimpleNamespace(
+            torrents=lambda: [torrent],
+            files=lambda torrent_hash: [{
+                "name": "Missing.Movie.2024.REMUX.mkv",
+                "size": 100,
+                "priority": 1,
+            }],
+            categories=lambda: {
+                "radarr-pool3": {"savePath": "/p3/download"},
+            },
+        )
+        manager.config = SimpleNamespace(
+            pools=(pool,),
+            pool_for_path=lambda path: pool,
+            pool_for_category=lambda category: (pool, "radarr"),
+        )
+        manager.arr = {"radarr": SimpleNamespace(
+            download_mapping=lambda torrent_hash: None,
+            history_for_downloads=lambda hashes: {"missing": 42},
+            all_items=lambda: [],
+        )}
+
+        plan = manager.plan("MISSING")
+        audit = manager.sync_audit("radarr")
+
+        self.assertEqual(plan.status, "blocked")
+        self.assertEqual(plan.error_code, "ARR_HISTORY_ITEM_MISSING")
+        self.assertEqual(plan.item_id, 42)
+        self.assertIn(
+            "Radarr Add New",
+            plan.error_details["issues"][0]["action"],
+        )
+        self.assertEqual(audit["rows"][0]["status"], "missing-item")
+        self.assertIn(
+            "Radarr Add New",
+            audit["rows"][0]["action"],
+        )
+
     def test_reconcile_plan_blocks_multiple_torrents_for_one_arr_item(self):
         pool = Pool(
             "p3", Path("/p3"), (Path("/p3/download"),),
@@ -1026,6 +1101,253 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(plan.error_code, "ARR_ITEM_HAS_MULTIPLE_TORRENTS")
         self.assertEqual(len(plan.error_details["related_torrents"]), 2)
         self.assertIn("seeding", plan.error_details["action"])
+
+    def test_radarr_plan_restores_one_missing_video_and_selected_subtitles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download_root = root / "download"
+            release = download_root / "Moana.2.2024.REMUX"
+            movie = release / "Moana.2.2024.REMUX.mkv"
+            english = release / "Moana.2.2024.REMUX.en.srt"
+            swedish = release / "Moana.2.2024.REMUX.sv.srt"
+            ignored = release / "Moana.2.2024.REMUX.no.srt"
+            release.mkdir(parents=True)
+            movie.write_bytes(b"verified movie")
+            english.write_bytes(b"english")
+            swedish.write_bytes(b"swedish")
+            ignored.write_bytes(b"not selected")
+            movie_root = root / "movies"
+            item = {
+                "id": 66,
+                "title": "Moana 2",
+                "path": str(movie_root / "Moana 2 (2024)"),
+            }
+            torrent = {
+                "hash": "MOANA",
+                "name": "Moana.2.2024.REMUX",
+                "category": "radarr-pool3",
+                "save_path": str(download_root),
+            }
+            records = [
+                {
+                    "name": str(path.relative_to(download_root)),
+                    "size": path.stat().st_size,
+                    "priority": priority,
+                }
+                for path, priority in (
+                    (movie, 1), (english, 1), (swedish, 1), (ignored, 0)
+                )
+            ]
+            pool = Pool(
+                "p3", root, (download_root,), movie_root, root / "series",
+                "radarr-pool3", "sonarr-pool3",
+                "radarr-pool3", "sonarr-pool3",
+            )
+            manager = Stowarr.__new__(Stowarr)
+            manager.qbit = SimpleNamespace(
+                torrents=lambda: [torrent],
+                files=lambda torrent_hash: records,
+            )
+            manager.config = SimpleNamespace(
+                pools=(pool,),
+                pool_for_path=lambda path: pool,
+                pool_for_category=lambda category: (pool, "radarr"),
+            )
+            manager.arr = {"radarr": SimpleNamespace(
+                download_mapping=lambda torrent_hash: {
+                    "app": "radarr", "item": item, "files": [],
+                },
+                history_for_downloads=lambda hashes: {"moana": 66},
+            )}
+
+            plan = manager.plan("MOANA")
+
+            self.assertEqual(plan.status, "ready")
+            self.assertEqual(len(plan.pairs), 1)
+            self.assertEqual(plan.pairs[0].status, "missing-library")
+            self.assertEqual(plan.pairs[0].torrent_file, str(movie))
+            self.assertEqual(
+                plan.pairs[0].target_library,
+                str(movie_root / "Moana 2 (2024)" / movie.name),
+            )
+            self.assertEqual(
+                {Path(item.source).name for item in plan.auxiliary_files},
+                {english.name, swedish.name},
+            )
+            self.assertEqual(plan.managed_files[0]["id"], None)
+            self.assertTrue(plan.managed_files[0]["plannedRestore"])
+
+            verification = manager.verify("MOANA")
+            self.assertEqual(verification["status"], "ready-to-restore")
+            self.assertIsNone(
+                verification["video_files"][0]["old_matches_torrent"]
+            )
+
+    def test_radarr_missing_media_restore_blocks_multiple_selected_videos(self):
+        pool = Pool(
+            "p3", Path("/p3"), (Path("/p3/download"),),
+            Path("/p3/movies"), Path("/p3/series"),
+            "radarr-pool3", "sonarr-pool3",
+            "radarr-pool3", "sonarr-pool3",
+        )
+        item = {
+            "id": 66, "title": "Moana 2",
+            "path": "/p3/movies/Moana 2 (2024)",
+        }
+        manager = Stowarr.__new__(Stowarr)
+        manager.qbit = SimpleNamespace(
+            torrents=lambda: [{
+                "hash": "MOANA", "name": "Moana.2.2024",
+                "category": "radarr-pool3",
+                "save_path": "/p3/download/Moana.2.2024",
+            }],
+            files=lambda torrent_hash: [
+                {"name": "disc1.mkv", "size": 10, "priority": 1},
+                {"name": "disc2.mkv", "size": 11, "priority": 1},
+            ],
+        )
+        manager.config = SimpleNamespace(
+            pools=(pool,),
+            pool_for_path=lambda path: pool,
+            pool_for_category=lambda category: (pool, "radarr"),
+        )
+        manager.arr = {"radarr": SimpleNamespace(
+            download_mapping=lambda torrent_hash: {
+                "app": "radarr", "item": item, "files": [],
+            },
+            history_for_downloads=lambda hashes: {"moana": 66},
+        )}
+
+        plan = manager.plan("MOANA")
+
+        self.assertEqual(plan.status, "blocked")
+        self.assertEqual(plan.error_code, "ARR_MANAGED_MEDIA_MISSING")
+        self.assertEqual(plan.error_details["torrent_video_count"], 2)
+
+    def test_radarr_missing_media_restore_force_rechecks_and_hardlinks_subtitles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download_root = root / "download"
+            release = download_root / "Moana.2.2024.REMUX"
+            movie = release / "Moana.2.2024.REMUX.mkv"
+            subtitle = release / "Moana.2.2024.REMUX.sv.srt"
+            release.mkdir(parents=True)
+            movie.write_bytes(b"verified movie")
+            subtitle.write_bytes(b"verified subtitle")
+            movie_root = root / "movies"
+            target_root = movie_root / "Moana 2 (2024)"
+            target_movie = target_root / movie.name
+            target_subtitle = target_root / subtitle.name
+            item = {
+                "id": 66,
+                "title": "Moana 2",
+                "path": str(target_root),
+            }
+            initial_mapping = {
+                "app": "radarr", "item": item, "files": [],
+            }
+            refreshed_mapping = {
+                "app": "radarr",
+                "item": item,
+                "files": [{
+                    "id": 700,
+                    "path": str(target_movie),
+                    "relativePath": target_movie.name,
+                    "size": movie.stat().st_size,
+                    "episodeIds": [],
+                }],
+            }
+            plan = Plan(
+                "MOANA", "Moana.2.2024.REMUX", "radarr", "p3", 66,
+                "Moana 2", str(target_root), str(target_root),
+                [FilePair(
+                    str(target_movie), str(target_movie), str(movie),
+                    movie.stat().st_size, "missing-library", "hardlink",
+                )],
+                "ready",
+                auxiliary_files=[AuxiliaryFile(
+                    str(subtitle), str(target_subtitle),
+                    subtitle.stat().st_size, "torrent-sidecar",
+                    "qbittorrent", "hardlink", "subtitle",
+                )],
+                managed_files=[{
+                    "id": None,
+                    "path": str(target_movie),
+                    "relativePath": target_movie.name,
+                    "size": movie.stat().st_size,
+                    "episodeIds": [],
+                    "plannedRestore": True,
+                }],
+            )
+            rescanned = False
+
+            def rescan(item_id):
+                nonlocal rescanned
+                rescanned = True
+
+            client = SimpleNamespace(
+                download_mapping=lambda torrent_hash: (
+                    refreshed_mapping if rescanned else initial_mapping
+                ),
+                sync_pool=Mock(),
+                rescan=Mock(side_effect=rescan),
+            )
+            pool = Pool(
+                "p3", root, (download_root,), movie_root, root / "series",
+                "radarr-pool3", "sonarr-pool3",
+                "radarr-pool3", "sonarr-pool3",
+            )
+            manager = Stowarr.__new__(Stowarr)
+            manager.arr = {"radarr": client}
+            manager.config = SimpleNamespace(
+                apply=True,
+                pools=(pool,),
+                pool_for_path=lambda path: pool,
+                pool_for_category=lambda category: (pool, "radarr"),
+            )
+            manager.store = SimpleNamespace(update=Mock())
+            manager.qbit = SimpleNamespace(
+                recheck=Mock(),
+                torrent=lambda torrent_hash: {
+                    "hash": torrent_hash,
+                    "save_path": str(download_root),
+                    "category": "radarr-pool3",
+                },
+                files=lambda torrent_hash: [
+                    {
+                        "name": str(movie.relative_to(download_root)),
+                        "size": movie.stat().st_size,
+                        "priority": 1,
+                    },
+                    {
+                        "name": str(subtitle.relative_to(download_root)),
+                        "size": subtitle.stat().st_size,
+                        "priority": 1,
+                    },
+                ],
+            )
+            manager._wait_for_recheck = Mock(return_value={})
+            manager._wait_for_visible_torrent_files = Mock(return_value=[])
+
+            result = manager.reconcile(
+                "MOANA", {str(subtitle)}, operation_id=9,
+                mapping_hint=initial_mapping, prepared_plan=plan,
+            )
+
+            self.assertEqual(result["state"], "COMPLETE")
+            manager.qbit.recheck.assert_called_once_with("MOANA")
+            manager._wait_for_recheck.assert_called_once()
+            client.rescan.assert_called_once_with(66)
+            self.assertEqual(
+                (target_movie.stat().st_dev, target_movie.stat().st_ino),
+                (movie.stat().st_dev, movie.stat().st_ino),
+            )
+            self.assertEqual(
+                (target_subtitle.stat().st_dev, target_subtitle.stat().st_ino),
+                (subtitle.stat().st_dev, subtitle.stat().st_ino),
+            )
+            self.assertTrue(movie.exists())
+            self.assertTrue(subtitle.exists())
 
     def test_sync_audit_reports_duplicate_and_unrouted_history_torrents(self):
         p1 = Pool(
@@ -1076,6 +1398,101 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(by_hash["C"]["status"], "category-unconfigured")
         self.assertEqual(by_hash["C"]["expected_category"], "radarr-pool3")
         self.assertTrue(by_hash["C"]["category_repairable"])
+
+    def test_radarr_sync_audit_finds_missing_media_and_missing_hardlinks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download_root = root / "download"
+            movie_root = root / "movies"
+            download_root.mkdir()
+            movie_root.mkdir()
+            missing_download = download_root / "Missing.2024.mkv"
+            copied_download = download_root / "Copied.2024.mkv"
+            linked_download = download_root / "Linked.2024.mkv"
+            for path in (missing_download, copied_download, linked_download):
+                path.write_bytes(path.stem.encode())
+            copied_root = movie_root / "Copied (2024)"
+            linked_root = movie_root / "Linked (2024)"
+            copied_root.mkdir()
+            linked_root.mkdir()
+            copied_library = copied_root / copied_download.name
+            copied_library.write_bytes(copied_download.read_bytes())
+            linked_library = linked_root / linked_download.name
+            os.link(linked_download, linked_library)
+            pool = Pool(
+                "p3", root, (download_root,), movie_root, root / "series",
+                "radarr-pool3", "sonarr-pool3",
+                "radarr-pool3", "sonarr-pool3",
+            )
+            torrents = [
+                {
+                    "hash": name.upper(), "name": f"{name}.2024",
+                    "category": "radarr-pool3",
+                    "save_path": str(download_root),
+                }
+                for name in ("missing", "copied", "linked")
+            ]
+            torrent_paths = {
+                "MISSING": missing_download,
+                "COPIED": copied_download,
+                "LINKED": linked_download,
+            }
+            items = [
+                {
+                    "id": 1, "title": "Missing",
+                    "path": str(movie_root / "Missing (2024)"),
+                },
+                {
+                    "id": 2, "title": "Copied", "path": str(copied_root),
+                    "movieFile": {
+                        "id": 20, "path": str(copied_library),
+                        "relativePath": copied_library.name,
+                        "size": copied_library.stat().st_size,
+                    },
+                },
+                {
+                    "id": 3, "title": "Linked", "path": str(linked_root),
+                    "movieFile": {
+                        "id": 30, "path": str(linked_library),
+                        "relativePath": linked_library.name,
+                        "size": linked_library.stat().st_size,
+                    },
+                },
+            ]
+            manager = Stowarr.__new__(Stowarr)
+            manager.qbit = SimpleNamespace(
+                torrents=lambda: torrents,
+                categories=lambda: {
+                    "radarr-pool3": {"savePath": str(download_root)},
+                },
+                files=lambda torrent_hash: [{
+                    "name": torrent_paths[torrent_hash.upper()].name,
+                    "size": torrent_paths[torrent_hash.upper()].stat().st_size,
+                    "priority": 1,
+                }],
+            )
+            manager.config = SimpleNamespace(
+                pools=(pool,),
+                pool_for_path=lambda path: pool,
+                pool_for_category=lambda category: (pool, "radarr"),
+            )
+            manager.arr = {"radarr": SimpleNamespace(
+                history_for_downloads=lambda hashes: {
+                    "missing": 1, "copied": 2, "linked": 3,
+                },
+                all_items=lambda: items,
+            )}
+
+            audit = manager.sync_audit("radarr")
+            by_hash = {row["hash"]: row for row in audit["rows"]}
+
+            self.assertEqual(
+                by_hash["MISSING"]["status"], "missing-library-file"
+            )
+            self.assertEqual(
+                by_hash["COPIED"]["status"], "hardlink-missing"
+            )
+            self.assertEqual(by_hash["LINKED"]["status"], "in-sync")
 
     def test_sonarr_roots_preserve_anime_family_between_pools(self):
         p1 = Pool(
