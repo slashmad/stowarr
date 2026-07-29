@@ -121,22 +121,27 @@ class ArrClient:
         }
         episode_files = self.http.request("GET", "/api/v3/episodefile", query={"seriesId": item_id})
         file_episode_ids: dict[int, list[int]] = {}
-        for episode in selected_episodes:
+        for episode in episodes:
             if episode.get("episodeFileId"):
                 file_episode_ids.setdefault(int(episode["episodeFileId"]), []).append(int(episode["id"]))
-        files = [{
+        all_files = [{
             "id": record.get("id"),
             "path": record.get("path"),
             "relativePath": record.get("relativePath") or str(record.get("path", "")).removeprefix(item["path"].rstrip("/") + "/"),
             "size": int(record.get("size", 0)),
             "episodeIds": file_episode_ids.get(int(record.get("id", 0)), []),
-        } for record in episode_files if int(record.get("id", 0)) in episode_file_ids]
+        } for record in episode_files]
+        files = [
+            record for record in all_files
+            if int(record.get("id", 0)) in episode_file_ids
+        ]
         return {
             "app": self.kind,
             "item": item,
             "history": records,
             "episodes": selected_episodes,
             "files": files,
+            "allFiles": all_files,
             "mappingComplete": bool(episode_ids and selected_episodes and episode_file_ids and files),
         }
 

@@ -715,6 +715,56 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(sidecars[0].operation, "hardlink")
             self.assertEqual(sidecars[0].target, str(target / "Movie.sv.srt"))
 
+    def test_torrent_sidecars_recognize_existing_hardlinks_as_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download = root / "download"
+            release = download / "Release"
+            target = root / "library" / "Movie (2020)"
+            release.mkdir(parents=True)
+            target.mkdir(parents=True)
+            source = release / "Movie.nfo"
+            destination = target / source.name
+            source.write_bytes(b"metadata")
+            os.link(source, destination)
+            files = [{
+                "name": "Release/Movie.nfo",
+                "size": source.stat().st_size,
+                "priority": 1,
+            }]
+
+            sidecars = Stowarr._torrent_sidecars(
+                {"save_path": str(download)}, files, target
+            )
+
+            self.assertEqual(len(sidecars), 1)
+            self.assertEqual(sidecars[0].status, "linked")
+
+    def test_reconcile_selection_rejects_an_already_correct_noop(self):
+        plan = Plan(
+            "hash", "Movie.2020", "radarr", "p1", 20, "Movie",
+            "/movies/Movie (2020)", "/movies/Movie (2020)",
+            [FilePair(
+                "/movies/Movie (2020)/Movie.mkv",
+                "/movies/Movie (2020)/Movie.mkv",
+                "/downloads/Movie.2020/Movie.mkv",
+                100, "linked", "hardlink",
+            )],
+            "ready",
+            auxiliary_files=[AuxiliaryFile(
+                "/downloads/Movie.2020/Movie.nfo",
+                "/movies/Movie (2020)/Movie.nfo",
+                10, "linked", "qbittorrent", "hardlink", "metadata",
+            )],
+        ).json()
+
+        with self.assertRaisesRegex(ValueError, "No Reconcile changes"):
+            Stowarr._validate_reconcile_selection(plan, [])
+        with self.assertRaisesRegex(ValueError, "do not require repair"):
+            Stowarr._validate_reconcile_selection(
+                plan, ["/downloads/Movie.2020/Movie.nfo"]
+            )
+
     def test_torrent_sidecars_block_flattened_name_conflicts(self):
         files = [
             {"name": "Release/Movie.mkv", "size": 100, "priority": 1},
@@ -2090,6 +2140,195 @@ class EngineTest(unittest.TestCase):
             manager._library_root_for_path("sonarr", p3, "/p3/anime/Dr. STONE"),
             Path("/p3/anime"),
         )
+
+    def test_sonarr_partial_series_download_cannot_change_whole_series_pool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            p1 = Pool(
+                "p1", root / "p1", (root / "p1" / "download",),
+                root / "p1" / "movies", root / "p1" / "series",
+                "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+            )
+            p3 = Pool(
+                "p3", root / "p3", (root / "p3" / "download",),
+                root / "p3" / "movies", root / "p3" / "series",
+                "radarr-p3", "sonarr-p3", "radarr-p3", "sonarr-p3",
+            )
+            current_series = p1.sonarr_root / "Archer (2009)"
+            current_episode = current_series / "Season 1" / "Archer.S01E01.mkv"
+            other_episode = current_series / "Season 6" / "Archer.S06E01.mkv"
+            download_episode = (
+                p3.download_roots[0] / "Archer.S01" / "Archer.S01E01.mkv"
+            )
+            for path, content in (
+                (current_episode, b"season one"),
+                (other_episode, b"season six"),
+                (download_episode, b"season one"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            selected = {
+                "id": 101,
+                "path": str(current_episode),
+                "relativePath": "Season 1/Archer.S01E01.mkv",
+                "size": current_episode.stat().st_size,
+                "episodeIds": [1],
+            }
+            other = {
+                "id": 601,
+                "path": str(other_episode),
+                "relativePath": "Season 6/Archer.S06E01.mkv",
+                "size": other_episode.stat().st_size,
+                "episodeIds": [60],
+            }
+            torrent = {
+                "hash": "ARCHER",
+                "name": "Archer.S01",
+                "category": "sonarr-p3",
+                "save_path": str(p3.download_roots[0]),
+            }
+            manager = Stowarr.__new__(Stowarr)
+            manager.qbit = SimpleNamespace(
+                torrents=lambda: [torrent],
+                files=lambda torrent_hash: [{
+                    "name": "Archer.S01/Archer.S01E01.mkv",
+                    "size": download_episode.stat().st_size,
+                    "priority": 1,
+                }],
+            )
+            manager.config = SimpleNamespace(
+                pools=(p1, p3),
+                pool_for_path=lambda path: (
+                    p1 if Path(path).is_relative_to(p1.prefix) else p3
+                ),
+                pool_for_category=lambda category: (p3, "sonarr"),
+            )
+            manager.arr = {"sonarr": SimpleNamespace(
+                download_mapping=lambda torrent_hash: {
+                    "app": "sonarr",
+                    "item": {
+                        "id": 51, "title": "Archer",
+                        "path": str(current_series),
+                    },
+                    "files": [selected],
+                    "allFiles": [selected, other],
+                    "mappingComplete": True,
+                },
+                root_folders=lambda: [
+                    {"path": str(p1.sonarr_root)},
+                    {"path": str(p3.sonarr_root)},
+                ],
+            )}
+
+            plan = manager.plan("ARCHER")
+
+            self.assertEqual(plan.status, "blocked")
+            self.assertEqual(
+                plan.error_code, "SONARR_PARTIAL_SERIES_POOL_CHANGE"
+            )
+            self.assertEqual(
+                plan.error_details["other_managed_file_count"], 1
+            )
+            self.assertEqual(
+                plan.error_details["recommended_move_pool"], "p1"
+            )
+            self.assertEqual(plan.pairs, [])
+
+    def test_sonarr_complete_series_plan_may_create_missing_target_folders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            p1 = Pool(
+                "p1", root / "p1", (root / "p1" / "download",),
+                root / "p1" / "movies", root / "p1" / "series",
+                "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+            )
+            p3 = Pool(
+                "p3", root / "p3", (root / "p3" / "download",),
+                root / "p3" / "movies", root / "p3" / "series",
+                "radarr-p3", "sonarr-p3", "radarr-p3", "sonarr-p3",
+            )
+            current_series = p1.sonarr_root / "Complete Show (2026)"
+            current_episode = (
+                current_series / "Season 1" / "Complete.Show.S01E01.mkv"
+            )
+            unmanaged_video = current_series / "Extras" / "behind-scenes.mkv"
+            artwork = current_series / "poster.jpg"
+            download_episode = (
+                p3.download_roots[0]
+                / "Complete.Show.S01"
+                / "Complete.Show.S01E01.mkv"
+            )
+            for path, content in (
+                (current_episode, b"episode"),
+                (unmanaged_video, b"unmanaged video"),
+                (artwork, b"artwork"),
+                (download_episode, b"episode"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            selected = {
+                "id": 101,
+                "path": str(current_episode),
+                "relativePath": "Season 1/Complete.Show.S01E01.mkv",
+                "size": current_episode.stat().st_size,
+                "episodeIds": [1],
+            }
+            target_series = p3.sonarr_root / current_series.name
+            torrent = {
+                "hash": "COMPLETE",
+                "name": "Complete.Show.S01",
+                "category": "sonarr-p3",
+                "save_path": str(p3.download_roots[0]),
+            }
+            manager = Stowarr.__new__(Stowarr)
+            manager.qbit = SimpleNamespace(
+                torrents=lambda: [torrent],
+                files=lambda torrent_hash: [{
+                    "name": "Complete.Show.S01/Complete.Show.S01E01.mkv",
+                    "size": download_episode.stat().st_size,
+                    "priority": 1,
+                }],
+            )
+            manager.config = SimpleNamespace(
+                pools=(p1, p3),
+                pool_for_path=lambda path: (
+                    p1 if Path(path).is_relative_to(p1.prefix) else p3
+                ),
+                pool_for_category=lambda category: (p3, "sonarr"),
+            )
+            manager.arr = {"sonarr": SimpleNamespace(
+                download_mapping=lambda torrent_hash: {
+                    "app": "sonarr",
+                    "item": {
+                        "id": 52, "title": "Complete Show",
+                        "path": str(current_series),
+                    },
+                    "files": [selected],
+                    "allFiles": [selected],
+                    "mappingComplete": True,
+                },
+                root_folders=lambda: [
+                    {"path": str(p1.sonarr_root)},
+                    {"path": str(p3.sonarr_root)},
+                ],
+            )}
+
+            plan = manager.plan("COMPLETE")
+
+            self.assertEqual(plan.status, "ready")
+            self.assertFalse(target_series.exists())
+            self.assertEqual(
+                plan.pairs[0].target_library,
+                str(target_series / "Season 1" / current_episode.name),
+            )
+            self.assertEqual(
+                {Path(item.source).name for item in plan.auxiliary_files},
+                {"poster.jpg"},
+            )
+            self.assertNotIn(
+                str(unmanaged_video),
+                {item.source for item in plan.auxiliary_files},
+            )
 
     def test_write_mode_validates_and_reports_discovered_sonarr_roots(self):
         with tempfile.TemporaryDirectory() as directory:

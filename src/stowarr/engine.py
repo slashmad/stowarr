@@ -185,6 +185,14 @@ class AuxiliaryFile:
     kind: str
 
 
+RECONCILE_UNCHANGED_PAIR_STATUSES = frozenset({
+    "linked", "already-on-target", "verified-derived",
+})
+RECONCILE_ACTIONABLE_AUXILIARY_STATUSES = frozenset({
+    "torrent-sidecar", "missing-target", "target-exists-same-size",
+})
+
+
 @dataclass
 class Plan:
     torrent_hash: str
@@ -1027,6 +1035,10 @@ class Stowarr:
             raise ValueError("kind must be reconcile or move")
         if plan.get("status") != "ready":
             raise RuntimeError(plan.get("reason") or "Operation plan is not ready")
+        if kind == "reconcile":
+            self._validate_reconcile_selection(
+                plan, normalized["auxiliaryFiles"]
+            )
         token = secrets.token_urlsafe(32)
         expires_at = int(time.time()) + 600
         fingerprint = self._operation_fingerprint(kind, plan, normalized)
@@ -1057,6 +1069,7 @@ class Stowarr:
         if kind == "reconcile":
             normalized = {"auxiliaryFiles": sorted(set(payload.get("auxiliaryFiles", [])))}
             plan = self.plan(torrent_hash).json()
+            self._validate_reconcile_selection(plan, normalized["auxiliaryFiles"])
         else:
             actions = payload.get("additionalFiles", {})
             normalized = {"targetPool": payload.get("targetPool"), "additionalFiles": dict(sorted(actions.items()))}
@@ -1069,6 +1082,25 @@ class Stowarr:
             token, kind, torrent_hash, confirmation_fingerprint
         )
         return {"plan": plan, "payload": normalized, "fingerprint": fingerprint}
+
+    @staticmethod
+    def _validate_reconcile_selection(plan: dict, selected_sources: list[str]) -> None:
+        allowed = {
+            item["source"]
+            for item in plan.get("auxiliary_files", [])
+            if item.get("status") in RECONCILE_ACTIONABLE_AUXILIARY_STATUSES
+        }
+        selected = set(selected_sources)
+        if selected - allowed:
+            raise ValueError(
+                "One or more selected sidecar paths do not require repair"
+            )
+        primary_work = any(
+            pair.get("status") not in RECONCILE_UNCHANGED_PAIR_STATUSES
+            for pair in plan.get("pairs", [])
+        )
+        if not primary_work and not selected:
+            raise ValueError("No Reconcile changes are selected")
 
     def enqueue_move(self, token: str, torrent_hash: str, payload: dict) -> dict:
         submission_apply = self.config.apply
@@ -1253,10 +1285,21 @@ class Stowarr:
             target = target_item / source.name
             if not target.exists():
                 status = "torrent-sidecar"
-            elif target.stat().st_size == int(item["size"]):
-                status = "target-exists-same-size"
             else:
-                status = "target-conflict"
+                target_stat = target.stat()
+                source_stat = source.stat()
+                if (
+                    target_stat.st_dev,
+                    target_stat.st_ino,
+                ) == (
+                    source_stat.st_dev,
+                    source_stat.st_ino,
+                ):
+                    status = "linked"
+                elif target_stat.st_size == int(item["size"]):
+                    status = "target-exists-same-size"
+                else:
+                    status = "target-conflict"
             previous = by_target.get(target)
             if previous:
                 previous.status = "torrent-name-conflict"
@@ -2534,6 +2577,81 @@ class Stowarr:
                     ),
                 },
             )
+        current_item = Path(str(item["path"]))
+        if app == "sonarr" and current_item != target_item:
+            all_managed_files = mapping.get("allFiles")
+            selected_ids = {
+                int(record["id"])
+                for record in mapping.get("files", [])
+                if record.get("id") is not None
+            }
+            if all_managed_files is None:
+                other_managed_files = []
+                scope_verified = False
+            else:
+                other_managed_files = [
+                    record for record in all_managed_files
+                    if (
+                        record.get("id") is None
+                        or int(record["id"]) not in selected_ids
+                    )
+                ]
+                scope_verified = True
+            if not scope_verified or other_managed_files:
+                current_pool = self.config.pool_for_path(current_item)
+                current_pool_name = current_pool.name if current_pool else None
+                selected_episode_ids = sorted({
+                    int(episode_id)
+                    for record in mapping.get("files", [])
+                    for episode_id in record.get("episodeIds", [])
+                })
+                reason = (
+                    "This download covers only part of the Sonarr series, but "
+                    "Reconcile would have to change the root folder for the whole series"
+                    if scope_verified
+                    else
+                    "Stowarr cannot prove that this download covers every managed "
+                    "episode before changing the Sonarr series root"
+                )
+                recommended = (
+                    f"Move this qBittorrent download to {current_pool_name}, then "
+                    "build the Reconcile plan again. To move the series to "
+                    f"{pool.name}, use a future coordinated whole-series migration "
+                    "that verifies every release."
+                    if current_pool_name
+                    else
+                    "Keep the download and series unchanged until every managed "
+                    "episode can be verified as one coordinated series migration."
+                )
+                issue = {
+                    "code": "SONARR_PARTIAL_SERIES_POOL_CHANGE",
+                    "summary": reason,
+                    "action": recommended,
+                }
+                return Plan(
+                    torrent_hash, torrent["name"], app, pool.name, item["id"],
+                    item.get("title"), item.get("path"), str(target_item), [],
+                    "blocked", reason, issue["code"],
+                    {
+                        "issues": [issue],
+                        "selected_episode_count": len(selected_episode_ids),
+                        "selected_file_count": len(mapping.get("files", [])),
+                        "other_managed_file_count": len(other_managed_files),
+                        "other_managed_files": [
+                            {
+                                "path": record.get("path"),
+                                "relativePath": record.get("relativePath"),
+                                "episodeIds": record.get("episodeIds", []),
+                            }
+                            for record in other_managed_files[:20]
+                        ],
+                        "scope_verified": scope_verified,
+                        "current_pool": current_pool_name,
+                        "target_pool": pool.name,
+                        "recommended_move_pool": current_pool_name,
+                        "action": recommended,
+                    },
+                )
         torrent_files = self._torrent_paths(torrent, torrent_records)
         library_files = self._library_files(mapping)
         missing_library_pair: FilePair | None = None
@@ -2781,7 +2899,11 @@ class Stowarr:
         current_root = Path(item["path"])
         if current_root.exists() and current_root != target_item:
             for source in current_root.rglob("*"):
-                if not source.is_file() or source in source_videos:
+                if (
+                    not source.is_file()
+                    or source in source_videos
+                    or source.suffix.casefold() in VIDEO_EXTENSIONS
+                ):
                     continue
                 relative = source.relative_to(current_root)
                 target = target_item / relative
@@ -2789,10 +2911,21 @@ class Stowarr:
                     status = "torrent-name-conflict"
                 elif not target.exists():
                     status = "missing-target"
-                elif target.stat().st_size == source.stat().st_size:
-                    status = "target-exists-same-size"
                 else:
-                    status = "target-conflict"
+                    target_stat = target.stat()
+                    source_stat = source.stat()
+                    if (
+                        target_stat.st_dev,
+                        target_stat.st_ino,
+                    ) == (
+                        source_stat.st_dev,
+                        source_stat.st_ino,
+                    ):
+                        status = "linked"
+                    elif target_stat.st_size == source_stat.st_size:
+                        status = "target-exists-same-size"
+                    else:
+                        status = "target-conflict"
                 auxiliary_files.append(
                     AuxiliaryFile(
                         str(source), str(target), source.stat().st_size, status,
@@ -3286,14 +3419,19 @@ class Stowarr:
                             "error_code": plan.get("error_code"),
                         })
                     else:
-                        blocked_sidecars = {
-                            "target-conflict", "torrent-name-conflict"
-                        }
                         auxiliary_files = sorted({
                             item["source"]
                             for item in plan.get("auxiliary_files", [])
-                            if item["status"] not in blocked_sidecars
+                            if item["status"]
+                            in RECONCILE_ACTIONABLE_AUXILIARY_STATUSES
                         })
+                        primary_work = any(
+                            pair.get("status")
+                            not in RECONCILE_UNCHANGED_PAIR_STATUSES
+                            for pair in plan.get("pairs", [])
+                        )
+                        if not primary_work and not auxiliary_files:
+                            continue
                         reconcile_candidates.append({
                             "hash": row["hash"],
                             "torrent_name": plan["torrent_name"],
@@ -3982,14 +4120,28 @@ class Stowarr:
         if plan.torrent_hash.casefold() != torrent_hash.casefold():
             raise ValueError("Prepared reconciliation plan does not match the requested torrent")
         selected_auxiliary = auxiliary_sources or set()
-        blocked_sidecars = {"target-conflict", "torrent-name-conflict"}
         allowed_auxiliary = {
-            item.source for item in (plan.auxiliary_files or []) if item.status not in blocked_sidecars
+            item.source
+            for item in (plan.auxiliary_files or [])
+            if item.status in RECONCILE_ACTIONABLE_AUXILIARY_STATUSES
         }
         invalid_auxiliary = selected_auxiliary - allowed_auxiliary
         if invalid_auxiliary:
-            raise ValueError("One or more selected sidecar paths are not eligible in the current plan")
+            raise ValueError(
+                "One or more selected sidecar paths do not require repair"
+            )
         nested_move = operation_id is not None
+        primary_work = any(
+            pair.status not in RECONCILE_UNCHANGED_PAIR_STATUSES
+            for pair in plan.pairs
+        )
+        if (
+            write_enabled
+            and not nested_move
+            and not primary_work
+            and not selected_auxiliary
+        ):
+            raise ValueError("No Reconcile changes are selected")
         if operation_id is None:
             operation_id = self.store.record(
                 torrent_hash, plan.app, "PLANNED", plan.json(),
