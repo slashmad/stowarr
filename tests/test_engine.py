@@ -1506,6 +1506,80 @@ class EngineTest(unittest.TestCase):
             )
             client.rescan.assert_called_once_with(77)
 
+    def test_same_path_hardlink_repair_hashes_each_primary_file_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download_root = root / "download"
+            torrent_movie = download_root / "Movie.2024.mkv"
+            library_root = root / "movies" / "Movie (2024)"
+            library_movie = library_root / torrent_movie.name
+            download_root.mkdir()
+            library_root.mkdir(parents=True)
+            torrent_movie.write_bytes(b"same verified movie")
+            library_movie.write_bytes(torrent_movie.read_bytes())
+            item = {
+                "id": 88, "title": "Movie", "path": str(library_root),
+                "tags": [],
+            }
+            record = {
+                "id": 800, "path": str(library_movie),
+                "relativePath": library_movie.name,
+                "size": library_movie.stat().st_size, "episodeIds": [],
+            }
+            mapping = {"app": "radarr", "item": item, "files": [record]}
+            plan = Plan(
+                "DUPLICATE", "Movie.2024", "radarr", "p3", 88, "Movie",
+                str(library_root), str(library_root),
+                [FilePair(
+                    str(library_movie), str(library_movie), str(torrent_movie),
+                    torrent_movie.stat().st_size, "duplicate", "hardlink",
+                )],
+                "ready", managed_files=[record],
+            )
+            pool = Pool(
+                "p3", root, (download_root,), root / "movies", root / "series",
+                "radarr-pool3", "sonarr-pool3",
+                "radarr-pool3", "sonarr-pool3",
+            )
+            client = SimpleNamespace(
+                download_mapping=lambda torrent_hash: mapping,
+                sync_pool=Mock(),
+                rescan=Mock(),
+            )
+            manager = Stowarr.__new__(Stowarr)
+            manager.arr = {"radarr": client}
+            manager.config = SimpleNamespace(apply=True, pools=(pool,))
+            manager.store = SimpleNamespace(update=Mock())
+            manager.qbit = SimpleNamespace()
+            hashed_paths = []
+            progress = []
+
+            def tracked_sha256(path, *args, **kwargs):
+                hashed_paths.append(Path(path))
+                return sha256(path, *args, **kwargs)
+
+            with patch("stowarr.engine.sha256", side_effect=tracked_sha256):
+                result = manager.reconcile(
+                    "DUPLICATE", operation_id=11, mapping_hint=mapping,
+                    prepared_plan=plan,
+                    progress_callback=lambda state, percent, **detail: (
+                        progress.append((state, percent, detail))
+                    ),
+                )
+
+            self.assertEqual(result["state"], "COMPLETE")
+            self.assertEqual(
+                hashed_paths, [library_movie, torrent_movie]
+            )
+            self.assertEqual(
+                (library_movie.stat().st_dev, library_movie.stat().st_ino),
+                (torrent_movie.stat().st_dev, torrent_movie.stat().st_ino),
+            )
+            self.assertIn(
+                "Content hashes verified; creating library hardlink",
+                [detail["message"] for _, _, detail in progress],
+            )
+
     def test_sync_audit_reports_duplicate_and_unrouted_history_torrents(self):
         p1 = Pool(
             "p1", Path("/p1"), (Path("/p1/download"),),

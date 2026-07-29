@@ -4091,23 +4091,91 @@ class Stowarr:
                 torrent_file = Path(pair.torrent_file)
                 if not torrent_file.exists() or torrent_file.stat().st_size != pair.size:
                     raise RuntimeError(f"Relocated qBittorrent media changed or missing: {torrent_file}")
+                source_digest = None
+                source_identity = None
+                torrent_digest = None
+                torrent_identity = None
                 if source.exists():
                     if source.stat().st_size != torrent_file.stat().st_size:
                         raise RuntimeError(f"Source changed size: {source}")
-                    if sha256(source, progress=lambda done, total: pair_progress(done, total, "current library media")) != sha256(
-                        torrent_file, progress=lambda done, total: pair_progress(done, total, "qBittorrent media")
-                    ):
+                    source_digest = sha256(
+                        source,
+                        progress=lambda done, total: pair_progress(
+                            done, total, "current library media"
+                        ),
+                    )
+                    source_identity = _file_identity(source)
+                    torrent_digest = sha256(
+                        torrent_file,
+                        progress=lambda done, total: pair_progress(
+                            done, total, "qBittorrent media"
+                        ),
+                    )
+                    torrent_identity = _file_identity(torrent_file)
+                    if source_digest != torrent_digest:
                         raise RuntimeError(f"Hash mismatch: {source} != {torrent_file}")
                 elif (
                     pair.status != "missing-library"
                     and str(source) not in (relocated_library_sources or set())
                 ):
                     raise RuntimeError(f"Source changed or missing: {source}")
+                target_identity = None
                 if target.exists():
                     target_stat, torrent_stat = target.stat(), torrent_file.stat()
                     same_file = (target_stat.st_dev, target_stat.st_ino) == (torrent_stat.st_dev, torrent_stat.st_ino)
-                    if not same_file and sha256(target) != sha256(torrent_file):
-                        raise RuntimeError(f"Existing library target differs from torrent data: {target}")
+                    if not same_file:
+                        if target == source and source_digest is not None:
+                            if _file_identity(target) != source_identity:
+                                raise RuntimeError(
+                                    f"Library source changed after verification: {target}"
+                                )
+                            target_digest = source_digest
+                            target_identity = source_identity
+                        else:
+                            target_digest = sha256(
+                                target,
+                                progress=lambda done, total: pair_progress(
+                                    done, total, "existing library target"
+                                ),
+                            )
+                            target_identity = _file_identity(target)
+                        if torrent_digest is None:
+                            torrent_digest = sha256(
+                                torrent_file,
+                                progress=lambda done, total: pair_progress(
+                                    done, total, "qBittorrent media"
+                                ),
+                            )
+                            torrent_identity = _file_identity(torrent_file)
+                        if target_digest != torrent_digest:
+                            raise RuntimeError(
+                                f"Existing library target differs from torrent data: {target}"
+                            )
+                if (
+                    torrent_identity is not None
+                    and _file_identity(torrent_file) != torrent_identity
+                ):
+                    raise RuntimeError(
+                        f"qBittorrent media changed after verification: {torrent_file}"
+                    )
+                if (
+                    target_identity is not None
+                    and _file_identity(target) != target_identity
+                ):
+                    raise RuntimeError(
+                        f"Library target changed after verification: {target}"
+                    )
+                if progress_callback:
+                    progress_callback(
+                        state_name(
+                            "RECONCILE_VERIFYING", "MOVE_LIBRARY_VERIFYING"
+                        ),
+                        (pair_index + 1) / pair_total * 100,
+                        completed_files=pair_index,
+                        total_files=len(plan.pairs),
+                        current=target.name,
+                        message="Content hashes verified; creating library hardlink",
+                    )
                 self._filesystem().mkdir(
                     target.parent, parents=True, exist_ok=True
                 )
