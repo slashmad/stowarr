@@ -17,12 +17,49 @@ from stowarr.engine import (
     Stowarr,
     is_archive,
     release_folder_warning,
+    safe_restore_video_candidate,
     sha256,
+    strong_release_matches_item,
     title_matches,
 )
 
 
 class EngineTest(unittest.TestCase):
+    def test_safe_restore_video_requires_file_level_feature_evidence(self):
+        self.assertTrue(
+            safe_restore_video_candidate(
+                "Moana 2", Path("/download/Moana.2.2024/Moana.2.2024.mkv")
+            )
+        )
+        self.assertFalse(
+            safe_restore_video_candidate(
+                "Moana 2", Path("/download/Moana.2.2024/Sample.mkv")
+            )
+        )
+        self.assertFalse(
+            safe_restore_video_candidate(
+                "Moana 2", Path("/download/Moana.2.2024/Extras/Moana.2.mkv")
+            )
+        )
+        self.assertFalse(
+            safe_restore_video_candidate(
+                "Moana 2", Path("/download/Moana.2.2024/movie.mkv")
+            )
+        )
+
+    def test_strong_release_match_requires_complete_title_and_compatible_year(self):
+        item = {"title": "Crime 101", "year": 2026}
+
+        self.assertTrue(
+            strong_release_matches_item(item, "Crime.101.2026.2160p.REMUX")
+        )
+        self.assertFalse(
+            strong_release_matches_item(item, "Crime.Scene.2026.2160p")
+        )
+        self.assertFalse(
+            strong_release_matches_item(item, "Crime.101.2025.2160p")
+        )
+
     def test_write_submission_is_rejected_while_recovery_is_required(self):
         manager = Stowarr.__new__(Stowarr)
         manager.config = SimpleNamespace(apply=True)
@@ -1092,7 +1129,7 @@ class EngineTest(unittest.TestCase):
         )
         manager.arr = {"radarr": SimpleNamespace(
             download_mapping=lambda torrent_hash: {"item": item, "files": []},
-            history_for_downloads=lambda hashes: {"beast-a": 42, "beast-b": 42},
+            history_for_downloads=lambda hashes: {"beast-a": 42},
         )}
 
         plan = manager.plan("beast-a")
@@ -1100,6 +1137,10 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(plan.status, "blocked")
         self.assertEqual(plan.error_code, "ARR_ITEM_HAS_MULTIPLE_TORRENTS")
         self.assertEqual(len(plan.error_details["related_torrents"]), 2)
+        self.assertEqual(
+            {item["evidence"] for item in plan.error_details["related_torrents"]},
+            {"exact-history", "strong-title"},
+        )
         self.assertIn("seeding", plan.error_details["action"])
 
     def test_radarr_plan_restores_one_missing_video_and_selected_subtitles(self):
@@ -1223,6 +1264,46 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(plan.status, "blocked")
         self.assertEqual(plan.error_code, "ARR_MANAGED_MEDIA_MISSING")
         self.assertEqual(plan.error_details["torrent_video_count"], 2)
+
+    def test_radarr_missing_media_restore_rejects_sample_as_feature(self):
+        pool = Pool(
+            "p3", Path("/p3"), (Path("/p3/download"),),
+            Path("/p3/movies"), Path("/p3/series"),
+            "radarr-pool3", "sonarr-pool3",
+            "radarr-pool3", "sonarr-pool3",
+        )
+        item = {
+            "id": 66, "title": "Moana 2",
+            "path": "/p3/movies/Moana 2 (2024)",
+        }
+        manager = Stowarr.__new__(Stowarr)
+        manager.qbit = SimpleNamespace(
+            torrents=lambda: [{
+                "hash": "MOANA", "name": "Moana.2.2024",
+                "category": "radarr-pool3",
+                "save_path": "/p3/download/Moana.2.2024",
+            }],
+            files=lambda torrent_hash: [
+                {"name": "Sample.mkv", "size": 10, "priority": 1},
+            ],
+        )
+        manager.config = SimpleNamespace(
+            pools=(pool,),
+            pool_for_path=lambda path: pool,
+            pool_for_category=lambda category: (pool, "radarr"),
+        )
+        manager.arr = {"radarr": SimpleNamespace(
+            download_mapping=lambda torrent_hash: {
+                "app": "radarr", "item": item, "files": [],
+            },
+            history_for_downloads=lambda hashes: {"moana": 66},
+        )}
+
+        plan = manager.plan("MOANA")
+
+        self.assertEqual(plan.status, "blocked")
+        self.assertEqual(plan.error_code, "RADARR_FEATURE_VIDEO_UNPROVEN")
+        self.assertEqual(plan.error_details["selected_video"], "/p3/download/Moana.2.2024/Sample.mkv")
 
     def test_radarr_missing_media_restore_force_rechecks_and_hardlinks_subtitles(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1394,10 +1475,13 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(audit["scanned"], 3)
         self.assertEqual(by_hash["A"]["status"], "multiple-torrents")
         self.assertEqual(by_hash["B"]["status"], "multiple-torrents")
+        self.assertFalse(by_hash["A"]["safe_plan_candidate"])
+        self.assertFalse(by_hash["B"]["safe_plan_candidate"])
         self.assertEqual(len(by_hash["A"]["related_torrents"]), 2)
         self.assertEqual(by_hash["C"]["status"], "category-unconfigured")
         self.assertEqual(by_hash["C"]["expected_category"], "radarr-pool3")
         self.assertTrue(by_hash["C"]["category_repairable"])
+        self.assertTrue(by_hash["C"]["safe_plan_candidate"])
 
     def test_radarr_sync_audit_finds_missing_media_and_missing_hardlinks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1489,10 +1573,124 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(
                 by_hash["MISSING"]["status"], "missing-library-file"
             )
+            self.assertTrue(by_hash["MISSING"]["safe_plan_candidate"])
             self.assertEqual(
                 by_hash["COPIED"]["status"], "hardlink-missing"
             )
+            self.assertTrue(by_hash["COPIED"]["safe_plan_candidate"])
             self.assertEqual(by_hash["LINKED"]["status"], "in-sync")
+            self.assertFalse(by_hash["LINKED"]["safe_plan_candidate"])
+
+    def test_radarr_sync_audit_does_not_offer_hardlink_repair_for_packed_media(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download_root = root / "download"
+            release = download_root / "Click.2006.2160p"
+            archive = release / "click.rar"
+            archive.parent.mkdir(parents=True)
+            archive.write_bytes(b"packed movie")
+            movie_root = root / "movies"
+            library = movie_root / "Click (2006)" / "Click.2006.mkv"
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b"derived movie")
+            pool = Pool(
+                "p3", root, (download_root,), movie_root, root / "series",
+                "radarr-pool3", "sonarr-pool3",
+                "radarr-pool3", "sonarr-pool3",
+            )
+            torrent = {
+                "hash": "CLICK", "name": "Click.2006.2160p",
+                "category": "radarr-pool3", "save_path": str(download_root),
+            }
+            item = {
+                "id": 6, "title": "Click", "year": 2006,
+                "path": str(library.parent),
+                "movieFile": {
+                    "id": 60, "path": str(library),
+                    "relativePath": library.name,
+                    "size": library.stat().st_size,
+                },
+            }
+            manager = Stowarr.__new__(Stowarr)
+            manager.qbit = SimpleNamespace(
+                torrents=lambda: [torrent],
+                categories=lambda: {
+                    "radarr-pool3": {"savePath": str(download_root)},
+                },
+                files=lambda torrent_hash: [{
+                    "name": str(archive.relative_to(download_root)),
+                    "size": archive.stat().st_size,
+                    "priority": 1,
+                }],
+            )
+            manager.config = SimpleNamespace(
+                pools=(pool,),
+                pool_for_path=lambda path: pool,
+                pool_for_category=lambda category: (pool, "radarr"),
+            )
+            manager.arr = {"radarr": SimpleNamespace(
+                history_for_downloads=lambda hashes: {"click": 6},
+                all_items=lambda: [item],
+            )}
+
+            row = manager.sync_audit("radarr")["rows"][0]
+
+            self.assertEqual(row["status"], "packed-media")
+            self.assertFalse(row["safe_plan_candidate"])
+            self.assertEqual(
+                row["issues"][0]["code"],
+                "PACKED_MEDIA_HARDLINK_NOT_APPLICABLE",
+            )
+
+    def test_radarr_sync_audit_blocks_a_different_release_folder_from_safe_repair(self):
+        pool = Pool(
+            "p3", Path("/p3"), (Path("/p3/download"),),
+            Path("/p3/movies"), Path("/p3/series"),
+            "radarr-pool3", "sonarr-pool3",
+            "radarr-pool3", "sonarr-pool3",
+        )
+        torrent = {
+            "hash": "KILLING",
+            "name": "How.To.Make.A.Killing.2026.2160p.REMUX-CiNEPHiLES",
+            "category": "radarr-pool3",
+            "save_path": "/p3/download/How.To.Make.A.Killing.2026",
+        }
+        item = {
+            "id": 42, "title": "How to Make a Killing", "year": 2026,
+            "path": (
+                "/p3/movies/How.to.Make.a.Killing.2026.NORDiC.2160p."
+                "WEB-DL.DDP5.1-CiUHD"
+            ),
+            "movieFile": {
+                "id": 420,
+                "relativePath": "How.to.Make.a.Killing.2026.mkv",
+                "size": 100,
+            },
+        }
+        manager = Stowarr.__new__(Stowarr)
+        manager.qbit = SimpleNamespace(
+            torrents=lambda: [torrent],
+            categories=lambda: {
+                "radarr-pool3": {"savePath": "/p3/download"},
+            },
+        )
+        manager.config = SimpleNamespace(
+            pools=(pool,),
+            pool_for_path=lambda path: pool,
+            pool_for_category=lambda category: (pool, "radarr"),
+        )
+        manager.arr = {"radarr": SimpleNamespace(
+            history_for_downloads=lambda hashes: {"killing": 42},
+            all_items=lambda: [item],
+        )}
+
+        row = manager.sync_audit("radarr")["rows"][0]
+
+        self.assertEqual(row["status"], "library-folder-mismatch")
+        self.assertFalse(row["safe_plan_candidate"])
+        self.assertEqual(
+            row["issues"][0]["code"], "RADARR_RELEASE_FOLDER_MISMATCH"
+        )
 
     def test_sonarr_roots_preserve_anime_family_between_pools(self):
         p1 = Pool(

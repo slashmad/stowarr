@@ -32,6 +32,13 @@ VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".vtt"}
 ARTWORK_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 TITLE_STOPWORDS = {"the", "and", "for", "with", "from", "part", "movie"}
+NON_FEATURE_VIDEO_MARKERS = {
+    "bonus", "bts", "deleted", "extra", "extras", "featurette", "featurettes",
+    "interview", "sample", "samples", "teaser", "trailer", "trailers",
+}
+SAFE_RECONCILE_AUDIT_STATUSES = {
+    "root-mismatch", "missing-library-file", "hardlink-missing",
+}
 RELEASE_FOLDER_MARKERS = re.compile(
     r"(?i)(?:^|[._ -])(?:720p|1080[pi]|2160p|uhd|bluray|blu-ray|web(?:[._ -]?dl)?|"
     r"remux|x26[45]|h[._ -]?26[45]|hevc|avc|hdr10p?|dv|dolby[._ -]?vision|"
@@ -53,6 +60,70 @@ def title_matches(item_title: str, *candidate_names: str) -> bool:
         return True
     actual = title_tokens(" ".join(candidate_names))
     return bool(expected & actual)
+
+
+def strong_release_matches_item(item: dict, candidate_name: str) -> bool:
+    """Require all meaningful title tokens and a compatible release year."""
+    expected = {
+        token
+        for token in re.findall(
+            r"[a-z0-9]+", str(item.get("title") or "").casefold()
+        )
+        if len(token) >= 2 and token not in TITLE_STOPWORDS
+    }
+    actual = set(re.findall(r"[a-z0-9]+", candidate_name.casefold()))
+    if not expected or not expected.issubset(actual):
+        return False
+    expected_year = int(item.get("year") or 0)
+    candidate_years = {
+        int(token)
+        for token in actual
+        if len(token) == 4 and token.isdigit() and 1900 <= int(token) <= 2100
+    }
+    return not expected_year or not candidate_years or expected_year in candidate_years
+
+
+def safe_restore_video_candidate(item_title: str, path: Path) -> bool:
+    """Require file-level feature evidence before restoring missing Radarr media."""
+    file_tokens = set(re.findall(r"[a-z0-9]+", path.stem.casefold()))
+    parent_tokens = set(re.findall(r"[a-z0-9]+", path.parent.name.casefold()))
+    if NON_FEATURE_VIDEO_MARKERS & (file_tokens | parent_tokens):
+        return False
+    return strong_release_matches_item({"title": item_title}, path.name)
+
+
+def radarr_torrent_candidates(
+    torrents: list[dict], item: dict, item_by_hash: dict[str, int]
+) -> list[dict]:
+    """Return every exact or strong-title qBittorrent candidate for one movie."""
+    item_id = int(item["id"])
+    candidates = []
+    for torrent in torrents:
+        torrent_hash = str(torrent.get("hash") or "").casefold()
+        exact_history = item_by_hash.get(torrent_hash) == item_id
+        strong_title = strong_release_matches_item(
+            item, str(torrent.get("name") or "")
+        )
+        if not exact_history and not strong_title:
+            continue
+        candidates.append({
+            "hash": torrent.get("hash"),
+            "name": torrent.get("name"),
+            "category": torrent.get("category", ""),
+            "save_path": torrent.get("save_path", ""),
+            "evidence": "exact-history" if exact_history else "strong-title",
+        })
+    return candidates
+
+
+def safe_sync_candidate(row: dict) -> bool:
+    return bool(
+        (
+            row.get("status") == "category-unconfigured"
+            and row.get("category_repairable") is True
+        )
+        or row.get("status") in SAFE_RECONCILE_AUDIT_STATUSES
+    )
 
 
 def release_folder_warning(item: dict | None, torrent_name: str, app: str) -> dict | None:
@@ -2383,23 +2454,14 @@ class Stowarr:
                 str(candidate.get("hash") or "").casefold() for candidate in torrents
                 if candidate.get("hash")
             })
-            related = [
-                {
-                    "hash": candidate.get("hash"),
-                    "name": candidate.get("name"),
-                    "category": candidate.get("category", ""),
-                    "save_path": candidate.get("save_path", ""),
-                }
-                for candidate in torrents
-                if item_by_hash.get(str(candidate.get("hash") or "").casefold()) == int(item["id"])
-            ]
+            related = radarr_torrent_candidates(torrents, item, item_by_hash)
             if len(related) > 1:
                 service = app.capitalize()
                 issue = {
                     "code": "ARR_ITEM_HAS_MULTIPLE_TORRENTS",
                     "summary": (
-                        f"{len(related)} qBittorrent torrents are associated with the same "
-                        f'{service} item "{item.get("title", "")}"'
+                        f"{len(related)} qBittorrent torrents are exact or strong-title "
+                        f'candidates for the same {service} item "{item.get("title", "")}"'
                     ),
                     "action": (
                         "Wait for required seeding to finish, keep the intended release, and "
@@ -2428,6 +2490,24 @@ class Stowarr:
                     "episode_ids": [episode["id"] for episode in mapping.get("episodes", [])],
                     "episode_file_ids": [record["id"] for record in mapping.get("files", [])],
                     "action": "Refresh or rescan the series in Sonarr, then analyze the torrent again.",
+                },
+            )
+        folder_warning = release_folder_warning(item, torrent["name"], app)
+        if folder_warning:
+            return Plan(
+                torrent_hash, torrent["name"], app, pool.name, item["id"],
+                item.get("title"), item.get("path"), None, [], "blocked",
+                folder_warning["message"], folder_warning["code"],
+                {
+                    "issues": [{
+                        "code": folder_warning["code"],
+                        "summary": folder_warning["message"],
+                        "action": folder_warning["action"],
+                    }],
+                    "current_library_path": folder_warning["currentPath"],
+                    "suggested_library_path": folder_warning["suggestedPath"],
+                    "selected_release": folder_warning["selectedRelease"],
+                    "action": folder_warning["action"],
                 },
             )
         try:
@@ -2484,6 +2564,31 @@ class Stowarr:
                     },
                 )
             torrent_file, size = direct_videos[0]
+            if not safe_restore_video_candidate(
+                str(item.get("title") or ""), torrent_file
+            ):
+                reason = (
+                    "Stowarr cannot prove that the selected direct video is the feature "
+                    "movie rather than a sample, trailer, extra, or unrelated file"
+                )
+                return Plan(
+                    torrent_hash, torrent["name"], app, pool.name, item["id"],
+                    item.get("title"), item.get("path"), str(target_item), [],
+                    "blocked", reason, "RADARR_FEATURE_VIDEO_UNPROVEN",
+                    {
+                        "issues": [{
+                            "code": "RADARR_FEATURE_VIDEO_UNPROVEN",
+                            "summary": reason,
+                            "action": (
+                                "Keep the qBittorrent data intact. Select the actual feature "
+                                "movie with a filename that identifies the Radarr title, or "
+                                "import the intended file manually in Radarr."
+                            ),
+                        }],
+                        "selected_video": str(torrent_file),
+                        "arr_title": item.get("title"),
+                    },
+                )
             target = target_item / torrent_file.name
             missing_library_pair = FilePair(
                 str(target), str(target), str(torrent_file), size,
@@ -2840,6 +2945,16 @@ class Stowarr:
                         "exact torrent-to-library mapping and no competing torrent exists."
                     ),
                 })
+            elif folder_warning := release_folder_warning(
+                item, torrent["name"], app
+            ):
+                status = "library-folder-mismatch"
+                reason = folder_warning["message"]
+                issues.append({
+                    "code": folder_warning["code"],
+                    "summary": folder_warning["message"],
+                    "action": folder_warning["action"],
+                })
             elif app == "radarr":
                 movie_file = item.get("movieFile") or {}
                 relative = str(movie_file.get("relativePath") or "")
@@ -2848,31 +2963,52 @@ class Stowarr:
                     recorded_path
                     or str(Path(str(item.get("path") or "")) / relative)
                 )
+                torrent_records = self.qbit.files(torrent["hash"])
+                has_archives = any(
+                    int(record.get("priority", 1)) > 0
+                    and is_archive(Path(str(record.get("name") or "")))
+                    for record in torrent_records
+                )
                 if (
                     not movie_file
                     or not (recorded_path or relative)
                     or not library_path.is_file()
                 ):
-                    status = "missing-library-file"
+                    status = (
+                        "packed-media-missing"
+                        if has_archives else "missing-library-file"
+                    )
                     reason = (
-                        "Radarr does not manage a visible movie file for this download"
+                        "Radarr does not manage a visible movie derived from this "
+                        "packed download"
+                        if has_archives
+                        else "Radarr does not manage a visible movie file for this download"
                     )
                     issues.append({
-                        "code": "ARR_MANAGED_MEDIA_MISSING",
+                        "code": (
+                            "PACKED_MEDIA_REQUIRES_IMPORT"
+                            if has_archives else "ARR_MANAGED_MEDIA_MISSING"
+                        ),
                         "summary": reason,
                         "action": (
-                            "Build a Reconcile plan. Stowarr can restore one uniquely "
-                            "identified direct qBittorrent video and its sidecars after "
-                            "force recheck; ambiguous or packed content remains manual."
+                            (
+                                "Keep the qBittorrent archives intact. Standalone Reconcile "
+                                "does not extract missing packed media; extract/import it "
+                                "through Radarr, then rescan and rerun the audit."
+                            )
+                            if has_archives
+                            else (
+                                "Build a Reconcile plan. Stowarr can restore one uniquely "
+                                "identified direct qBittorrent video and its sidecars after "
+                                "force recheck; ambiguous or packed content remains manual."
+                            )
                         ),
                     })
                 else:
                     library_stat = library_path.stat()
                     torrent_videos = [
                         path
-                        for path, size in self._torrent_paths(
-                            torrent, self.qbit.files(torrent["hash"])
-                        )
+                        for path, size in self._torrent_paths(torrent, torrent_records)
                         if size == int(
                             movie_file.get("size") or library_stat.st_size
                         )
@@ -2888,6 +3024,21 @@ class Stowarr:
                             "in-sync",
                             "Hash, category, save path, *Arr root and hardlink agree",
                         )
+                    elif has_archives and not torrent_videos:
+                        status = "packed-media"
+                        reason = (
+                            "Radarr manages visible media derived from a packed "
+                            "qBittorrent download; hardlink identity is not applicable"
+                        )
+                        issues.append({
+                            "code": "PACKED_MEDIA_HARDLINK_NOT_APPLICABLE",
+                            "summary": reason,
+                            "action": (
+                                "Keep the qBittorrent archives intact. No hardlink repair "
+                                "is available; use Diagnose only if the imported media or "
+                                "Radarr association is suspect."
+                            ),
+                        })
                     else:
                         status = "hardlink-missing"
                         reason = (
@@ -2925,37 +3076,37 @@ class Stowarr:
                 "action": issues[0]["action"] if issues else None,
             })
         if app == "radarr":
-            rows_by_item: dict[int, list[dict]] = {}
             for row in rows:
-                if row["item_id"] and row["item_title"]:
-                    rows_by_item.setdefault(int(row["item_id"]), []).append(row)
-            for related in rows_by_item.values():
-                if len(related) < 2:
+                if not row["item_id"] or not row["item_title"]:
                     continue
-                torrent_evidence = [{
-                    "hash": row["hash"],
-                    "name": row["torrent_name"],
-                    "category": row["category"],
-                    "save_path": row["save_path"],
-                } for row in related]
-                for row in related:
-                    issue = {
-                        "code": "ARR_ITEM_HAS_MULTIPLE_TORRENTS",
-                        "summary": (
-                            f'{len(related)} qBittorrent torrents map to the same {service} item '
-                            f'"{row["item_title"]}".'
-                        ),
-                        "action": (
-                            "Keep seeding if required, but do not Reconcile yet. When allowed, retain "
-                            "the intended release and remove or disassociate the unwanted torrent(s); "
-                            "then verify its category and rerun the audit."
-                        ),
-                    }
-                    row["status"] = "multiple-torrents"
-                    row["reason"] = issue["summary"]
-                    row["issues"].insert(0, issue)
-                    row["action"] = issue["action"]
-                    row["related_torrents"] = torrent_evidence
+                item = items.get(int(row["item_id"]))
+                if not item:
+                    continue
+                torrent_evidence = radarr_torrent_candidates(
+                    all_torrents, item, history
+                )
+                if len(torrent_evidence) < 2:
+                    continue
+                issue = {
+                    "code": "ARR_ITEM_HAS_MULTIPLE_TORRENTS",
+                    "summary": (
+                        f'{len(torrent_evidence)} qBittorrent torrents are exact or '
+                        f'strong-title candidates for the same {service} item '
+                        f'"{row["item_title"]}".'
+                    ),
+                    "action": (
+                        "Keep seeding if required, but do not Reconcile yet. When allowed, retain "
+                        "the intended release and remove or disassociate the unwanted torrent(s); "
+                        "then verify its category and rerun the audit."
+                    ),
+                }
+                row["status"] = "multiple-torrents"
+                row["reason"] = issue["summary"]
+                row["issues"].insert(0, issue)
+                row["action"] = issue["action"]
+                row["related_torrents"] = torrent_evidence
+        for row in rows:
+            row["safe_plan_candidate"] = safe_sync_candidate(row)
         rows.sort(key=lambda row: (row["status"] == "in-sync", row["torrent_name"].casefold()))
         return {
             "app": app,
@@ -3008,9 +3159,7 @@ class Stowarr:
                     "category": row["expected_category"],
                 })
                 continue
-            if row["status"] in {
-                "root-mismatch", "missing-library-file", "hardlink-missing",
-            }:
+            if row["status"] in SAFE_RECONCILE_AUDIT_STATUSES:
                 reconcile_issues.append(row)
                 continue
             manual.append({
