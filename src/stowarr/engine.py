@@ -1084,6 +1084,18 @@ class Stowarr:
         return {"plan": plan, "payload": normalized, "fingerprint": fingerprint}
 
     @staticmethod
+    def _reconcile_has_primary_work(plan: dict) -> bool:
+        current_item = str(plan.get("current_item_path") or "").rstrip("/")
+        target_item = str(plan.get("target_item_path") or "").rstrip("/")
+        pending_root_change = bool(
+            current_item and target_item and current_item != target_item
+        )
+        return pending_root_change or any(
+            pair.get("status") not in RECONCILE_UNCHANGED_PAIR_STATUSES
+            for pair in plan.get("pairs", [])
+        )
+
+    @staticmethod
     def _validate_reconcile_selection(plan: dict, selected_sources: list[str]) -> None:
         allowed = {
             item["source"]
@@ -1095,10 +1107,7 @@ class Stowarr:
             raise ValueError(
                 "One or more selected sidecar paths do not require repair"
             )
-        primary_work = any(
-            pair.get("status") not in RECONCILE_UNCHANGED_PAIR_STATUSES
-            for pair in plan.get("pairs", [])
-        )
+        primary_work = Stowarr._reconcile_has_primary_work(plan)
         if not primary_work and not selected:
             raise ValueError("No Reconcile changes are selected")
 
@@ -1283,7 +1292,9 @@ class Stowarr:
             ):
                 continue
             target = target_item / source.name
-            if not target.exists():
+            if not source.is_file():
+                status = "source-missing"
+            elif not target.exists():
                 status = "torrent-sidecar"
             else:
                 target_stat = target.stat()
@@ -1644,6 +1655,99 @@ class Stowarr:
             "files": results,
         }
 
+    def _sonarr_series_scope_issue(
+        self,
+        mapping: dict,
+        current_item: Path,
+        target_item: Path,
+        target_pool_name: str,
+    ) -> dict | None:
+        """Describe an unsafe partial-series root change before any mutation."""
+        if current_item == target_item:
+            return None
+        all_managed_files = mapping.get("allFiles")
+        selected_ids = {
+            int(record["id"])
+            for record in mapping.get("files", [])
+            if record.get("id") is not None
+        }
+        if all_managed_files is None:
+            other_managed_files = []
+            scope_verified = False
+        else:
+            all_managed_ids = {
+                int(record["id"])
+                for record in all_managed_files
+                if record.get("id") is not None
+            }
+            other_managed_files = [
+                record for record in all_managed_files
+                if (
+                    record.get("id") is None
+                    or int(record["id"]) not in selected_ids
+                )
+            ]
+            scope_verified = bool(
+                selected_ids
+                and selected_ids.issubset(all_managed_ids)
+                and len(all_managed_ids) == len(all_managed_files)
+            )
+        if scope_verified and not other_managed_files:
+            return None
+
+        current_pool = self.config.pool_for_path(current_item)
+        current_pool_name = current_pool.name if current_pool else None
+        selected_episode_ids = sorted({
+            int(episode_id)
+            for record in mapping.get("files", [])
+            for episode_id in record.get("episodeIds", [])
+        })
+        reason = (
+            "This download covers only part of the Sonarr series, but changing "
+            "the route would move the root folder for the whole series"
+            if scope_verified
+            else
+            "Stowarr cannot prove that this download covers every managed "
+            "episode before changing the Sonarr series root"
+        )
+        recommended = (
+            f"Move this qBittorrent download to {current_pool_name}, then "
+            "build the Reconcile plan again. To move the series to "
+            f"{target_pool_name}, use a coordinated whole-series migration "
+            "that verifies every managed episode and associated release."
+            if current_pool_name
+            else
+            "Keep the download and series unchanged until every managed "
+            "episode can be verified as one coordinated series migration."
+        )
+        return {
+            "reason": reason,
+            "code": "SONARR_PARTIAL_SERIES_POOL_CHANGE",
+            "details": {
+                "issues": [{
+                    "code": "SONARR_PARTIAL_SERIES_POOL_CHANGE",
+                    "summary": reason,
+                    "action": recommended,
+                }],
+                "selected_episode_count": len(selected_episode_ids),
+                "selected_file_count": len(mapping.get("files", [])),
+                "other_managed_file_count": len(other_managed_files),
+                "other_managed_files": [
+                    {
+                        "path": record.get("path"),
+                        "relativePath": record.get("relativePath"),
+                        "episodeIds": record.get("episodeIds", []),
+                    }
+                    for record in other_managed_files[:20]
+                ],
+                "scope_verified": scope_verified,
+                "current_pool": current_pool_name,
+                "target_pool": target_pool_name,
+                "recommended_move_pool": current_pool_name,
+                "action": recommended,
+            },
+        }
+
     def move_plan(self, torrent_hash: str, target_pool_name: str) -> MovePlan:
         torrent = self.qbit.torrent(torrent_hash)
         target_pool = next((pool for pool in self.config.pools if pool.name == target_pool_name), None)
@@ -1814,6 +1918,18 @@ class Stowarr:
                     ),
                 }
             if target_item:
+                if app == "sonarr" and status == "ready":
+                    scope_issue = self._sonarr_series_scope_issue(
+                        mapping,
+                        Path(str(item["path"])),
+                        target_item,
+                        target_pool.name,
+                    )
+                    if scope_issue:
+                        status = "blocked"
+                        reason = scope_issue["reason"]
+                        error_code = scope_issue["code"]
+                        error_details = scope_issue["details"]
                 for record in mapping.get("files", []):
                     managed_files.append({
                         **record,
@@ -2578,79 +2694,16 @@ class Stowarr:
                 },
             )
         current_item = Path(str(item["path"]))
-        if app == "sonarr" and current_item != target_item:
-            all_managed_files = mapping.get("allFiles")
-            selected_ids = {
-                int(record["id"])
-                for record in mapping.get("files", [])
-                if record.get("id") is not None
-            }
-            if all_managed_files is None:
-                other_managed_files = []
-                scope_verified = False
-            else:
-                other_managed_files = [
-                    record for record in all_managed_files
-                    if (
-                        record.get("id") is None
-                        or int(record["id"]) not in selected_ids
-                    )
-                ]
-                scope_verified = True
-            if not scope_verified or other_managed_files:
-                current_pool = self.config.pool_for_path(current_item)
-                current_pool_name = current_pool.name if current_pool else None
-                selected_episode_ids = sorted({
-                    int(episode_id)
-                    for record in mapping.get("files", [])
-                    for episode_id in record.get("episodeIds", [])
-                })
-                reason = (
-                    "This download covers only part of the Sonarr series, but "
-                    "Reconcile would have to change the root folder for the whole series"
-                    if scope_verified
-                    else
-                    "Stowarr cannot prove that this download covers every managed "
-                    "episode before changing the Sonarr series root"
-                )
-                recommended = (
-                    f"Move this qBittorrent download to {current_pool_name}, then "
-                    "build the Reconcile plan again. To move the series to "
-                    f"{pool.name}, use a future coordinated whole-series migration "
-                    "that verifies every release."
-                    if current_pool_name
-                    else
-                    "Keep the download and series unchanged until every managed "
-                    "episode can be verified as one coordinated series migration."
-                )
-                issue = {
-                    "code": "SONARR_PARTIAL_SERIES_POOL_CHANGE",
-                    "summary": reason,
-                    "action": recommended,
-                }
+        if app == "sonarr":
+            scope_issue = self._sonarr_series_scope_issue(
+                mapping, current_item, target_item, pool.name
+            )
+            if scope_issue:
                 return Plan(
                     torrent_hash, torrent["name"], app, pool.name, item["id"],
                     item.get("title"), item.get("path"), str(target_item), [],
-                    "blocked", reason, issue["code"],
-                    {
-                        "issues": [issue],
-                        "selected_episode_count": len(selected_episode_ids),
-                        "selected_file_count": len(mapping.get("files", [])),
-                        "other_managed_file_count": len(other_managed_files),
-                        "other_managed_files": [
-                            {
-                                "path": record.get("path"),
-                                "relativePath": record.get("relativePath"),
-                                "episodeIds": record.get("episodeIds", []),
-                            }
-                            for record in other_managed_files[:20]
-                        ],
-                        "scope_verified": scope_verified,
-                        "current_pool": current_pool_name,
-                        "target_pool": pool.name,
-                        "recommended_move_pool": current_pool_name,
-                        "action": recommended,
-                    },
+                    "blocked", scope_issue["reason"], scope_issue["code"],
+                    scope_issue["details"],
                 )
         torrent_files = self._torrent_paths(torrent, torrent_records)
         library_files = self._library_files(mapping)
@@ -3425,11 +3478,7 @@ class Stowarr:
                             if item["status"]
                             in RECONCILE_ACTIONABLE_AUXILIARY_STATUSES
                         })
-                        primary_work = any(
-                            pair.get("status")
-                            not in RECONCILE_UNCHANGED_PAIR_STATUSES
-                            for pair in plan.get("pairs", [])
-                        )
+                        primary_work = self._reconcile_has_primary_work(plan)
                         if not primary_work and not auxiliary_files:
                             continue
                         reconcile_candidates.append({
@@ -4131,10 +4180,7 @@ class Stowarr:
                 "One or more selected sidecar paths do not require repair"
             )
         nested_move = operation_id is not None
-        primary_work = any(
-            pair.status not in RECONCILE_UNCHANGED_PAIR_STATUSES
-            for pair in plan.pairs
-        )
+        primary_work = self._reconcile_has_primary_work(plan.json())
         if (
             write_enabled
             and not nested_move

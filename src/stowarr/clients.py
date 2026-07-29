@@ -194,23 +194,28 @@ class ArrClient:
         selected_episodes = []
         for episode in episodes:
             file_id = int(episode.get("episodeFileId") or 0)
-            if file_id not in selected_file_ids:
-                continue
-            selected_episodes.append(episode)
-            file_episode_ids.setdefault(file_id, []).append(int(episode["id"]))
-        files = [{
+            if file_id:
+                file_episode_ids.setdefault(file_id, []).append(int(episode["id"]))
+            if file_id in selected_file_ids:
+                selected_episodes.append(episode)
+        all_files = [{
             "id": record.get("id"),
             "path": record.get("path"),
             "relativePath": record.get("relativePath") or str(record.get("path", "")).removeprefix(item["path"].rstrip("/") + "/"),
             "size": int(record.get("size", 0)),
             "episodeIds": file_episode_ids.get(int(record.get("id", 0)), []),
-        } for record in selected_files]
+        } for record in episode_files]
+        files = [
+            record for record in all_files
+            if int(record.get("id", 0)) in selected_file_ids
+        ]
         return {
             "app": self.kind,
             "item": item,
             "history": [],
             "episodes": selected_episodes,
             "files": files,
+            "allFiles": all_files,
             "mappingComplete": bool(files and selected_episodes and all(record["episodeIds"] for record in files)),
             "mappingSource": "exact-library-path",
         }
