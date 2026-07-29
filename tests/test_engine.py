@@ -1430,6 +1430,82 @@ class EngineTest(unittest.TestCase):
             self.assertTrue(movie.exists())
             self.assertTrue(subtitle.exists())
 
+    def test_sidecar_only_reconcile_skips_primary_media_hashing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download_root = root / "download"
+            release = download_root / "Movie.2024"
+            torrent_movie = release / "Movie.2024.mkv"
+            subtitle = release / "Movie.2024.sv.srt"
+            library_root = root / "movies" / "Movie (2024)"
+            library_movie = library_root / torrent_movie.name
+            target_subtitle = library_root / subtitle.name
+            release.mkdir(parents=True)
+            library_root.mkdir(parents=True)
+            torrent_movie.write_bytes(b"already hardlinked movie")
+            os.link(torrent_movie, library_movie)
+            subtitle.write_bytes(b"missing subtitle")
+            item = {
+                "id": 77, "title": "Movie", "path": str(library_root),
+                "tags": [],
+            }
+            record = {
+                "id": 700, "path": str(library_movie),
+                "relativePath": library_movie.name,
+                "size": library_movie.stat().st_size, "episodeIds": [],
+            }
+            mapping = {"app": "radarr", "item": item, "files": [record]}
+            plan = Plan(
+                "SIDE", "Movie.2024", "radarr", "p3", 77, "Movie",
+                str(library_root), str(library_root),
+                [FilePair(
+                    str(library_movie), str(library_movie), str(torrent_movie),
+                    torrent_movie.stat().st_size, "linked", "hardlink",
+                )],
+                "ready",
+                auxiliary_files=[AuxiliaryFile(
+                    str(subtitle), str(target_subtitle),
+                    subtitle.stat().st_size, "torrent-sidecar",
+                    "qbittorrent", "hardlink", "subtitle",
+                )],
+                managed_files=[record],
+            )
+            pool = Pool(
+                "p3", root, (download_root,), root / "movies", root / "series",
+                "radarr-pool3", "sonarr-pool3",
+                "radarr-pool3", "sonarr-pool3",
+            )
+            client = SimpleNamespace(
+                download_mapping=lambda torrent_hash: mapping,
+                sync_pool=Mock(),
+                rescan=Mock(),
+            )
+            manager = Stowarr.__new__(Stowarr)
+            manager.arr = {"radarr": client}
+            manager.config = SimpleNamespace(apply=True, pools=(pool,))
+            manager.store = SimpleNamespace(update=Mock())
+            manager.qbit = SimpleNamespace()
+
+            with patch(
+                "stowarr.engine.sha256",
+                side_effect=AssertionError("sidecar-only repair hashed media"),
+            ):
+                result = manager.reconcile(
+                    "SIDE", {str(subtitle)}, operation_id=10,
+                    mapping_hint=mapping, prepared_plan=plan,
+                )
+
+            self.assertEqual(result["state"], "COMPLETE")
+            self.assertEqual(
+                (library_movie.stat().st_dev, library_movie.stat().st_ino),
+                (torrent_movie.stat().st_dev, torrent_movie.stat().st_ino),
+            )
+            self.assertEqual(
+                (target_subtitle.stat().st_dev, target_subtitle.stat().st_ino),
+                (subtitle.stat().st_dev, subtitle.stat().st_ino),
+            )
+            client.rescan.assert_called_once_with(77)
+
     def test_sync_audit_reports_duplicate_and_unrouted_history_torrents(self):
         p1 = Pool(
             "p1", Path("/p1"), (Path("/p1/download"),),
@@ -1493,7 +1569,13 @@ class EngineTest(unittest.TestCase):
             missing_download = download_root / "Missing.2024.mkv"
             copied_download = download_root / "Copied.2024.mkv"
             linked_download = download_root / "Linked.2024.mkv"
-            for path in (missing_download, copied_download, linked_download):
+            unmatched_download = download_root / "Unmatched.2024.mkv"
+            ambiguous_a = download_root / "Ambiguous.2024.a.mkv"
+            ambiguous_b = download_root / "Ambiguous.2024.b.mkv"
+            for path in (
+                missing_download, copied_download, linked_download,
+                unmatched_download, ambiguous_a, ambiguous_b,
+            ):
                 path.write_bytes(path.stem.encode())
             copied_root = movie_root / "Copied (2024)"
             linked_root = movie_root / "Linked (2024)"
@@ -1503,6 +1585,15 @@ class EngineTest(unittest.TestCase):
             copied_library.write_bytes(copied_download.read_bytes())
             linked_library = linked_root / linked_download.name
             os.link(linked_download, linked_library)
+            unmatched_root = movie_root / "Unmatched (2024)"
+            unmatched_root.mkdir()
+            unmatched_library = unmatched_root / unmatched_download.name
+            unmatched_library.write_bytes(b"definitely-a-different-size")
+            ambiguous_root = movie_root / "Ambiguous (2024)"
+            ambiguous_root.mkdir()
+            ambiguous_library = ambiguous_root / "Ambiguous.2024.mkv"
+            ambiguous_library.write_bytes(ambiguous_a.read_bytes())
+            ambiguous_b.write_bytes(ambiguous_a.read_bytes())
             pool = Pool(
                 "p3", root, (download_root,), movie_root, root / "series",
                 "radarr-pool3", "sonarr-pool3",
@@ -1514,12 +1605,13 @@ class EngineTest(unittest.TestCase):
                     "category": "radarr-pool3",
                     "save_path": str(download_root),
                 }
-                for name in ("missing", "copied", "linked")
+                for name in ("missing", "copied", "linked", "unmatched", "ambiguous")
             ]
             torrent_paths = {
                 "MISSING": missing_download,
                 "COPIED": copied_download,
                 "LINKED": linked_download,
+                "UNMATCHED": unmatched_download,
             }
             items = [
                 {
@@ -1542,6 +1634,22 @@ class EngineTest(unittest.TestCase):
                         "size": linked_library.stat().st_size,
                     },
                 },
+                {
+                    "id": 4, "title": "Unmatched", "path": str(unmatched_root),
+                    "movieFile": {
+                        "id": 40, "path": str(unmatched_library),
+                        "relativePath": unmatched_library.name,
+                        "size": unmatched_library.stat().st_size,
+                    },
+                },
+                {
+                    "id": 5, "title": "Ambiguous", "path": str(ambiguous_root),
+                    "movieFile": {
+                        "id": 50, "path": str(ambiguous_library),
+                        "relativePath": ambiguous_library.name,
+                        "size": ambiguous_library.stat().st_size,
+                    },
+                },
             ]
             manager = Stowarr.__new__(Stowarr)
             manager.qbit = SimpleNamespace(
@@ -1549,11 +1657,18 @@ class EngineTest(unittest.TestCase):
                 categories=lambda: {
                     "radarr-pool3": {"savePath": str(download_root)},
                 },
-                files=lambda torrent_hash: [{
-                    "name": torrent_paths[torrent_hash.upper()].name,
-                    "size": torrent_paths[torrent_hash.upper()].stat().st_size,
-                    "priority": 1,
-                }],
+                files=lambda torrent_hash: [
+                    {
+                        "name": path.name,
+                        "size": path.stat().st_size,
+                        "priority": 1,
+                    }
+                    for path in (
+                        [ambiguous_a, ambiguous_b]
+                        if torrent_hash.upper() == "AMBIGUOUS"
+                        else [torrent_paths[torrent_hash.upper()]]
+                    )
+                ],
             )
             manager.config = SimpleNamespace(
                 pools=(pool,),
@@ -1563,6 +1678,7 @@ class EngineTest(unittest.TestCase):
             manager.arr = {"radarr": SimpleNamespace(
                 history_for_downloads=lambda hashes: {
                     "missing": 1, "copied": 2, "linked": 3,
+                    "unmatched": 4, "ambiguous": 5,
                 },
                 all_items=lambda: items,
             )}
@@ -1577,9 +1693,21 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(
                 by_hash["COPIED"]["status"], "hardlink-missing"
             )
+            self.assertEqual(by_hash["COPIED"]["media_candidate_count"], 1)
+            self.assertIn("not hash-verified", by_hash["COPIED"]["reason"])
             self.assertTrue(by_hash["COPIED"]["safe_plan_candidate"])
             self.assertEqual(by_hash["LINKED"]["status"], "in-sync")
             self.assertFalse(by_hash["LINKED"]["safe_plan_candidate"])
+            self.assertEqual(
+                by_hash["UNMATCHED"]["status"], "media-file-unmatched"
+            )
+            self.assertEqual(by_hash["UNMATCHED"]["media_candidate_count"], 0)
+            self.assertFalse(by_hash["UNMATCHED"]["safe_plan_candidate"])
+            self.assertEqual(
+                by_hash["AMBIGUOUS"]["status"], "media-file-ambiguous"
+            )
+            self.assertEqual(by_hash["AMBIGUOUS"]["media_candidate_count"], 2)
+            self.assertFalse(by_hash["AMBIGUOUS"]["safe_plan_candidate"])
 
     def test_radarr_sync_audit_does_not_offer_hardlink_repair_for_packed_media(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1636,11 +1764,13 @@ class EngineTest(unittest.TestCase):
             row = manager.sync_audit("radarr")["rows"][0]
 
             self.assertEqual(row["status"], "packed-media")
+            self.assertTrue(row["healthy"])
             self.assertFalse(row["safe_plan_candidate"])
-            self.assertEqual(
-                row["issues"][0]["code"],
-                "PACKED_MEDIA_HARDLINK_NOT_APPLICABLE",
-            )
+            self.assertEqual(row["issues"], [])
+            self.assertIsNone(row["action"])
+            audit = manager.sync_audit("radarr")
+            self.assertEqual(audit["in_sync"], 1)
+            self.assertEqual(audit["issues"], 0)
 
     def test_radarr_sync_audit_blocks_a_different_release_folder_from_safe_repair(self):
         pool = Pool(

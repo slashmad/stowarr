@@ -39,6 +39,7 @@ NON_FEATURE_VIDEO_MARKERS = {
 SAFE_RECONCILE_AUDIT_STATUSES = {
     "root-mismatch", "missing-library-file", "hardlink-missing",
 }
+SYNC_HEALTHY_STATUSES = {"in-sync", "packed-media"}
 RELEASE_FOLDER_MARKERS = re.compile(
     r"(?i)(?:^|[._ -])(?:720p|1080[pi]|2160p|uhd|bluray|blu-ray|web(?:[._ -]?dl)?|"
     r"remux|x26[45]|h[._ -]?26[45]|hevc|avc|hdr10p?|dv|dolby[._ -]?vision|"
@@ -2824,6 +2825,7 @@ class Stowarr:
             expected_roots: tuple[Path, ...] = ()
             expected_category = None
             category_repairable = False
+            media_candidate_count = None
             title_candidate_count = sum(
                 title_matches(candidate.get("title", ""), torrent["name"])
                 for candidate in items.values()
@@ -3014,6 +3016,7 @@ class Stowarr:
                         )
                         and path.is_file()
                     ]
+                    media_candidate_count = len(torrent_videos)
                     hardlinked = any(
                         (candidate.stat().st_dev, candidate.stat().st_ino)
                         == (library_stat.st_dev, library_stat.st_ino)
@@ -3030,28 +3033,49 @@ class Stowarr:
                             "Radarr manages visible media derived from a packed "
                             "qBittorrent download; hardlink identity is not applicable"
                         )
-                        issues.append({
-                            "code": "PACKED_MEDIA_HARDLINK_NOT_APPLICABLE",
-                            "summary": reason,
-                            "action": (
-                                "Keep the qBittorrent archives intact. No hardlink repair "
-                                "is available; use Diagnose only if the imported media or "
-                                "Radarr association is suspect."
-                            ),
-                        })
-                    else:
+                    elif len(torrent_videos) == 1:
                         status = "hardlink-missing"
                         reason = (
-                            "Radarr media is not hardlinked to the matched "
-                            "qBittorrent download"
+                            "Radarr media and one same-size qBittorrent video are "
+                            "separate files; content is not hash-verified yet"
                         )
                         issues.append({
                             "code": "LIBRARY_HARDLINK_MISSING",
                             "summary": reason,
                             "action": (
-                                "Build a Reconcile plan. Stowarr will require one exact "
-                                "same-content torrent file before replacing the library "
-                                "entry with a verified hardlink."
+                                "Build a Reconcile plan. Stowarr will hash-verify the "
+                                "single candidate before replacing the library copy "
+                                "in place with a verified hardlink."
+                            ),
+                        })
+                    elif not torrent_videos:
+                        status = "media-file-unmatched"
+                        reason = (
+                            "No selected qBittorrent video has the same size as "
+                            "Radarr's managed movie"
+                        )
+                        issues.append({
+                            "code": "QBITTORRENT_MEDIA_CANDIDATE_MISSING",
+                            "summary": reason,
+                            "action": (
+                                "Force recheck qBittorrent and verify the selected files "
+                                "and Radarr download association. Do not replace the "
+                                "library file until one exact candidate is identified."
+                            ),
+                        })
+                    else:
+                        status = "media-file-ambiguous"
+                        reason = (
+                            f"{len(torrent_videos)} selected qBittorrent videos have "
+                            "the same size as Radarr's managed movie"
+                        )
+                        issues.append({
+                            "code": "QBITTORRENT_MEDIA_CANDIDATE_AMBIGUOUS",
+                            "summary": reason,
+                            "action": (
+                                "Inspect the selected torrent files and use Radarr Manual "
+                                "Import if needed. Stowarr will not choose between multiple "
+                                "same-size candidates automatically."
                             ),
                         })
             else:
@@ -3069,6 +3093,7 @@ class Stowarr:
                 "expected_roots": [str(root) for root in expected_roots],
                 "expected_category": expected_category,
                 "category_repairable": category_repairable,
+                "media_candidate_count": media_candidate_count,
                 "title_candidate_count": title_candidate_count,
                 "status": status,
                 "reason": reason,
@@ -3107,13 +3132,14 @@ class Stowarr:
                 row["related_torrents"] = torrent_evidence
         for row in rows:
             row["safe_plan_candidate"] = safe_sync_candidate(row)
-        rows.sort(key=lambda row: (row["status"] == "in-sync", row["torrent_name"].casefold()))
+            row["healthy"] = row["status"] in SYNC_HEALTHY_STATUSES
+        rows.sort(key=lambda row: (row["healthy"], row["torrent_name"].casefold()))
         return {
             "app": app,
             "scanned": len(rows),
             "matched_history": len(history),
-            "in_sync": sum(row["status"] == "in-sync" for row in rows),
-            "issues": sum(row["status"] != "in-sync" for row in rows),
+            "in_sync": sum(row["healthy"] for row in rows),
+            "issues": sum(not row["healthy"] for row in rows),
             "rows": rows,
         }
 
@@ -3144,7 +3170,7 @@ class Stowarr:
         queued_reconciles = []
         manual = []
         for row in audit["rows"]:
-            if row["status"] == "in-sync":
+            if row.get("healthy") is True or row["status"] in SYNC_HEALTHY_STATUSES:
                 continue
             if (
                 row["status"] == "category-unconfigured"

@@ -486,6 +486,7 @@ function renderReconcileBlocker(plan){
 }
 function reconcileActionCopy(plan){
   const restoresMissing=plan.pairs?.some(pair=>pair.status==='missing-library');
+  const mediaAlreadyValid=Boolean(plan.pairs?.length)&&plan.pairs.every(pair=>['linked','already-on-target','verified-derived'].includes(pair.status));
   const samePath=Boolean(plan.pairs?.length)&&plan.pairs.every(pair=>pair.source_library===pair.target_library);
   if(restoresMissing)return{
     title:'Ready to restore missing Radarr media',
@@ -494,6 +495,15 @@ function reconcileActionCopy(plan){
     confirmTitle:`Restore ${plan.item_title} from qBittorrent?`,
     confirmMessage:'The qBittorrent video is retained as the source of truth. Stowarr creates library hardlinks only after a successful force recheck.',
     detailLabel:'Missing library media',
+  };
+  if(mediaAlreadyValid)return{
+    title:'Ready to repair selected sidecars only',
+    message:'The primary movie file is already valid and remains untouched. Stowarr processes only the selected subtitles, NFO, or other sidecar files.',
+    button:'Repair selected sidecars',
+    confirmTitle:`Repair selected sidecars for ${plan.item_title}?`,
+    confirmMessage:'No primary movie file is hashed, replaced, moved, or deleted by this plan.',
+    detailLabel:'Primary movie changes',
+    mediaUntouched:true,
   };
   if(samePath)return{
     title:'Ready to repair missing hardlink identity',
@@ -515,6 +525,7 @@ function reconcileActionCopy(plan){
 function renderReconcilePair(pair){
   const packed=pair.strategy==='archive-reextract'||pair.strategy==='verified-copy';
   const already=pair.status==='already-on-target';
+  const mediaAlreadyValid=['linked','already-on-target','verified-derived'].includes(pair.status);
   const restore=pair.status==='missing-library';
   const sourceTitle=packed
     ?'qBittorrent archive set'
@@ -539,7 +550,21 @@ function renderReconcilePair(pair){
         :'Stowarr extracts the qBittorrent-owned archives into isolated staging and verifies the result before import.')
       :'Created as a hardlink to the qBittorrent file after verification.';
   const previous=restore?'':`<div class="flow-arrow">→</div><div class="flow-card obsolete"><span class="flow-step">3 · ${already?'CURRENT LIBRARY':'SUSPECTED STALE DERIVATIVE'}</span><h3>${already?'Current imported media':`Old derived media on ${esc(poolForPath(pair.source_library))}`}</h3><p>${already?'This file is already on the pool selected by qBittorrent.':'It is removed only after Stowarr has extracted, verified, and imported the media on the authoritative pool.'}</p><code class="path">${esc(pair.source_library)}</code></div>`;
-  return `<div class="pair"><div class="pair-summary">${badge(pair.status)}${badge(pair.strategy)}<strong>${(pair.size/1073741824).toFixed(2)} GiB</strong></div><div class="file-flow"><div class="flow-card canonical"><span class="flow-step">1 · SOURCE OF TRUTH / KEEP</span><h3>${sourceTitle}</h3><p>${sourceText}</p><code class="path">${sourcePath}</code></div><div class="flow-arrow">→</div><div class="flow-card target"><span class="flow-step">2 · ${targetStep}</span><h3>${targetTitle}</h3><p>${targetText}</p><code class="path">${esc(pair.target_library)}</code></div>${previous}</div></div>`;
+  const mediaState=restore
+    ?'The primary movie is missing from the library.'
+    :mediaAlreadyValid
+      ?'The primary movie is already valid and requires no repair.'
+      :pair.source_library===pair.target_library&&!packed
+      ?'The primary movie already exists, but it is a separate copy rather than a hardlink to qBittorrent.'
+      :'The primary movie exists at an old or non-authoritative library path.';
+  const mediaAction=restore
+    ?'After qBittorrent recheck, create the missing library hardlink.'
+    :mediaAlreadyValid
+      ?'Skip media hashing and leave this file unchanged.'
+      :pair.source_library===pair.target_library&&!packed
+      ?'Hash both files; only if identical, replace this library copy with a hardlink at the same path.'
+      :'Verify and publish the primary movie on the authoritative pool before removing the old derivative.';
+  return `<section class="primary-media"><div class="primary-media-head"><div><span class="section-kicker">Primary movie file</span><strong>${esc(mediaState)}</strong><small>${esc(mediaAction)}</small></div><div class="pair-summary">${badge(pair.status)}${badge(pair.strategy)}<strong>${(pair.size/1073741824).toFixed(2)} GiB</strong></div></div><div class="pair"><div class="file-flow"><div class="flow-card canonical"><span class="flow-step">1 · SOURCE OF TRUTH / KEEP</span><h3>${sourceTitle}</h3><p>${sourceText}</p><code class="path">${sourcePath}</code></div><div class="flow-arrow">→</div><div class="flow-card target"><span class="flow-step">2 · ${targetStep}</span><h3>${targetTitle}</h3><p>${targetText}</p><code class="path">${esc(pair.target_library)}</code></div>${previous}</div></div></section>`;
 }
 function renderPlan(plan){
   const error=renderReconcileBlocker(plan);
@@ -550,12 +575,12 @@ function renderPlan(plan){
   const missingAux=(plan.auxiliary_files||[]).filter(x=>['missing-target','torrent-sidecar'].includes(x.status));
   const conflicts=(plan.auxiliary_files||[]).filter(x=>['target-conflict','torrent-name-conflict'].includes(x.status));
   const eligibleAux=(plan.auxiliary_files||[]).filter(x=>!['target-conflict','torrent-name-conflict'].includes(x.status));
-  const auxiliary=plan.auxiliary_files?.length?`<div class="auxiliary"><label class="check-option select-all"><input id="select-all-auxiliary" type="checkbox" ${eligibleAux.length?'checked':'disabled'}><span><strong>Select all ${eligibleAux.length} eligible sidecar files</strong><small>qBittorrent-owned files are hardlinked. Files found only in the old library are copied and verified.</small></span></label><details open><summary>Sidecar files · ${missingAux.length} missing at destination${conflicts.length?` · ${conflicts.length} conflict`:''}</summary><div class="aux-list">${plan.auxiliary_files.map(x=>{const selectable=!['target-conflict','torrent-name-conflict'].includes(x.status);const origin=x.origin==='qbittorrent'?'qBittorrent · hardlink':'Old library · copy';return `<label class="aux-row ${selectable?'':'disabled'}"><input class="aux-file" type="checkbox" data-source="${esc(x.source)}" ${selectable?'checked':'disabled'}><span class="origin">${esc(origin)}</span><span>${badge(x.status)}</span><code class="path">${esc(x.source)}</code><span>→</span><code class="path">${esc(x.target)}</code></label>`}).join('')}</div></details>${conflicts.length?`<div class="aux-warning">${conflicts.length} file(s) compete for the same destination or differ from an existing target. They are disabled and will not be overwritten automatically.</div>`:''}</div>`:'';
+  const auxiliary=plan.auxiliary_files?.length?`<div class="auxiliary"><div class="auxiliary-head"><span class="section-kicker">Optional secondary files</span><strong>Subtitles, NFO, and other sidecars</strong><small>These selections do not determine whether the primary movie hardlink needs repair.</small></div><label class="check-option select-all"><input id="select-all-auxiliary" type="checkbox" ${eligibleAux.length?'checked':'disabled'}><span><strong>Select all ${eligibleAux.length} eligible sidecar files</strong><small>qBittorrent-owned files are hardlinked. Files found only in the old library are copied and verified.</small></span></label><details open><summary>Sidecar files · ${missingAux.length} missing at destination${conflicts.length?` · ${conflicts.length} conflict`:''}</summary><div class="aux-list">${plan.auxiliary_files.map(x=>{const selectable=!['target-conflict','torrent-name-conflict'].includes(x.status);const origin=x.origin==='qbittorrent'?'qBittorrent · hardlink':'Old library · copy';return `<label class="aux-row ${selectable?'':'disabled'}"><input class="aux-file" type="checkbox" data-source="${esc(x.source)}" ${selectable?'checked':'disabled'}><span class="origin">${esc(origin)}</span><span>${badge(x.status)}</span><code class="path">${esc(x.source)}</code><span>→</span><code class="path">${esc(x.target)}</code></label>`}).join('')}</div></details>${conflicts.length?`<div class="aux-warning">${conflicts.length} sidecar file(s) already exist with different content or compete for the same destination. They are skipped and will not be overwritten automatically.</div>`:''}</div>`:'';
   const ready=plan.status==='ready';
   const apply=Boolean(state.config?.apply);
   const copy=reconcileActionCopy(plan);
   const action=ready?`<div id="verification-result"></div><div class="reconcile-action"><div><strong>${apply?esc(copy.title):'Changes are locked in dry-run mode'}</strong><p>${apply?esc(copy.message):'Enable Write mode and provide writable media mounts only after reviewing the plan.'}</p></div><div class="action-buttons"><button id="verify-plan" class="secondary">Verify content hashes</button><button id="queue-reconcile" class="secondary" ${apply?'':'disabled'}>Add to queue</button><button id="apply-plan" class="danger" ${apply?'':'disabled'}>${esc(copy.button)}</button></div></div>`:'';
-  $('#plan-result').innerHTML=`${error}<article class="panel"><div class="panel-head"><div><h2>Plan details</h2><p>No changes have been made</p></div></div><div class="detail-grid">${details.map(([k,v])=>`<div class="detail"><small>${k}</small><strong>${v}</strong></div>`).join('')}</div></article><article class="panel"><div class="panel-head"><div><h2>File migration and hardlinks</h2><p>qBittorrent determines the authoritative pool; suspected duplicates are removed only after verification</p></div></div>${pairs}${auxiliary}${action}</article>`
+  $('#plan-result').innerHTML=`${error}<article class="panel"><div class="panel-head"><div><h2>Plan details</h2><p>No changes have been made</p></div></div><div class="detail-grid">${details.map(([k,v])=>`<div class="detail"><small>${k}</small><strong>${v}</strong></div>`).join('')}</div></article><article class="panel"><div class="panel-head"><div><h2>Primary media repair</h2><p>The movie action is shown first. Optional subtitles and metadata are handled separately below.</p></div></div>${pairs}${auxiliary}${action}</article>`
 }
 async function applyPlan(){
   const plan=state.plan;
@@ -563,7 +588,7 @@ async function applyPlan(){
   const copy=reconcileActionCopy(plan);
   const oldFiles=plan.pairs.map(p=>p.source_library).join(', ');
   const auxiliaryFiles=$$('.aux-file:checked').map(input=>input.dataset.source);
-  if(!await confirmAction({title:copy.confirmTitle,message:copy.confirmMessage,details:[[copy.detailLabel,oldFiles],['Selected sidecar files',String(auxiliaryFiles.length)]],confirmLabel:copy.button,danger:true}))return;
+  if(!await confirmAction({title:copy.confirmTitle,message:copy.confirmMessage,details:[[copy.detailLabel,copy.mediaUntouched?'None — existing file kept':oldFiles],['Selected sidecar files',String(auxiliaryFiles.length)]],confirmLabel:copy.button,danger:true}))return;
   const button=$('#apply-plan');
   button.disabled=true;
   button.textContent='Authorizing…';
@@ -924,19 +949,21 @@ function renderSync(result){
   result.rows.forEach(row=>statusCounts.set(row.status,(statusCounts.get(row.status)||0)+1));
   const visibleRows=result.rows.filter(row=>!hidden.has(row.status));
   const rowMarkup=row=>{
-    const issue=row.status!=='in-sync';
+    const issue=row.healthy===undefined?row.status!=='in-sync':row.healthy!==true;
     const queued=activeReconcileQueueItem(row.hash);
     const canRepairCategory=row.status==='category-unconfigured'&&row.category_repairable;
     const safePlanCandidate=row.safe_plan_candidate===true;
     const actionLabel=canRepairCategory?'Stowarr fix available':safePlanCandidate?'Stowarr safe-plan candidate':'Manual fix';
     const categoryAction=canRepairCategory?`<button type="button" class="secondary compact repair-sync-category" data-app="${esc(result.app)}" data-hash="${esc(row.hash)}" data-name="${esc(row.torrent_name)}" data-current-category="${esc(row.category||'none')}" data-category="${esc(row.expected_category)}" data-pool="${esc(row.qbit_pool)}" ${state.config?.apply?'':'disabled'}>Set category</button>`:'';
-    const primaryAction=queued
+    const primaryAction=!issue&&row.status==='packed-media'
+      ?''
+      :queued
       ?`<button class="link-button view-sync-queue" data-public-id="${esc(queued.public_id)}" title="Open this Reconcile job in Queue">${queued.state==='RUNNING'?'Running':'In queue'}</button>`
       :`<button class="link-button inspect" data-hash="${esc(row.hash)}">${issue?'Diagnose':'Reconcile'}</button>`;
     return `<tr title="${esc(row.reason)}"><td>${badge(row.status)}</td><td class="sync-title-cell"><strong>${esc(row.torrent_name)}</strong><small>${esc(row.item_title||missingLabel)}</small>${issue?`<small class="sync-diagnosis">${esc(row.reason)}</small>`:''}</td><td><span class="hash-short" title="${esc(row.hash)}">${esc(row.hash.slice(0,12))}…</span></td><td><span class="category">${esc(row.category||'none')}</span>${row.expected_category&&row.category!==row.expected_category?`<small class="sync-expected">Expected: ${esc(row.expected_category)}</small>`:''}</td><td>${esc(row.qbit_pool||'—')}</td><td class="path">${esc(row.arr_path||row.reason)}${issue&&row.action?`<small class="sync-action"><b>${actionLabel}:</b> ${esc(row.action)}</small>`:''}</td><td><div class="sync-row-actions">${categoryAction}${primaryAction}</div></td></tr>`;
   };
-  const issues=visibleRows.filter(row=>row.status!=='in-sync');
-  const healthy=visibleRows.filter(row=>row.status==='in-sync');
+  const issues=visibleRows.filter(row=>row.healthy===undefined?row.status!=='in-sync':row.healthy!==true);
+  const healthy=visibleRows.filter(row=>row.healthy===undefined?row.status==='in-sync':row.healthy===true);
   const expanded=state.syncExpanded.has(result.app);
   const healthyGroup=healthy.length?`<tr class="sync-group-row"><td colspan="7"><button type="button" class="sync-group-toggle" data-sync-group="${esc(result.app)}" aria-expanded="${expanded}"><span><i>${expanded?'▾':'▸'}</i><strong>In sync</strong><small>${healthy.length} ${healthy.length===1?'title':'titles'} without detected issues</small></span><b>${expanded?'Collapse':'Show'}</b></button></td></tr>${expanded?healthy.map(rowMarkup).join(''):''}`:'';
   $('#sync-summary').innerHTML=`<span><strong>${result.scanned}</strong><small>qBit torrents</small></span><span><strong>${result.matched_history}</strong><small>hash matches</small></span><span><strong>${result.in_sync}</strong><small>in sync</small></span><span><strong>${result.issues}</strong><small>issues</small></span><span><strong>${visibleRows.length}</strong><small>visible</small></span>`;
