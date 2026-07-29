@@ -1,7 +1,10 @@
 services:
   stowarr-api:
     image: ghcr.io/slashmad/stowarr-api:latest
-    build: .
+    build:
+      context: .
+      args:
+        STOWARR_COMMIT: ${STOWARR_COMMIT:-unknown}
     container_name: stowarr-api
     restart: unless-stopped
     environment:
@@ -43,6 +46,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.web
+      args:
+        STOWARR_COMMIT: ${STOWARR_COMMIT:-unknown}
     container_name: stowarr-web
     restart: unless-stopped
     depends_on:

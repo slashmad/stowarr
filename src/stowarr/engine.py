@@ -11,7 +11,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from . import __version__
+from . import __commit__, __version__
 from .archive import (
     ArchiveExtractor,
     ArchiveMember,
@@ -404,6 +404,7 @@ class Stowarr:
                 "configured": True,
                 "status": "connected",
                 "version": __version__,
+                "commit": __commit__,
             }
         }
         checks = {
@@ -443,6 +444,7 @@ class Stowarr:
                 }
         return {
             "version": __version__,
+            "commit": __commit__,
             "apply": self.config.apply,
             "services": services,
         }
@@ -2358,7 +2360,7 @@ class Stowarr:
                     "path": item.get("path"),
                 }
                 for item in all_items
-                if title_matches(item.get("title", ""), torrent["name"])
+                if strong_release_matches_item(item, torrent["name"])
             ]
             issues = []
             if category_issue:
@@ -2541,55 +2543,96 @@ class Stowarr:
                 for path, size in torrent_files
                 if path.suffix.casefold() in VIDEO_EXTENSIONS
             ]
-            if app != "radarr" or has_archives or len(direct_videos) != 1:
-                reason = (
-                    f"{app.capitalize()} does not report any managed media file and "
-                    "Stowarr cannot prove one unique direct torrent video to restore"
-                )
+            feature_videos = (
+                [
+                    (path, size)
+                    for path, size in direct_videos
+                    if safe_restore_video_candidate(
+                        str(item.get("title") or ""), path
+                    )
+                ]
+                if app == "radarr"
+                else []
+            )
+            rejected_videos = [
+                str(path)
+                for path, _size in direct_videos
+                if all(path != candidate for candidate, _size in feature_videos)
+            ]
+            video_evidence = {
+                "torrent_video_count": len(direct_videos),
+                "eligible_feature_video_count": len(feature_videos),
+                "eligible_feature_videos": [
+                    str(path) for path, _size in feature_videos
+                ],
+                "rejected_non_feature_videos": rejected_videos,
+                "contains_archives": has_archives,
+            }
+            if app != "radarr" or has_archives or len(feature_videos) != 1:
+                if has_archives:
+                    reason = (
+                        f"{app.capitalize()} does not report any managed media file and "
+                        "the selected qBittorrent content includes archives"
+                    )
+                    code = "ARR_MANAGED_MEDIA_MISSING"
+                    action = (
+                        "Keep the qBittorrent data intact. Standalone Reconcile does "
+                        "not extract packed media; restore or import the verified "
+                        "feature movie before trying again."
+                    )
+                elif app == "radarr" and direct_videos and not feature_videos:
+                    reason = (
+                        "Stowarr found direct torrent video files, but none can be "
+                        "proven to be the feature movie rather than a sample, trailer, "
+                        "extra, or unrelated file"
+                    )
+                    code = "RADARR_FEATURE_VIDEO_UNPROVEN"
+                    action = (
+                        "Keep the qBittorrent data intact. Select a direct feature "
+                        "movie whose filename identifies the Radarr title; samples, "
+                        "trailers, and extras are ignored."
+                    )
+                elif app == "radarr" and len(feature_videos) > 1:
+                    reason = (
+                        "Radarr does not report any managed media file and Stowarr "
+                        "found multiple plausible feature videos"
+                    )
+                    code = "ARR_MANAGED_MEDIA_MISSING"
+                    action = (
+                        "Keep the qBittorrent data intact. Restoration requires one "
+                        "unambiguous selected feature movie after samples, trailers, "
+                        "and extras are excluded."
+                    )
+                else:
+                    reason = (
+                        f"{app.capitalize()} does not report any managed media file and "
+                        "Stowarr cannot prove one unique direct torrent video to restore"
+                    )
+                    code = "ARR_MANAGED_MEDIA_MISSING"
+                    action = (
+                        "Keep the qBittorrent data intact. Radarr restoration requires "
+                        "one unambiguous selected direct feature video; Sonarr requires "
+                        "a complete episode-to-file mapping."
+                    )
                 return Plan(
                     torrent_hash, torrent["name"], app, pool.name, item["id"],
                     item.get("title"), item.get("path"), str(target_item), [],
-                    "blocked", reason, "ARR_MANAGED_MEDIA_MISSING",
+                    "blocked", reason, code,
                     {
                         "issues": [{
-                            "code": "ARR_MANAGED_MEDIA_MISSING",
+                            "code": code,
                             "summary": reason,
-                            "action": (
-                                "Keep the qBittorrent data intact. Radarr restoration requires "
-                                "exactly one selected direct video; Sonarr requires a complete "
-                                "episode-to-file mapping."
-                            ),
+                            "action": action,
                         }],
-                        "torrent_video_count": len(direct_videos),
-                        "contains_archives": has_archives,
+                        **video_evidence,
+                        **(
+                            {"selected_video": str(direct_videos[0][0])}
+                            if len(direct_videos) == 1
+                            else {}
+                        ),
                     },
                 )
-            torrent_file, size = direct_videos[0]
-            if not safe_restore_video_candidate(
-                str(item.get("title") or ""), torrent_file
-            ):
-                reason = (
-                    "Stowarr cannot prove that the selected direct video is the feature "
-                    "movie rather than a sample, trailer, extra, or unrelated file"
-                )
-                return Plan(
-                    torrent_hash, torrent["name"], app, pool.name, item["id"],
-                    item.get("title"), item.get("path"), str(target_item), [],
-                    "blocked", reason, "RADARR_FEATURE_VIDEO_UNPROVEN",
-                    {
-                        "issues": [{
-                            "code": "RADARR_FEATURE_VIDEO_UNPROVEN",
-                            "summary": reason,
-                            "action": (
-                                "Keep the qBittorrent data intact. Select the actual feature "
-                                "movie with a filename that identifies the Radarr title, or "
-                                "import the intended file manually in Radarr."
-                            ),
-                        }],
-                        "selected_video": str(torrent_file),
-                        "arr_title": item.get("title"),
-                    },
-                )
+            torrent_file, size = feature_videos[0]
             target = target_item / torrent_file.name
             missing_library_pair = FilePair(
                 str(target), str(target), str(torrent_file), size,
@@ -2827,7 +2870,7 @@ class Stowarr:
             category_repairable = False
             media_candidate_count = None
             title_candidate_count = sum(
-                title_matches(candidate.get("title", ""), torrent["name"])
+                strong_release_matches_item(candidate, torrent["name"])
                 for candidate in items.values()
             )
             if pool:

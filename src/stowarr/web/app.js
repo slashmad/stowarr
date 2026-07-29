@@ -5,6 +5,14 @@ const fmtTime=v=>v?new Date(v*1000).toLocaleString(): '—';
 const fmtBytes=v=>{const n=Number(v||0);if(!n)return '0 B';const units=['B','KiB','MiB','GiB','TiB'];const i=Math.min(Math.floor(Math.log(n)/Math.log(1024)),units.length-1);return `${(n/1024**i).toFixed(i?2:0)} ${units[i]}`};
 const badge=v=>`<span class="badge ${esc(String(v).toLowerCase())}">${esc(String(v).replaceAll('_',' '))}</span>`;
 const poolForPath=path=>state.config?.pools.find(p=>String(path||'').startsWith(p.prefix))?.name||'unknown pool';
+function renderBuildVersion(source){
+  const version=source?.version||state.config?.version||state.serviceStatus?.version||'—';
+  const commit=source?.commit||state.config?.commit||state.serviceStatus?.commit||'unknown';
+  const shortCommit=commit==='unknown'?'unknown':commit.slice(0,12);
+  const node=$('#side-version');
+  node.textContent=`Version ${version} · ${shortCommit}`;
+  node.title=commit==='unknown'?'Build commit was not embedded in this image':`Git commit ${commit}`;
+}
 async function api(path,options={}){const method=(options.method||'GET').toUpperCase();const headers=new Headers(options.headers||{});if(method!=='GET'&&method!=='HEAD')headers.set('X-Stowarr-CSRF','1');const response=await fetch(path,{...options,headers,credentials:'same-origin'});if(response.status===401&&path!=='/api/auth/login'){state.authenticated=false;showLogin()}if(!response.ok)throw new Error((await response.json().catch(()=>({}))).error||`HTTP ${response.status}`);return response.json()}
 async function streamApi(path,options={},onProgress=()=>{}){
   const method=(options.method||'GET').toUpperCase();
@@ -432,15 +440,21 @@ async function startOperationTracking(findOperation,kind='move',queueContext=nul
   await update();
   if(keepTracking&&generation===state.operationTrackingGeneration)state.operationTimer=setInterval(update,1000);
 }
-async function trackOperation(torrentHash,kind='move',afterId=0){return startOperationTracking(operations=>operations.find(item=>item.id>afterId&&item.torrent_hash.toLowerCase()===torrentHash.toLowerCase()&&item.kind===kind),kind)}
 async function trackOperationById(operationId){const kind=state.operations.find(item=>String(item.id)===String(operationId))?.kind||'move';return startOperationTracking(operations=>operations.find(item=>String(item.id)===String(operationId)),kind)}
 async function trackOperationByPublicId(publicId,kind,startHidden=false){
   const queueContext={publicId,kind:kind||'move'};
   return startOperationTracking(operations=>operations.find(item=>item.public_id===queueContext.publicId&&item.kind===queueContext.kind),queueContext.kind,queueContext,startHidden);
 }
-function watchOperationRegistration(torrentHash,kind,afterId=0){
+function watchOperationRegistration(torrentHash,kind,afterId=0,startHidden=false){
   let active=true;
   let timer=null;
+  const watcher={
+    registeredOperationId:null,
+    stop(){
+      active=false;
+      clearTimeout(timer);
+    },
+  };
   const update=async()=>{
     if(!active)return;
     await refreshOperations();
@@ -448,24 +462,54 @@ function watchOperationRegistration(torrentHash,kind,afterId=0){
     const operation=state.operations.find(item=>item.id>afterId&&item.torrent_hash.toLowerCase()===torrentHash.toLowerCase()&&item.kind===kind);
     if(operation){
       active=false;
-      startOperationTracking(operations=>operations.find(item=>item.id===operation.id),kind,null,true);
+      watcher.registeredOperationId=operation.id;
+      startOperationTracking(operations=>operations.find(item=>item.id===operation.id),kind,null,startHidden);
       return;
     }
     timer=setTimeout(update,250);
   };
   update();
-  return ()=>{
-    active=false;
-    clearTimeout(timer);
-  };
+  return watcher;
+}
+async function ensureDirectOperationTracking(watcher,result,kind){
+  if(result?.disposition!=='direct'||!result.operation_id||watcher.registeredOperationId)return;
+  watcher.stop();
+  await refreshOperations();
+  await startOperationTracking(
+    operations=>operations.find(item=>String(item.id)===String(result.operation_id)),
+    kind,
+  );
 }
 function hideOperationTracking(){if(!state.operationTracking||terminalOperation(state.currentOperation))return finishOperationTracking();state.operationHidden=true;const dialog=$('#operation-dialog');if(dialog.open)dialog.close();renderOperationMinimized()}
 function showOperationTracking(){if(!state.operationTracking)return;state.operationHidden=false;renderOperationDialog(state.currentOperation,state.currentOperation?.state==='WAITING');const dialog=$('#operation-dialog');if(!dialog.open)dialog.showModal()}
 function finishOperationTracking(){state.operationTrackingGeneration++;clearInterval(state.operationTimer);state.operationTimer=null;state.operationTracking=false;state.operationHidden=false;state.currentOperation=null;renderOperationMinimized();const dialog=$('#operation-dialog');if(dialog.open)dialog.close()}
-function rejectOperationTracking(torrentHash,kind,message,afterId=0){const registered=state.operations.find(item=>item.id>afterId&&item.torrent_hash.toLowerCase()===torrentHash.toLowerCase()&&item.kind===kind);if(registered){renderOperationDialog(registered);return}state.operationTrackingGeneration++;clearInterval(state.operationTimer);state.operationTimer=null;state.operationEvents=[];renderOperationDialog({id:0,kind,torrent_hash:torrentHash,state:'FAILED',detail:{torrent_name:state.movePlan?.torrent_name||torrentHash,error:`Operation was rejected before it started: ${message}. No files were changed by this request.`,live:{state:kind==='move'?'MOVE_PLANNED':'PLANNED',percent:0,message:'The API did not register the operation'}}})}
+function rejectOperationTracking(torrentHash,kind,message,afterId=0){
+  const registered=state.operations.find(item=>item.id>afterId&&item.torrent_hash.toLowerCase()===torrentHash.toLowerCase()&&item.kind===kind);
+  if(registered){
+    startOperationTracking(operations=>operations.find(item=>item.id===registered.id),kind);
+    return;
+  }
+  const trackingLiveOperation=state.operationTracking&&!terminalOperation(state.currentOperation);
+  if(trackingLiveOperation){
+    state.operationHidden=true;
+    renderOperationMinimized();
+  }else{
+    state.operationTrackingGeneration++;
+    clearInterval(state.operationTimer);
+    state.operationTimer=null;
+    state.operationTracking=false;
+    state.operationHidden=false;
+  }
+  state.operationEvents=[];
+  const failedAfter=kind==='move'?'MOVE_PLANNED':kind==='category'?'CATEGORY_APPLYING':'PLANNED';
+  const planName=(kind==='move'?state.movePlan:kind==='reconcile'?state.plan:null)?.torrent_name;
+  renderOperationDialog({id:0,kind,torrent_hash:torrentHash,state:'FAILED',detail:{torrent_name:planName||torrentHash,error:`Operation was rejected before it started: ${message}. No files were changed by this request.`,failed_after:failedAfter,progress:{state:failedAfter,percent:0,message:'The API did not register the operation'}}},false,!trackingLiveOperation);
+  const dialog=$('#operation-dialog');
+  if(!dialog.open)dialog.showModal();
+}
 function navigate(page){$$('.page').forEach(x=>x.classList.toggle('active',x.id===page));$$('.nav-item').forEach(x=>x.classList.toggle('active',x.dataset.page===page));$('.sidebar').classList.remove('open');location.hash=page;if(page==='move')loadQbitCatalog();if(page==='queue')refreshQueue()}
-function renderConfig(){const c=state.config;$('#mode-pill').textContent=c.apply?'Write mode':'Dry run';$('#mode-pill').className=`pill ${c.apply?'live':'dry'}`;$('#side-mode').textContent=c.apply?'Write mode':'Dry run';$('#side-dot').className=`dot ${c.apply?'ok':'warn'}`;$('#side-version').textContent=`Version ${esc(c.version||state.serviceStatus?.version||'—')}`;$('#stat-pools').textContent=c.pools.length;$('#routing-head').innerHTML=`<tr><th>Service</th>${c.pools.map(p=>`<th colspan="2" class="pool-heading">${esc(p.name)}</th>`).join('')}</tr><tr class="subhead"><th></th>${c.pools.map(()=>'<th>Category</th><th>Root folders</th>').join('')}</tr>`;const roots=(p,app)=>app==='sonarr'?(p.sonarr_roots||[p.sonarr_root]):[p.radarr_root];const services=[['Radarr','radarr_category','radarr'],['Sonarr','sonarr_category','sonarr']];$('#pool-rows').innerHTML=services.map(([name,categoryKey,app])=>`<tr><td class="service-name">${esc(name)}</td>${c.pools.map(p=>`<td><span class="category">${esc(p[categoryKey])}</span></td><td class="path">${roots(p,app).map(esc).join('<br>')}</td>`).join('')}</tr>`).join('');$('#settings-pools').innerHTML=c.pools.map(p=>`<article class="settings-card"><h2>${esc(p.name)}</h2><dl class="settings-grid"><dt>Pool prefix</dt><dd>${esc(p.prefix)}</dd><dt>Download roots</dt><dd>${p.download_roots.map(esc).join('<br>')}</dd><dt>Radarr root / tag</dt><dd>${esc(p.radarr_root)} · ${esc(p.radarr_tag)}</dd><dt>Sonarr roots / tag</dt><dd>${roots(p,'sonarr').map(esc).join('<br>')}<br>${esc(p.sonarr_tag)}</dd><dt>Categories</dt><dd>${esc(p.radarr_category)} · ${esc(p.sonarr_category)}</dd></dl></article>`).join('');$('#move-target').innerHTML=c.pools.map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('')}
-function renderServiceStatus(){const status=state.serviceStatus;if(!status)return;const ids={stowarr_api:'api',qbittorrent:'qbit',radarr:'radarr',sonarr:'sonarr'};Object.entries(ids).forEach(([name,id])=>{const service=status.services?.[name]||{};const node=$(`#side-${id}-dot`);const mode=service.status==='connected'?'ok':service.status==='unavailable'?'failed':'warn';node.className=`dot ${mode}`;node.title=service.status==='connected'?`${name==='stowarr_api'?'Stowarr API':name} connected${service.version?` · ${service.version}`:''}`:service.error||'Not configured'});$('#side-version').textContent=`Version ${esc(status.version||state.config?.version||'—')}`}
+function renderConfig(){const c=state.config;$('#mode-pill').textContent=c.apply?'Write mode':'Dry run';$('#mode-pill').className=`pill ${c.apply?'live':'dry'}`;$('#side-mode').textContent=c.apply?'Write mode':'Dry run';$('#side-dot').className=`dot ${c.apply?'ok':'warn'}`;renderBuildVersion(c);$('#stat-pools').textContent=c.pools.length;$('#routing-head').innerHTML=`<tr><th>Service</th>${c.pools.map(p=>`<th colspan="2" class="pool-heading">${esc(p.name)}</th>`).join('')}</tr><tr class="subhead"><th></th>${c.pools.map(()=>'<th>Category</th><th>Root folders</th>').join('')}</tr>`;const roots=(p,app)=>app==='sonarr'?(p.sonarr_roots||[p.sonarr_root]):[p.radarr_root];const services=[['Radarr','radarr_category','radarr'],['Sonarr','sonarr_category','sonarr']];$('#pool-rows').innerHTML=services.map(([name,categoryKey,app])=>`<tr><td class="service-name">${esc(name)}</td>${c.pools.map(p=>`<td><span class="category">${esc(p[categoryKey])}</span></td><td class="path">${roots(p,app).map(esc).join('<br>')}</td>`).join('')}</tr>`).join('');$('#settings-pools').innerHTML=c.pools.map(p=>`<article class="settings-card"><h2>${esc(p.name)}</h2><dl class="settings-grid"><dt>Pool prefix</dt><dd>${esc(p.prefix)}</dd><dt>Download roots</dt><dd>${p.download_roots.map(esc).join('<br>')}</dd><dt>Radarr root / tag</dt><dd>${esc(p.radarr_root)} · ${esc(p.radarr_tag)}</dd><dt>Sonarr roots / tag</dt><dd>${roots(p,'sonarr').map(esc).join('<br>')}<br>${esc(p.sonarr_tag)}</dd><dt>Categories</dt><dd>${esc(p.radarr_category)} · ${esc(p.sonarr_category)}</dd></dl></article>`).join('');$('#move-target').innerHTML=c.pools.map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('')}
+function renderServiceStatus(){const status=state.serviceStatus;if(!status)return;const ids={stowarr_api:'api',qbittorrent:'qbit',radarr:'radarr',sonarr:'sonarr'};Object.entries(ids).forEach(([name,id])=>{const service=status.services?.[name]||{};const node=$(`#side-${id}-dot`);const mode=service.status==='connected'?'ok':service.status==='unavailable'?'failed':'warn';node.className=`dot ${mode}`;node.title=service.status==='connected'?`${name==='stowarr_api'?'Stowarr API':name} connected${service.version?` · ${service.version}`:''}${service.commit&&service.commit!=='unknown'?` · ${service.commit.slice(0,12)}`:''}`:service.error||'Not configured'});renderBuildVersion(status)}
 function renderConnections(){const services=state.connections?.services;if(!services)return;const form=$('#connections-form');form.elements['qbittorrent-url'].value=services.qbittorrent.url||'';form.elements['qbittorrent-api-key'].placeholder=services.qbittorrent.api_key_set?'Saved API key · preferred authentication':'API key recommended for qBittorrent 5.2+';form.elements['qbittorrent-username'].value=services.qbittorrent.username||'';form.elements['qbittorrent-password'].placeholder=services.qbittorrent.password_set?'Saved password · login fallback':'Password for login fallback';form.elements['radarr-url'].value=services.radarr.url||'';form.elements['radarr-api-key'].placeholder=services.radarr.api_key_set?'Saved API key · leave blank to keep':'API key required when Radarr is configured';form.elements['sonarr-url'].value=services.sonarr.url||'';form.elements['sonarr-api-key'].placeholder=services.sonarr.api_key_set?'Saved API key · leave blank to keep':'API key required when Sonarr is configured';const configured=state.connections.configured||{};const count=Object.values(configured).filter(Boolean).length;const complete=state.connections.status==='ready';$('#connections-status').textContent=complete?'All connected':count?`${count} of 3 connected`:'Not configured';$('#connections-status').className=`badge ${complete?'complete':count?'partial':'blocked'}`;$('#connection-error').textContent=state.connections.error||'';$('#connection-error').classList.toggle('hidden',!state.connections.error);$('#setup-error').textContent=state.connections.error||'';$('#setup-error').classList.toggle('hidden',!state.connections.error);const states={qbit:Boolean(configured.qbittorrent),radarr:Boolean(configured.radarr),sonarr:Boolean(configured.sonarr)};Object.entries(states).forEach(([name,connected])=>{const node=$(`#${name}-connection-state`);node.textContent=connected?'Connected':'Optional';node.className=`badge ${connected?'complete':'partial'}`;const dot=$(`#${name}-summary-dot`);dot.className=`dot ${connected?'ok':'warn'}`});const methods={qbit:services.qbittorrent.api_key_set?'API key':services.qbittorrent.password_set?'Username/password fallback':'No credentials',radarr:services.radarr.api_key_set?'API key':'No API key',sonarr:services.sonarr.api_key_set?'API key':'No API key'};Object.entries(states).forEach(([name,connected])=>{$(`#${name}-auth-summary`).textContent=connected?`Connected · ${methods[name]}`:`Not configured · ${methods[name]}`})}
 function renderRuntime(){if(!state.runtime)return;$('#runtime-apply').checked=state.runtime.apply;$('#runtime-status').textContent=state.runtime.apply?'Write mode':'Dry run';$('#runtime-status').className=`badge ${state.runtime.apply?'complete':'dry_run'}`;const deployment=state.runtime.deployment;$('#deployment-settings').innerHTML=`<div class="deployment-note"><strong>Docker deployment settings</strong><span>These values define the container boundary and require a Compose recreate to change safely.</span></div>${deployment.running_as_root?'<div class="alert inline-alert">The API process is running as root. Configure PUID and PGID or a non-root container user before enabling writes.</div>':''}<dl><dt>Configured identity</dt><dd>${esc(deployment.configured_puid)}:${esc(deployment.configured_pgid)}</dd><dt>Effective identity</dt><dd>${esc(deployment.process_uid)}:${esc(deployment.process_gid)}</dd><dt>File creation umask</dt><dd>${esc(deployment.umask)}</dd><dt>Media mount mode</dt><dd>${esc(deployment.media_mount_mode)}</dd><dt>API token</dt><dd>${deployment.api_token_set?'Configured':'Not configured'}</dd><dt>API listener</dt><dd>${esc(deployment.listen)}:${esc(deployment.port)}</dd><dt>API-only service</dt><dd>${deployment.api_only?'Enabled':'Disabled'}</dd><dt>Timezone</dt><dd>${esc(deployment.timezone)}</dd>${deployment.pool_mounts.map(pool=>`<dt>${esc(pool.name)} mount</dt><dd>${esc(pool.prefix)} · ${pool.writable?'writable':'read-only'}</dd>`).join('')}</dl>`}
 function renderSecurity(){const method=state.auth?.method||state.runtime?.deployment?.auth_method||'forms';$('#password-panel').classList.toggle('hidden',method!=='forms');$('#security-summary').innerHTML=`<div><small>Authentication method</small><strong>${esc(method==='external'?'External proxy':'Forms')}</strong></div><div><small>Active sessions</small><strong>${state.sessions.length}</strong></div><div><small>API authentication</small><strong>Bearer or X-Api-Key</strong></div>`;$('#revoke-sessions').disabled=method!=='forms'||!state.sessions.length;$('#security-events').innerHTML=state.securityEvents.length?state.securityEvents.map(item=>`<tr><td>${badge(item.event)}</td><td>${esc(item.username||'—')}</td><td>${esc(item.client||'—')}</td><td>${fmtTime(item.created_at)}</td></tr>`).join(''):'<tr><td colspan="4" class="empty">No security events recorded</td></tr>'}
@@ -478,11 +522,14 @@ function renderReconcileBlocker(plan){
   const related=details.related_torrents||[];
   const candidates=details.candidates||[];
   const affected=details.affected_files||[];
-  const issueMarkup=issues.length?`<ol class="reconcile-prerequisites">${issues.map(issue=>`<li><div><strong>${esc(issue.summary)}</strong><code>${esc(issue.code)}</code></div><p><b>Manual fix:</b> ${esc(issue.action)}</p></li>`).join('')}</ol>`:`<div class="alert inline-alert"><p>${esc(plan.reason)}</p></div>`;
+  const issueMarkup=issues.length?`<ol class="reconcile-prerequisites">${issues.map(issue=>{const repeated=issue.summary===plan.reason&&issue.code===plan.error_code;return `<li><div>${repeated?'':`<strong>${esc(issue.summary)}</strong>`}<code>${esc(issue.code)}</code></div><p><b>Manual fix:</b> ${esc(issue.action)}</p></li>`}).join('')}</ol>`:`<div class="alert inline-alert"><p>${esc(plan.reason)}</p></div>`;
   const relatedMarkup=related.length?`<div class="table-wrap"><table><thead><tr><th>Competing qBittorrent release</th><th>Hash</th><th>Category</th><th>Save path</th></tr></thead><tbody>${related.map(item=>`<tr><td>${esc(item.name)}</td><td><span class="hash-short" title="${esc(item.hash)}">${esc(String(item.hash||'').slice(0,12))}…</span></td><td><span class="category">${esc(item.category||'none')}</span></td><td class="path">${esc(item.save_path||'—')}</td></tr>`).join('')}</tbody></table></div>`:'';
   const candidateMarkup=candidates.length?`<div class="release-evidence">${candidates.map(item=>`<div><small>Possible ${plan.app==='sonarr'?'Sonarr series':'Radarr movie'} — not automatically trusted</small><strong>${esc(item.title||'Unknown')} ${item.id?`(#${esc(item.id)})`:''}</strong><code>${esc(item.path||'No library path')}</code></div>`).join('')}</div>`:'';
   const affectedMarkup=affected.length?`<div class="table-wrap"><table><thead><tr><th>Blocked media file</th><th>Torrent file</th><th>Reason</th></tr></thead><tbody>${affected.map(item=>`<tr><td class="path">${esc(item.source_library||'—')}</td><td class="path">${esc(item.torrent_file||'No unique file')}</td><td>${badge(item.status)}</td></tr>`).join('')}</tbody></table></div>`:'';
-  return `<article class="panel release-conflict"><div class="panel-head"><div><h2>Reconcile needs manual resolution</h2><p>Stowarr made no changes and will not enable Reconcile until the identity and storage route are safe.</p></div>${badge('blocked')}</div><div class="reconcile-block-summary"><strong>${esc(plan.reason)}</strong>${plan.error_code?`<code>${esc(plan.error_code)}</code>`:''}</div>${issueMarkup}${candidateMarkup}${relatedMarkup}${affectedMarkup}${details.action?`<div class="recovery-guidance"><div><strong>Before trying again</strong><p>${esc(details.action)}</p></div></div>`:''}</article>`;
+  const eligibleVideos=details.eligible_feature_videos||[];
+  const rejectedVideos=details.rejected_non_feature_videos||[];
+  const videoEvidenceMarkup=Number.isInteger(details.torrent_video_count)?`<div class="release-evidence"><div><small>Selected direct videos</small><strong>${details.torrent_video_count}</strong><span>${details.contains_archives?'Archive content is also selected':'No archive content detected'}</span></div><div><small>Eligible feature candidates</small><strong>${details.eligible_feature_video_count??'—'}</strong>${eligibleVideos.map(path=>`<code>${esc(path)}</code>`).join('')||'<span>No unambiguous feature candidate</span>'}</div>${rejectedVideos.length?`<div><small>Ignored samples, trailers, extras, or unproven videos</small><strong>${rejectedVideos.length}</strong>${rejectedVideos.map(path=>`<code>${esc(path)}</code>`).join('')}</div>`:''}</div>`:'';
+  return `<article class="panel release-conflict"><div class="panel-head"><div><h2>Reconcile needs manual resolution</h2><p>Stowarr made no changes and will not enable Reconcile until the identity and storage route are safe.</p></div>${badge('blocked')}</div><div class="reconcile-block-summary"><strong>${esc(plan.reason)}</strong>${plan.error_code?`<code>${esc(plan.error_code)}</code>`:''}</div>${videoEvidenceMarkup}${issueMarkup}${candidateMarkup}${relatedMarkup}${affectedMarkup}${details.action?`<div class="recovery-guidance"><div><strong>Before trying again</strong><p>${esc(details.action)}</p></div></div>`:''}</article>`;
 }
 function reconcileActionCopy(plan){
   const restoresMissing=plan.pairs?.some(pair=>pair.status==='missing-library');
@@ -592,36 +639,30 @@ async function applyPlan(){
   const button=$('#apply-plan');
   button.disabled=true;
   button.textContent='Authorizing…';
+  await refreshOperations();
   const afterId=Math.max(0,...state.operations.map(item=>item.id));
-  const showSubmissionTracker=shouldShowSubmissionTracker();
-  let trackingGeneration=null;
-  let stopRegistrationWatcher=null;
+  let registrationWatcher=null;
   try{
     const confirmation=await api('/api/confirmations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'reconcile',torrentHash:plan.torrent_hash,payload:{auxiliaryFiles}})});
     button.textContent='Reconciling…';
-    if(showSubmissionTracker){
-      trackOperation(plan.torrent_hash,'reconcile',afterId);
-      trackingGeneration=state.operationTrackingGeneration;
-    }else{
-      stopRegistrationWatcher=watchOperationRegistration(plan.torrent_hash,'reconcile',afterId);
-    }
+    registrationWatcher=watchOperationRegistration(plan.torrent_hash,'reconcile',afterId);
     const result=await api(`/api/reconcile/${encodeURIComponent(plan.torrent_hash)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auxiliaryFiles,confirmationToken:confirmation.token})});
     if(result.disposition==='queued'){
-      stopRegistrationWatcher?.();
-      if(trackingGeneration===state.operationTrackingGeneration)finishOperationTracking();
+      registrationWatcher.stop();
+      if(registrationWatcher.registeredOperationId&&state.currentOperation?.id===registrationWatcher.registeredOperationId)finishOperationTracking();
       await refreshQueue();
       navigate('queue');
       toast(`Another operation has the shared slot; Reconcile queued last as ${result.public_id}`);
       return;
     }
-    await refreshOperations();
+    await ensureDirectOperationTracking(registrationWatcher,result,'reconcile');
     toast(`Reconcile result: ${result.state}`);
     await inspect(plan.torrent_hash);
     await load();
   }catch(e){
-    stopRegistrationWatcher?.();
+    registrationWatcher?.stop();
     await refreshOperations();
-    if(showSubmissionTracker)rejectOperationTracking(plan.torrent_hash,'reconcile',e.message,afterId);
+    rejectOperationTracking(plan.torrent_hash,'reconcile',e.message,afterId);
     toast(`Reconcile failed: ${e.message}`);
     button.disabled=false;
     button.textContent=copy.button;
@@ -784,17 +825,13 @@ function automaticallyTrackRunningQueue(){
   const runningReconcile=(state.reconcileQueue||[]).find(item=>item.state==='RUNNING');
   const running=runningMove||runningReconcile;
   if(!running)return;
+  let startHidden=true;
   if(state.operationTracking){
-    if(!state.operationHidden||!terminalOperation(state.currentOperation))return;
+    if(!terminalOperation(state.currentOperation))return;
+    startHidden=state.operationHidden;
     finishOperationTracking();
   }
-  trackOperationByPublicId(running.public_id,runningMove?'move':'reconcile',true);
-}
-
-function shouldShowSubmissionTracker(){
-  const activeQueueWork=[...(state.queue||[]),...(state.reconcileQueue||[])].some(item=>['QUEUED','RUNNING'].includes(item.state));
-  const activeOperationTracking=state.operationTracking&&!terminalOperation(state.currentOperation);
-  return !activeQueueWork&&!activeOperationTracking;
+  trackOperationByPublicId(running.public_id,runningMove?'move':'reconcile',startHidden);
 }
 
 async function refreshQueue(quiet=false,throwOnError=false){
@@ -871,38 +908,32 @@ async function applyMove(){
   button.disabled=true;
   button.textContent='Authorizing…';
   const payload={targetPool:plan.target_pool,additionalFiles};
+  await refreshOperations();
   const afterId=Math.max(0,...state.operations.map(item=>item.id));
-  const showSubmissionTracker=shouldShowSubmissionTracker();
-  let trackingGeneration=null;
-  let stopRegistrationWatcher=null;
+  let registrationWatcher=null;
   try{
     const confirmation=await api('/api/confirmations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'move',torrentHash:plan.torrent_hash,payload})});
     button.textContent='Moving and verifying…';
-    if(showSubmissionTracker){
-      trackOperation(plan.torrent_hash,'move',afterId);
-      trackingGeneration=state.operationTrackingGeneration;
-    }else{
-      stopRegistrationWatcher=watchOperationRegistration(plan.torrent_hash,'move',afterId);
-    }
+    registrationWatcher=watchOperationRegistration(plan.torrent_hash,'move',afterId);
     const result=await api(`/api/move/apply/${encodeURIComponent(plan.torrent_hash)}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...payload,confirmationToken:confirmation.token})});
     if(result.disposition==='queued'){
-      stopRegistrationWatcher?.();
-      if(trackingGeneration===state.operationTrackingGeneration)finishOperationTracking();
+      registrationWatcher.stop();
+      if(registrationWatcher.registeredOperationId&&state.currentOperation?.id===registrationWatcher.registeredOperationId)finishOperationTracking();
       await refreshQueue();
       navigate('queue');
       toast(`Another operation has the shared slot; Move queued last as ${result.public_id}`);
       return;
     }
-    await refreshOperations();
+    await ensureDirectOperationTracking(registrationWatcher,result,'move');
     toast(`Move result: ${result.state}`);
     clearMoveSelection();
     state.qbitCatalog=null;
     await loadQbitCatalog(true);
     await load();
   }catch(e){
-    stopRegistrationWatcher?.();
+    registrationWatcher?.stop();
     await refreshOperations();
-    if(showSubmissionTracker)rejectOperationTracking(plan.torrent_hash,'move',e.message,afterId);
+    rejectOperationTracking(plan.torrent_hash,'move',e.message,afterId);
     toast(`Move failed: ${e.message}`);
     button.disabled=false;
     button.textContent=`Review & move to ${plan.target_pool}`;
@@ -979,12 +1010,22 @@ async function repairSyncCategory(button){
   if(!await confirmAction({title:`Set qBittorrent category to ${category}?`,message:'Stowarr will revalidate the exact *Arr hash association, torrent save path, and configured qBittorrent category route before changing anything.',details:[['Torrent',button.dataset.name],['Current category',button.dataset.currentCategory],['New category',category],['Authoritative pool',button.dataset.pool]],confirmLabel:'Set category'}))return;
   button.disabled=true;
   button.textContent='Validating…';
+  await refreshOperations();
+  const afterId=Math.max(0,...state.operations.map(item=>item.id));
+  const registrationWatcher=watchOperationRegistration(hash,'category',afterId);
   try{
     const result=await api(`/api/sync/${encodeURIComponent(app)}/${encodeURIComponent(hash)}/category`,{method:'POST'});
-    toast(result.changed?`Category changed to ${result.category}`:`Category is already ${result.category}`);
     await refreshOperations();
+    if(!registrationWatcher.registeredOperationId&&result.operation_id){
+      registrationWatcher.stop();
+      startOperationTracking(operations=>operations.find(item=>item.id===result.operation_id),'category');
+    }
+    toast(result.changed?`Category changed to ${result.category}`:`Category is already ${result.category}`);
     await runSync({app,throwOnError:true});
   }catch(error){
+    registrationWatcher.stop();
+    await refreshOperations();
+    rejectOperationTracking(hash,'category',error.message,afterId);
     toast(`Category was not changed: ${error.message}`);
     button.disabled=false;
     button.textContent='Set category';

@@ -1,4 +1,7 @@
 FROM python:3.12-slim
+ARG STOWARR_COMMIT=unknown
+LABEL org.opencontainers.image.revision="${STOWARR_COMMIT}"
+ENV STOWARR_COMMIT="${STOWARR_COMMIT}"
 WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends 7zip gosu \
