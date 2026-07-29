@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from typing import Any
+from urllib.error import HTTPError
 
 from .config import Service
 from .http import JsonClient
@@ -86,7 +87,13 @@ class ArrClient:
             return None
         item_id = next(iter(item_ids))
         endpoint = "movie" if self.kind == "radarr" else "series"
-        item = self.http.request("GET", f"/api/v3/{endpoint}/{item_id}")
+        try:
+            item = self.http.request("GET", f"/api/v3/{endpoint}/{item_id}")
+        except HTTPError as error:
+            if error.code != 404:
+                raise
+            error.close()
+            return None
         if self.kind == "radarr":
             movie_file = item.get("movieFile")
             files = [] if not movie_file else [{

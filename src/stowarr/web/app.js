@@ -484,27 +484,86 @@ function renderReconcileBlocker(plan){
   const affectedMarkup=affected.length?`<div class="table-wrap"><table><thead><tr><th>Blocked media file</th><th>Torrent file</th><th>Reason</th></tr></thead><tbody>${affected.map(item=>`<tr><td class="path">${esc(item.source_library||'—')}</td><td class="path">${esc(item.torrent_file||'No unique file')}</td><td>${badge(item.status)}</td></tr>`).join('')}</tbody></table></div>`:'';
   return `<article class="panel release-conflict"><div class="panel-head"><div><h2>Reconcile needs manual resolution</h2><p>Stowarr made no changes and will not enable Reconcile until the identity and storage route are safe.</p></div>${badge('blocked')}</div><div class="reconcile-block-summary"><strong>${esc(plan.reason)}</strong>${plan.error_code?`<code>${esc(plan.error_code)}</code>`:''}</div>${issueMarkup}${candidateMarkup}${relatedMarkup}${affectedMarkup}${details.action?`<div class="recovery-guidance"><div><strong>Before trying again</strong><p>${esc(details.action)}</p></div></div>`:''}</article>`;
 }
+function reconcileActionCopy(plan){
+  const restoresMissing=plan.pairs?.some(pair=>pair.status==='missing-library');
+  const samePath=Boolean(plan.pairs?.length)&&plan.pairs.every(pair=>pair.source_library===pair.target_library);
+  if(restoresMissing)return{
+    title:'Ready to restore missing Radarr media',
+    message:'Stowarr will force-recheck qBittorrent, create the missing movie and selected subtitle hardlinks, rescan Radarr, and require Radarr to manage the exact movie path. No verified duplicate is removed.',
+    button:'Restore missing media hardlink',
+    confirmTitle:`Restore ${plan.item_title} from qBittorrent?`,
+    confirmMessage:'The qBittorrent video is retained as the source of truth. Stowarr creates library hardlinks only after a successful force recheck.',
+    detailLabel:'Missing library media',
+  };
+  if(samePath)return{
+    title:'Ready to repair missing hardlink identity',
+    message:'Stowarr will hash-verify the existing Radarr media against qBittorrent and replace the same library entry with a hardlink only when the content is identical.',
+    button:'Replace with verified hardlink',
+    confirmTitle:`Repair the ${plan.item_title} hardlink?`,
+    confirmMessage:'The existing library entry is replaced only after exact content verification.',
+    detailLabel:'Library entry repaired',
+  };
+  return{
+    title:'Ready for verified reconciliation',
+    message:'Stowarr will hash-verify, create the new hardlink, update *Arr, and only then remove the verified old duplicate.',
+    button:'Reconcile & remove verified duplicate',
+    confirmTitle:`Reconcile ${plan.item_title}?`,
+    confirmMessage:'Suspected duplicates are removed only after content verification.',
+    detailLabel:'Suspected duplicates',
+  };
+}
+function renderReconcilePair(pair){
+  const packed=pair.strategy==='archive-reextract'||pair.strategy==='verified-copy';
+  const already=pair.status==='already-on-target';
+  const restore=pair.status==='missing-library';
+  const sourceTitle=packed
+    ?'qBittorrent archive set'
+    :`qBittorrent download on ${esc(poolForPath(pair.torrent_file))}`;
+  const sourceText=packed
+    ?'The archive manifest and save path are authoritative. Extracted files are disposable derived artifacts.'
+    :'This save path determines the authoritative pool. The download is kept.';
+  const sourcePath=packed
+    ?'Archive content must pass a qBittorrent recheck and extractor test'
+    :esc(pair.torrent_file);
+  const targetStep=packed?(already?'KEEP':'RE-EXTRACT'):'CREATE';
+  const targetTitle=packed
+    ?(already
+      ?'Imported media already on the authoritative pool'
+      :`Regenerate media with Stowarr on ${esc(poolForPath(pair.target_library))}`)
+    :`New library hardlink on ${esc(poolForPath(pair.target_library))}`;
+  const targetText=restore
+    ?'Created from the selected qBittorrent video only after a successful force recheck.'
+    :packed
+      ?(already
+        ?'No media move is required.'
+        :'Stowarr extracts the qBittorrent-owned archives into isolated staging and verifies the result before import.')
+      :'Created as a hardlink to the qBittorrent file after verification.';
+  const previous=restore?'':`<div class="flow-arrow">→</div><div class="flow-card obsolete"><span class="flow-step">3 · ${already?'CURRENT LIBRARY':'SUSPECTED STALE DERIVATIVE'}</span><h3>${already?'Current imported media':`Old derived media on ${esc(poolForPath(pair.source_library))}`}</h3><p>${already?'This file is already on the pool selected by qBittorrent.':'It is removed only after Stowarr has extracted, verified, and imported the media on the authoritative pool.'}</p><code class="path">${esc(pair.source_library)}</code></div>`;
+  return `<div class="pair"><div class="pair-summary">${badge(pair.status)}${badge(pair.strategy)}<strong>${(pair.size/1073741824).toFixed(2)} GiB</strong></div><div class="file-flow"><div class="flow-card canonical"><span class="flow-step">1 · SOURCE OF TRUTH / KEEP</span><h3>${sourceTitle}</h3><p>${sourceText}</p><code class="path">${sourcePath}</code></div><div class="flow-arrow">→</div><div class="flow-card target"><span class="flow-step">2 · ${targetStep}</span><h3>${targetTitle}</h3><p>${targetText}</p><code class="path">${esc(pair.target_library)}</code></div>${previous}</div></div>`;
+}
 function renderPlan(plan){
   const error=renderReconcileBlocker(plan);
   const service=plan.app==='sonarr'?'Sonarr':'Radarr';
   const itemType=plan.app==='sonarr'?'Series':'Movie';
   const details=[['Status',badge(plan.status)],['Application',esc(service)],['Authoritative pool',esc(plan.target_pool||'—')],[`${service} ${itemType.toLowerCase()}`,plan.item_id?`${esc(plan.item_title)} (#${plan.item_id})`:'—'],['Torrent',esc(plan.torrent_name||'—')],[`Current ${service} ${itemType.toLowerCase()} folder`,`<span class="path">${esc(plan.current_item_path||'—')}</span>`],[`New ${service} ${itemType.toLowerCase()} folder`,`<span class="path">${esc(plan.target_item_path||'—')}</span>`],['Torrent hash',`<span class="path">${esc(plan.torrent_hash)}</span>`]];
-  const pairs=plan.pairs?.length?plan.pairs.map(p=>{const packed=p.strategy==='archive-reextract'||p.strategy==='verified-copy';const already=p.status==='already-on-target';return `<div class="pair"><div class="pair-summary">${badge(p.status)}${badge(p.strategy)}<strong>${(p.size/1073741824).toFixed(2)} GiB</strong></div><div class="file-flow"><div class="flow-card canonical"><span class="flow-step">1 · SOURCE OF TRUTH / KEEP</span><h3>${packed?'qBittorrent archive set':`qBittorrent download on ${esc(poolForPath(p.torrent_file))}`}</h3><p>${packed?'The archive manifest and save path are authoritative. Extracted files are disposable derived artifacts.':'This save path determines the authoritative pool. The download is kept.'}</p><code class="path">${packed?'Archive content must pass a qBittorrent recheck and extractor test':esc(p.torrent_file)}</code></div><div class="flow-arrow">→</div><div class="flow-card target"><span class="flow-step">2 · ${packed?(already?'KEEP':'RE-EXTRACT'):'CREATE'}</span><h3>${packed?(already?'Imported media already on the authoritative pool':`Regenerate media with Stowarr on ${esc(poolForPath(p.target_library))}`):`New library hardlink on ${esc(poolForPath(p.target_library))}`}</h3><p>${packed?(already?'No media move is required.':'Stowarr extracts the qBittorrent-owned archives into isolated staging and verifies the result before import.'):'Created as a hardlink to the qBittorrent file after verification.'}</p><code class="path">${esc(p.target_library)}</code></div><div class="flow-arrow">→</div><div class="flow-card obsolete"><span class="flow-step">3 · ${already?'CURRENT LIBRARY':'SUSPECTED STALE DERIVATIVE'}</span><h3>${already?'Current imported media':`Old derived media on ${esc(poolForPath(p.source_library))}`}</h3><p>${already?'This file is already on the pool selected by qBittorrent.':'It is removed only after Stowarr has extracted, verified, and imported the media on the authoritative pool.'}</p><code class="path">${esc(p.source_library)}</code></div></div></div>`}).join(''):'<div class="empty">No file pairs available</div>';
+  const pairs=plan.pairs?.length?plan.pairs.map(renderReconcilePair).join(''):'<div class="empty">No file pairs available</div>';
   const missingAux=(plan.auxiliary_files||[]).filter(x=>['missing-target','torrent-sidecar'].includes(x.status));
   const conflicts=(plan.auxiliary_files||[]).filter(x=>['target-conflict','torrent-name-conflict'].includes(x.status));
   const eligibleAux=(plan.auxiliary_files||[]).filter(x=>!['target-conflict','torrent-name-conflict'].includes(x.status));
   const auxiliary=plan.auxiliary_files?.length?`<div class="auxiliary"><label class="check-option select-all"><input id="select-all-auxiliary" type="checkbox" ${eligibleAux.length?'checked':'disabled'}><span><strong>Select all ${eligibleAux.length} eligible sidecar files</strong><small>qBittorrent-owned files are hardlinked. Files found only in the old library are copied and verified.</small></span></label><details open><summary>Sidecar files · ${missingAux.length} missing at destination${conflicts.length?` · ${conflicts.length} conflict`:''}</summary><div class="aux-list">${plan.auxiliary_files.map(x=>{const selectable=!['target-conflict','torrent-name-conflict'].includes(x.status);const origin=x.origin==='qbittorrent'?'qBittorrent · hardlink':'Old library · copy';return `<label class="aux-row ${selectable?'':'disabled'}"><input class="aux-file" type="checkbox" data-source="${esc(x.source)}" ${selectable?'checked':'disabled'}><span class="origin">${esc(origin)}</span><span>${badge(x.status)}</span><code class="path">${esc(x.source)}</code><span>→</span><code class="path">${esc(x.target)}</code></label>`}).join('')}</div></details>${conflicts.length?`<div class="aux-warning">${conflicts.length} file(s) compete for the same destination or differ from an existing target. They are disabled and will not be overwritten automatically.</div>`:''}</div>`:'';
   const ready=plan.status==='ready';
   const apply=Boolean(state.config?.apply);
-  const action=ready?`<div id="verification-result"></div><div class="reconcile-action"><div><strong>${apply?'Ready for verified reconciliation':'Deletion is locked in dry-run mode'}</strong><p>${apply?'Stowarr will hash-verify, create the new hardlink, update *Arr, and only then remove the verified duplicate.':'Set STOWARR_APPLY=true and provide writable media mounts only after reviewing the plan.'}</p></div><div class="action-buttons"><button id="verify-plan" class="secondary">Verify content hashes</button><button id="queue-reconcile" class="secondary" ${apply?'':'disabled'}>Add to queue</button><button id="apply-plan" class="danger" ${apply?'':'disabled'}>Reconcile &amp; remove verified duplicate</button></div></div>`:'';
+  const copy=reconcileActionCopy(plan);
+  const action=ready?`<div id="verification-result"></div><div class="reconcile-action"><div><strong>${apply?esc(copy.title):'Changes are locked in dry-run mode'}</strong><p>${apply?esc(copy.message):'Enable Write mode and provide writable media mounts only after reviewing the plan.'}</p></div><div class="action-buttons"><button id="verify-plan" class="secondary">Verify content hashes</button><button id="queue-reconcile" class="secondary" ${apply?'':'disabled'}>Add to queue</button><button id="apply-plan" class="danger" ${apply?'':'disabled'}>${esc(copy.button)}</button></div></div>`:'';
   $('#plan-result').innerHTML=`${error}<article class="panel"><div class="panel-head"><div><h2>Plan details</h2><p>No changes have been made</p></div></div><div class="detail-grid">${details.map(([k,v])=>`<div class="detail"><small>${k}</small><strong>${v}</strong></div>`).join('')}</div></article><article class="panel"><div class="panel-head"><div><h2>File migration and hardlinks</h2><p>qBittorrent determines the authoritative pool; suspected duplicates are removed only after verification</p></div></div>${pairs}${auxiliary}${action}</article>`
 }
 async function applyPlan(){
   const plan=state.plan;
   if(!plan||plan.status!=='ready'||!state.config?.apply)return;
+  const copy=reconcileActionCopy(plan);
   const oldFiles=plan.pairs.map(p=>p.source_library).join(', ');
   const auxiliaryFiles=$$('.aux-file:checked').map(input=>input.dataset.source);
-  if(!await confirmAction({title:`Reconcile ${plan.item_title}?`,message:'Suspected duplicates are removed only after content verification.',details:[['Suspected duplicates',oldFiles],['Selected sidecar files',String(auxiliaryFiles.length)]],confirmLabel:'Reconcile',danger:true}))return;
+  if(!await confirmAction({title:copy.confirmTitle,message:copy.confirmMessage,details:[[copy.detailLabel,oldFiles],['Selected sidecar files',String(auxiliaryFiles.length)]],confirmLabel:copy.button,danger:true}))return;
   const button=$('#apply-plan');
   button.disabled=true;
   button.textContent='Authorizing…';
@@ -540,7 +599,7 @@ async function applyPlan(){
     if(showSubmissionTracker)rejectOperationTracking(plan.torrent_hash,'reconcile',e.message,afterId);
     toast(`Reconcile failed: ${e.message}`);
     button.disabled=false;
-    button.textContent='Reconcile & remove verified duplicate';
+    button.textContent=copy.button;
   }
 }
 async function enqueueReconcile(){const plan=state.plan;if(!plan||plan.status!=='ready'||!state.config?.apply)return;const auxiliaryFiles=$$('.aux-file:checked').map(input=>input.dataset.source);if(!await confirmAction({title:`Add ${plan.item_title} to the Reconcile queue?`,message:'The plan is revalidated immediately before execution.',details:[['Selected sidecar files',String(auxiliaryFiles.length)]],confirmLabel:'Add to queue'}))return;const button=$('#queue-reconcile');button.disabled=true;button.textContent='Authorizing…';try{const confirmation=await api('/api/confirmations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'reconcile',torrentHash:plan.torrent_hash,payload:{auxiliaryFiles}})});const queued=await api('/api/reconcile-queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHash:plan.torrent_hash,auxiliaryFiles,confirmationToken:confirmation.token})});toast(`Reconcile queued as ${queued.public_id}`);await refreshQueue();navigate('queue')}catch(error){toast(`Reconcile was not queued: ${error.message}`);button.disabled=false;button.textContent='Add to queue'}}
@@ -834,7 +893,7 @@ function clearMoveSelection(){state.moveTorrent=null;state.movePlan=null;$('#mov
 async function loadQbitCatalog(force=false){if(state.qbitCatalog&&state.routingAudit&&!force){renderRoutingAudit();renderQbitCatalog();return}clearMoveSelection();$('#move-search-loading').classList.remove('hidden');$('#move-search-results').innerHTML='';try{const [catalog,audit]=await Promise.all([api('/api/qbittorrent/torrents'),api('/api/routing/audit')]);state.qbitCatalog=catalog;state.routingAudit=audit;renderRoutingAudit();renderQbitCatalog()}catch(e){$('#move-search-results').innerHTML=`<div class="alert inline-alert"><div class="alert-head">qBittorrent catalog failed</div><p>${esc(e.message)}</p></div>`}finally{$('#move-search-loading').classList.add('hidden')}}
 function selectMoveTorrent(hash){const torrent=catalogRows().find(row=>row.hash===hash);if(!torrent)return;state.moveTorrent=torrent;$('#move-hash').value=hash;$('#move-selected-name').textContent=torrent.name;$('#move-selected-hash').textContent=hash;$('.move-selection').classList.remove('hidden');const destination=state.config.pools.find(pool=>pool.name!==torrent.pool)||state.config.pools[0];if(destination)$('#move-target').value=destination.name;$('#move-result').innerHTML='';$('.move-selection').scrollIntoView({behavior:'smooth',block:'nearest'})}
 function hashCell(file,label){if(!file)return `<div><small>${esc(label)}</small><strong>Not applicable</strong><span>Packed torrent: media is not part of the torrent manifest</span></div>`;if(!file.exists)return `<div><small>${esc(label)}</small><strong>Not present</strong><code class="path">${esc(file.path)}</code></div>`;return `<div><small>${esc(label)}</small><strong title="${esc(file.sha256)}">SHA-256 ${esc(file.sha256.slice(0,16))}…</strong><span>inode ${file.inode} · links ${file.links}</span><code class="path">${esc(file.path)}</code></div>`}
-async function verifyPlan(){const plan=state.plan;if(!plan||plan.status!=='ready')return;const button=$('#verify-plan');button.disabled=true;button.textContent='Hashing files…';$('#verification-result').innerHTML='<div class="loading"><span></span>Hashing torrent, old library, and new library paths. This may take several minutes…</div>';try{const result=await api(`/api/verify/${encodeURIComponent(plan.torrent_hash)}`,{method:'POST'});const videos=result.video_files.map(file=>{const packed=file.strategy==='archive-reextract'||file.strategy==='verified-copy';const valid=packed?file.new_matches_torrent!==false:file.old_matches_torrent&&file.new_matches_torrent!==false;return `<div class="verification-file"><div class="verification-head">${badge(valid?'verified':'mismatch')}<strong>${packed?'Extracted media comparison':'Direct torrent media comparison'}</strong></div><div class="hash-grid">${hashCell(file.torrent,'qBittorrent media file')}${hashCell(file.old_library,'Old library path')}${hashCell(file.new_library,'New library path')}</div><p>${packed?'The archive set remains authoritative; extracted media is verified independently.':`Old matches torrent: ${file.old_matches_torrent?'Yes':'No'}`} · New matches expected content: <b>${file.new_matches_torrent===null?'Not present yet':file.new_matches_torrent?'Yes':'No'}</b></p></div>`}).join('');const sidecarMatched=result.sidecar_files.filter(x=>x.matches_target===true).length;const sidecarMissing=result.sidecar_files.filter(x=>x.matches_target===null).length;const sidecarDifferent=result.sidecar_files.filter(x=>x.matches_target===false).length;$('#verification-result').innerHTML=`<div class="verification ${result.status}"><div class="verification-title"><strong>Hash verification: ${esc(result.status)}</strong><span>${result.sidecar_files.length} sidecars · ${sidecarMatched} matching · ${sidecarMissing} destination missing · ${sidecarDifferent} different</span></div>${videos}</div>`}catch(e){$('#verification-result').innerHTML=`<div class="alert"><div class="alert-head">Hash verification failed</div><p>${esc(e.message)}</p></div>`}finally{button.disabled=false;button.textContent='Verify content hashes'}}
+async function verifyPlan(){const plan=state.plan;if(!plan||plan.status!=='ready')return;const button=$('#verify-plan');button.disabled=true;button.textContent='Hashing files…';$('#verification-result').innerHTML='<div class="loading"><span></span>Hashing torrent, old library, and new library paths. This may take several minutes…</div>';try{const result=await api(`/api/verify/${encodeURIComponent(plan.torrent_hash)}`,{method:'POST'});const videos=result.video_files.map(file=>{const packed=file.strategy==='archive-reextract'||file.strategy==='verified-copy';const restore=file.status==='missing-library';const valid=restore?file.torrent?.exists&&file.old_library?.exists===false:packed?file.new_matches_torrent!==false:file.old_matches_torrent&&file.new_matches_torrent!==false;const comparison=restore?'Missing Radarr media restoration':packed?'Extracted media comparison':'Direct torrent media comparison';const explanation=restore?'The selected qBittorrent source is present. Its pieces are force-rechecked during execution before the missing library hardlink is created.':packed?'The archive set remains authoritative; extracted media is verified independently.':`Old matches torrent: ${file.old_matches_torrent?'Yes':'No'} · New matches expected content: ${file.new_matches_torrent===null?'Not present yet':file.new_matches_torrent?'Yes':'No'}`;return `<div class="verification-file"><div class="verification-head">${badge(restore&&valid?'ready-to-restore':valid?'verified':'mismatch')}<strong>${comparison}</strong></div><div class="hash-grid">${hashCell(file.torrent,'qBittorrent media file')}${hashCell(file.old_library,restore?'Missing library path':'Old library path')}${hashCell(file.new_library,'New library path')}</div><p>${explanation}</p></div>`}).join('');const sidecarMatched=result.sidecar_files.filter(x=>x.matches_target===true).length;const sidecarMissing=result.sidecar_files.filter(x=>x.matches_target===null).length;const sidecarDifferent=result.sidecar_files.filter(x=>x.matches_target===false).length;$('#verification-result').innerHTML=`<div class="verification ${result.status}"><div class="verification-title"><strong>Hash verification: ${esc(result.status)}</strong><span>${result.sidecar_files.length} sidecars · ${sidecarMatched} matching · ${sidecarMissing} destination missing · ${sidecarDifferent} different</span></div>${videos}</div>`}catch(e){$('#verification-result').innerHTML=`<div class="alert"><div class="alert-head">Hash verification failed</div><p>${esc(e.message)}</p></div>`}finally{button.disabled=false;button.textContent='Verify content hashes'}}
 function setSyncApp(app){
   state.syncApp=app;
   $$('.service-tab').forEach(x=>x.classList.toggle('active',x.dataset.app===app));
@@ -911,12 +970,12 @@ function renderSafeSyncPlan(plan){
   const manual=plan.manual||[];
   const preview=(items,empty)=>items.length?`<ul>${items.slice(0,8).map(item=>`<li><strong>${esc(item.torrent_name)}</strong><small>${esc(item.category?`${item.current_category||'none'} → ${item.category}`:item.target_pool?`Reconcile to ${item.target_pool}`:item.reason||item.status)}</small></li>`).join('')}${items.length>8?`<li><strong>+ ${items.length-8} more</strong></li>`:''}</ul>`:`<p>${esc(empty)}</p>`;
   const reconcileDisabled=!reconcile.length||!state.config?.apply||category.length>0;
-  target.innerHTML=`<section class="sync-safe-plan"><header><div><h3>Safe assisted repair</h3><p>Fresh plans only. Category fixes are applied first; Reconcile candidates enter the shared FIFO queue. Ambiguous items remain manual.</p></div><span>${plan.safe_count} safe</span></header><div class="sync-safe-columns"><article><h4>1 · Category fixes <b>${category.length}</b></h4>${preview(category,'No safely repairable categories.')}<button type="button" id="apply-safe-categories" class="primary compact" ${category.length&&state.config?.apply?'':'disabled'}>Apply safe category fixes</button></article><article><h4>2 · Reconcile queue <b>${reconcile.length}</b></h4>${preview(reconcile,'No root mismatches have a ready Reconcile plan.')}<button type="button" id="queue-safe-reconciles" class="primary compact" ${reconcileDisabled?'disabled':''}>${category.length?'Apply category fixes first':'Queue safe reconciles'}</button></article><article><h4>Manual review <b>${manual.length}</b></h4>${preview(manual,'No remaining manual issues in this plan.')}${queued.length?`<p>${queued.length} Reconcile ${queued.length===1?'job is':'jobs are'} already active.</p>`:''}</article></div></section>`;
+  target.innerHTML=`<section class="sync-safe-plan"><header><div><h3>Safe assisted repair</h3><p>Fresh plans only. Category fixes are applied first; Reconcile candidates enter the shared FIFO queue. Ambiguous items remain manual.</p></div><span>${plan.safe_count} safe</span></header><div class="sync-safe-columns"><article><h4>1 · Category fixes <b>${category.length}</b></h4>${preview(category,'No safely repairable categories.')}<button type="button" id="apply-safe-categories" class="primary compact" ${category.length&&state.config?.apply?'':'disabled'}>Apply safe category fixes</button></article><article><h4>2 · Reconcile queue <b>${reconcile.length}</b></h4>${preview(reconcile,'No repair candidates have a ready Reconcile plan.')}<button type="button" id="queue-safe-reconciles" class="primary compact" ${reconcileDisabled?'disabled':''}>${category.length?'Apply category fixes first':'Queue safe reconciles'}</button></article><article><h4>Manual review <b>${manual.length}</b></h4>${preview(manual,'No remaining manual issues in this plan.')}${queued.length?`<p>${queued.length} Reconcile ${queued.length===1?'job is':'jobs are'} already active.</p>`:''}</article></div></section>`;
 }
 const safePlanSteps=()=>[
   {id:'audit',title:'Read current audit',description:'Reading qBittorrent and exact *Arr history associations.'},
   {id:'categories',title:'Classify category fixes',description:'Checking save paths, pool routes, and configured categories.'},
-  {id:'reconciles',title:'Build fresh Reconcile plans',description:'Testing each root mismatch against the complete Reconcile safety plan.'},
+  {id:'reconciles',title:'Build fresh Reconcile plans',description:'Testing each repair candidate against the complete Reconcile safety plan.'},
   {id:'manual',title:'Separate manual issues',description:'Keeping ambiguous or incomplete evidence outside automation.'},
 ];
 async function fetchSafeSyncPlan(app,onProgress){
@@ -995,7 +1054,7 @@ async function applySafeCategories(options={}){
     {id:'validation',title:'Revalidate complete batch',description:'Every selected torrent must remain safe before any category changes.'},
     {id:'apply',title:'Apply qBittorrent categories',description:'Changing only the previously validated category routes.'},
     {id:'audit',title:'Refresh Sync audit',description:'Reading qBittorrent and *Arr again after the batch.'},
-    {id:'rebuild',title:'Rebuild safe action plan',description:'Discovering which root mismatches are now ready for Reconcile.'},
+    {id:'rebuild',title:'Rebuild safe action plan',description:'Discovering which repair candidates are now ready for Reconcile.'},
   ]);
   try{
     const confirmation=await api(`/api/sync/${encodeURIComponent(app)}/safe-category/confirmation`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHashes:hashes})});

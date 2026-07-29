@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from stowarr.clients import ArrClient, QBittorrentClient
 from stowarr.config import Service
@@ -67,6 +68,31 @@ class ArrClientTest(unittest.TestCase):
         client.http = BulkHttp()
         self.assertEqual(client.history_for_downloads({"abc123"}), {"abc123": 42})
         self.assertEqual(client.http.query["sortDirection"], "descending")
+
+    def test_download_mapping_returns_none_when_historical_item_was_deleted(self):
+        class DeletedMovieHttp:
+            def request(self, method, path, query=None, **kwargs):
+                if path == "/api/v3/history":
+                    return {
+                        "records": [{
+                            "downloadId": "HASH",
+                            "movieId": 42,
+                        }]
+                    }
+                if path == "/api/v3/movie/42":
+                    raise HTTPError(
+                        "http://unused/api/v3/movie/42",
+                        404,
+                        "Not Found",
+                        {},
+                        None,
+                    )
+                raise AssertionError(path)
+
+        client = ArrClient(Service("http://unused", api_key="unused"), "radarr")
+        client.http = DeletedMovieHttp()
+
+        self.assertIsNone(client.download_mapping("hash"))
 
     def test_sonarr_mapping_includes_only_episode_files_owned_by_download(self):
         class SonarrHttp:
