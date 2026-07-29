@@ -124,6 +124,11 @@ class ArrClientTest(unittest.TestCase):
         self.assertTrue(mapping["mappingComplete"])
         self.assertEqual([record["id"] for record in mapping["files"]], [700])
         self.assertEqual(mapping["files"][0]["episodeIds"], [70, 71])
+        self.assertEqual(
+            [record["id"] for record in mapping["allFiles"]],
+            [700, 701],
+        )
+        self.assertEqual(mapping["allFiles"][1]["episodeIds"], [72])
 
     def test_sonarr_mapping_is_incomplete_without_episode_identity(self):
         class SonarrHttp:
