@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from stowarr import __commit__
 from stowarr.archive import ArchiveMember, ExtractedFile
 from stowarr.config import Config, Pool, Service
 from stowarr.engine import (
@@ -59,6 +60,35 @@ class EngineTest(unittest.TestCase):
         self.assertFalse(
             strong_release_matches_item(item, "Crime.101.2025.2160p")
         )
+
+    def test_strong_release_match_excludes_unrelated_matrix_candidates(self):
+        release = (
+            "The.Matrix.1999.NORDiC.REMUX.2160p.DV.HDR.UHD-BluRay."
+            "HEVC.TrueHD.Atmos.7.1-RAPiDCOWS"
+        )
+
+        self.assertTrue(
+            strong_release_matches_item(
+                {"title": "The Matrix", "year": 1999}, release
+            )
+        )
+        for title, year in (
+            ("IF", 2024),
+            ("RV", 2006),
+            ("The Matrix Reloaded", 2003),
+            ("The Matrix Resurrections", 2021),
+            ("The Matrix Revolutions", 2003),
+            ("Up", 2009),
+            ("X2", 2003),
+            ("F1", 2025),
+            ("2012", 2009),
+        ):
+            with self.subTest(title=title):
+                self.assertFalse(
+                    strong_release_matches_item(
+                        {"title": title, "year": year}, release
+                    )
+                )
 
     def test_write_submission_is_rejected_while_recovery_is_required(self):
         manager = Stowarr.__new__(Stowarr)
@@ -377,6 +407,8 @@ class EngineTest(unittest.TestCase):
         result = manager.service_status()
 
         self.assertEqual(result["version"], "1.0.0-beta.4")
+        self.assertEqual(result["commit"], __commit__)
+        self.assertEqual(result["services"]["stowarr_api"]["commit"], __commit__)
         self.assertTrue(result["apply"])
         self.assertEqual(result["services"]["qbittorrent"]["version"], "5.2.1")
         self.assertEqual(result["services"]["radarr"]["status"], "connected")
@@ -1052,6 +1084,72 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(plan.error_details["contains_archives"])
         self.assertEqual(plan.error_details["candidates"][0]["title"], "Click")
 
+    def test_missing_history_lists_only_complete_title_and_year_candidates(self):
+        pool = Pool(
+            "p3", Path("/p3"), (Path("/p3/download"),),
+            Path("/p3/movies"), Path("/p3/series"),
+            "radarr-pool3", "sonarr-pool3",
+            "radarr-pool3", "sonarr-pool3",
+        )
+        torrent = {
+            "hash": "matrix",
+            "name": (
+                "The.Matrix.1999.NORDiC.REMUX.2160p.DV.HDR.UHD-BluRay."
+                "HEVC.TrueHD.Atmos.7.1-RAPiDCOWS"
+            ),
+            "category": "radarr-pool3",
+            "save_path": "/p3/download/The.Matrix.1999",
+        }
+        manager = Stowarr.__new__(Stowarr)
+        manager.qbit = SimpleNamespace(
+            torrents=lambda: [torrent],
+            files=lambda torrent_hash: [{
+                "name": f'{torrent["name"]}/{torrent["name"]}.mkv',
+                "size": 100,
+                "priority": 1,
+            }],
+            categories=lambda: {
+                "radarr-pool3": {"savePath": "/p3/download"},
+            },
+        )
+        manager.config = SimpleNamespace(
+            pools=(pool,),
+            pool_for_path=lambda path: pool,
+            pool_for_category=lambda category: (pool, "radarr"),
+        )
+        manager.arr = {"radarr": SimpleNamespace(
+            download_mapping=lambda torrent_hash: None,
+            history_for_downloads=lambda hashes: {},
+            all_items=lambda: [
+                {
+                    "id": 123, "title": "The Matrix", "year": 1999,
+                    "path": "/p3/movies/The Matrix (1999)",
+                },
+                {
+                    "id": 124, "title": "The Matrix Reloaded", "year": 2003,
+                    "path": "/p3/movies/The Matrix Reloaded (2003)",
+                },
+                {
+                    "id": 48, "title": "IF", "year": 2024,
+                    "path": "/p3/movies/IF (2024)",
+                },
+                {
+                    "id": 141, "title": "Up", "year": 2009,
+                    "path": "/p3/movies/Up (2009)",
+                },
+            ],
+        )}
+
+        plan = manager.plan("matrix")
+        audit = manager.sync_audit("radarr")
+
+        self.assertEqual(plan.error_code, "ARR_DOWNLOAD_HISTORY_MISSING")
+        self.assertEqual(
+            [candidate["title"] for candidate in plan.error_details["candidates"]],
+            ["The Matrix"],
+        )
+        self.assertEqual(audit["rows"][0]["title_candidate_count"], 1)
+
     def test_missing_radarr_title_requires_add_new_before_manual_import(self):
         pool = Pool(
             "p3", Path("/p3"), (Path("/p3/download"),),
@@ -1243,8 +1341,8 @@ class EngineTest(unittest.TestCase):
                 "save_path": "/p3/download/Moana.2.2024",
             }],
             files=lambda torrent_hash: [
-                {"name": "disc1.mkv", "size": 10, "priority": 1},
-                {"name": "disc2.mkv", "size": 11, "priority": 1},
+                {"name": "Moana.2.2024.disc1.mkv", "size": 10, "priority": 1},
+                {"name": "Moana.2.2024.disc2.mkv", "size": 11, "priority": 1},
             ],
         )
         manager.config = SimpleNamespace(
@@ -1264,6 +1362,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(plan.status, "blocked")
         self.assertEqual(plan.error_code, "ARR_MANAGED_MEDIA_MISSING")
         self.assertEqual(plan.error_details["torrent_video_count"], 2)
+        self.assertEqual(plan.error_details["eligible_feature_video_count"], 2)
 
     def test_radarr_missing_media_restore_rejects_sample_as_feature(self):
         pool = Pool(
@@ -1304,6 +1403,69 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(plan.status, "blocked")
         self.assertEqual(plan.error_code, "RADARR_FEATURE_VIDEO_UNPROVEN")
         self.assertEqual(plan.error_details["selected_video"], "/p3/download/Moana.2.2024/Sample.mkv")
+        self.assertEqual(plan.error_details["eligible_feature_video_count"], 0)
+
+    def test_radarr_missing_media_restore_ignores_sample_beside_feature(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download_root = root / "download"
+            release = download_root / "The.Mandalorian.and.Grogu.2026"
+            movie = release / "The.Mandalorian.and.Grogu.2026.mkv"
+            sample = release / "Sample" / "sample.mkv"
+            movie.parent.mkdir(parents=True)
+            sample.parent.mkdir(parents=True)
+            movie.write_bytes(b"feature")
+            sample.write_bytes(b"sample")
+            movie_root = root / "movies"
+            item = {
+                "id": 678,
+                "title": "The Mandalorian and Grogu",
+                "path": str(
+                    movie_root / "The Mandalorian and Grogu (2026)"
+                ),
+            }
+            torrent = {
+                "hash": "MANDALORIAN",
+                "name": "The.Mandalorian.and.Grogu.2026",
+                "category": "radarr-pool1",
+                "save_path": str(download_root),
+            }
+            records = [
+                {
+                    "name": str(path.relative_to(download_root)),
+                    "size": path.stat().st_size,
+                    "priority": 1,
+                }
+                for path in (movie, sample)
+            ]
+            pool = Pool(
+                "p1", root, (download_root,), movie_root, root / "series",
+                "radarr-pool1", "sonarr-pool1",
+                "radarr-pool1", "sonarr-pool1",
+            )
+            manager = Stowarr.__new__(Stowarr)
+            manager.qbit = SimpleNamespace(
+                torrents=lambda: [torrent],
+                files=lambda torrent_hash: records,
+            )
+            manager.config = SimpleNamespace(
+                pools=(pool,),
+                pool_for_path=lambda path: pool,
+                pool_for_category=lambda category: (pool, "radarr"),
+            )
+            manager.arr = {"radarr": SimpleNamespace(
+                download_mapping=lambda torrent_hash: {
+                    "app": "radarr", "item": item, "files": [],
+                },
+                history_for_downloads=lambda hashes: {"mandalorian": 678},
+            )}
+
+            plan = manager.plan("MANDALORIAN")
+
+            self.assertEqual(plan.status, "ready")
+            self.assertEqual(len(plan.pairs), 1)
+            self.assertEqual(plan.pairs[0].status, "missing-library")
+            self.assertEqual(plan.pairs[0].torrent_file, str(movie))
 
     def test_radarr_missing_media_restore_force_rechecks_and_hardlinks_subtitles(self):
         with tempfile.TemporaryDirectory() as directory:

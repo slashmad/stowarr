@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from urllib.parse import parse_qs, urlparse
 
-from . import __version__
+from . import __commit__, __version__
 from .engine import Stowarr
 from .queue import OperationQueueWorker
 
@@ -123,6 +123,7 @@ def handler(manager: Stowarr):
                     "apply": manager.config.apply,
                     "recovery_required": manager.store.has_recovery_required(),
                     "version": __version__,
+                    "commit": __commit__,
                 })
             elif path == "/api/auth/status":
                 external_user = self.headers.get(manager.config.external_user_header, "").strip()
@@ -139,6 +140,7 @@ def handler(manager: Stowarr):
                 self.send_json(200, {
                     "apply": manager.config.apply,
                     "version": __version__,
+                    "commit": __commit__,
                     "pools": [
                         {
                             "name": pool.name,
