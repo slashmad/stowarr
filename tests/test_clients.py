@@ -185,6 +185,33 @@ class ArrClientTest(unittest.TestCase):
         client.http = SonarrHttp()
         self.assertFalse(client.download_mapping("hash")["mappingComplete"])
 
+    def test_sonarr_mapping_is_incomplete_when_history_episode_is_missing(self):
+        class SonarrHttp:
+            def request(self, method, path, query=None, **kwargs):
+                if path == "/api/v3/history":
+                    return {"records": [{
+                        "id": 1,
+                        "downloadId": "HASH",
+                        "seriesId": 7,
+                        "data": {"episodeIds": [70, 71]},
+                    }]}
+                if path == "/api/v3/series/7":
+                    return {"id": 7, "title": "Series", "path": "/series/Series"}
+                if path == "/api/v3/episode":
+                    return [{"id": 70, "episodeFileId": 700}]
+                if path == "/api/v3/episodefile":
+                    return [{
+                        "id": 700,
+                        "path": "/series/Series/Season 01/S01E01.mkv",
+                        "size": 100,
+                    }]
+                raise AssertionError(path)
+
+        client = ArrClient(Service("http://unused", api_key="unused"), "sonarr")
+        client.http = SonarrHttp()
+
+        self.assertFalse(client.download_mapping("hash")["mappingComplete"])
+
     def test_radarr_library_mapping_requires_an_exact_managed_file_path(self):
         class RadarrHttp:
             def request(self, method, path, **kwargs):

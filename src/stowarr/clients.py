@@ -141,6 +141,11 @@ class ArrClient:
             record for record in all_files
             if int(record.get("id", 0)) in episode_file_ids
         ]
+        mapped_episode_ids = {
+            int(episode_id)
+            for record in files
+            for episode_id in record["episodeIds"]
+        }
         return {
             "app": self.kind,
             "item": item,
@@ -148,7 +153,13 @@ class ArrClient:
             "episodes": selected_episodes,
             "files": files,
             "allFiles": all_files,
-            "mappingComplete": bool(episode_ids and selected_episodes and episode_file_ids and files),
+            "mappingComplete": bool(
+                episode_ids
+                and {int(episode["id"]) for episode in selected_episodes}
+                == episode_ids
+                and mapped_episode_ids == episode_ids
+                and len(files) == len(episode_file_ids)
+            ),
         }
 
     def library_mapping(self, media_paths: list[str]) -> dict | None:
