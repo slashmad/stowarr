@@ -23,6 +23,7 @@ from stowarr.engine import (
     sha256,
     strong_release_matches_item,
     title_matches,
+    title_tokens,
 )
 
 
@@ -82,6 +83,32 @@ class EngineTest(unittest.TestCase):
                 item,
                 "Morning.Valley.2024.S01.2160p",
             )
+        )
+
+    def test_title_matching_transliterates_non_decomposing_latin_letters(self):
+        item = {"title": "Blåbær Łøkke", "year": 2024}
+
+        self.assertEqual(title_tokens(item["title"]), {"blabaer", "lokke"})
+        self.assertTrue(
+            title_matches(
+                item["title"],
+                "Blabaer.Lokke.2024.S01E01.2160p",
+            )
+        )
+        self.assertTrue(
+            strong_release_matches_item(
+                item,
+                "Blabaer.Lokke.2024.S01.2160p",
+            )
+        )
+
+    def test_short_title_fallback_never_accepts_an_unrelated_release(self):
+        self.assertTrue(title_matches("Ørn", "Orn.2024.S01E01"))
+        self.assertFalse(
+            title_matches("Ørn", "Completely.Unrelated.2024")
+        )
+        self.assertFalse(
+            title_matches("東京", "Completely.Unrelated.2024")
         )
 
     def test_strong_release_match_excludes_unrelated_matrix_candidates(self):

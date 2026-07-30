@@ -37,6 +37,19 @@ NON_FEATURE_VIDEO_MARKERS = {
     "bonus", "bts", "deleted", "extra", "extras", "featurette", "featurettes",
     "interview", "sample", "samples", "teaser", "trailer", "trailers",
 }
+LATIN_TITLE_TRANSLITERATION = str.maketrans({
+    "æ": "ae",
+    "đ": "d",
+    "ð": "d",
+    "ħ": "h",
+    "ı": "i",
+    "ł": "l",
+    "ŋ": "n",
+    "œ": "oe",
+    "ø": "o",
+    "þ": "th",
+    "ŧ": "t",
+})
 SAFE_RECONCILE_AUDIT_STATUSES = {
     "root-mismatch", "missing-library-file", "hardlink-missing",
 }
@@ -49,9 +62,10 @@ RELEASE_FOLDER_MARKERS = re.compile(
 
 
 def normalized_title_text(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value.casefold())
     return "".join(
         character
-        for character in unicodedata.normalize("NFKD", value.casefold())
+        for character in decomposed.translate(LATIN_TITLE_TRANSLITERATION)
         if not unicodedata.combining(character)
     )
 
@@ -66,9 +80,14 @@ def title_tokens(value: str) -> set[str]:
 
 def title_matches(item_title: str, *candidate_names: str) -> bool:
     expected = title_tokens(item_title)
+    normalized_candidates = normalized_title_text(" ".join(candidate_names))
     if not expected:
-        return True
-    actual = title_tokens(" ".join(candidate_names))
+        fallback = "".join(re.findall(
+            r"[a-z0-9]+", normalized_title_text(item_title)
+        ))
+        actual_tokens = set(re.findall(r"[a-z0-9]+", normalized_candidates))
+        return bool(fallback and fallback in actual_tokens)
+    actual = title_tokens(normalized_candidates)
     return bool(expected & actual)
 
 
