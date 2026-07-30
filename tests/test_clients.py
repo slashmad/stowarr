@@ -17,7 +17,7 @@ class FakeHttp:
         if path == "/api/v3/history":
             self.queries.append(query["downloadId"])
             if query["downloadId"] == "ABC123":
-                return {"records": [{"movieId": 42}]}
+                return {"records": [{"downloadId": "ABC123", "movieId": 42}]}
             return {"records": []}
         if path == "/api/v3/movie/42":
             return {"id": 42, "title": "masked"}
@@ -54,6 +54,46 @@ class ArrClientTest(unittest.TestCase):
         client.http = FakeHttp()
         self.assertEqual(client.item_for_download("abc123")["id"], 42)
         self.assertEqual(client.http.queries, ["abc123", "ABC123"])
+
+    def test_download_mapping_rejects_unfiltered_records_for_other_hashes(self):
+        class UnfilteredHttp:
+            def request(self, method, path, query=None, **kwargs):
+                if path == "/api/v3/history":
+                    return {"records": [
+                        {
+                            "id": 1,
+                            "downloadId": "S01-HASH",
+                            "seriesId": 7,
+                            "episodeId": 101,
+                        },
+                        {
+                            "id": 2,
+                            "downloadId": "S00-HASH",
+                            "seriesId": 7,
+                            "episodeId": 4,
+                        },
+                    ]}
+                if path == "/api/v3/series/7":
+                    return {"id": 7, "title": "Archer", "path": "/series/Archer"}
+                if path == "/api/v3/episode":
+                    return [
+                        {"id": 4, "episodeFileId": 704},
+                        {"id": 101, "episodeFileId": 7101},
+                    ]
+                if path == "/api/v3/episodefile":
+                    return [
+                        {"id": 704, "path": "/series/Archer/S00E04.mkv", "size": 40},
+                        {"id": 7101, "path": "/series/Archer/S01E01.mkv", "size": 100},
+                    ]
+                raise AssertionError(path)
+
+        client = ArrClient(Service("http://unused", api_key="unused"), "sonarr")
+        client.http = UnfilteredHttp()
+
+        mapping = client.download_mapping("s00-hash")
+
+        self.assertEqual([record["id"] for record in mapping["history"]], [2])
+        self.assertEqual([record["id"] for record in mapping["files"]], [704])
 
     def test_bulk_history_matches_hashes_case_insensitively(self):
         class BulkHttp:

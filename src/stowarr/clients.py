@@ -45,6 +45,7 @@ class ArrClient:
     def history_for_download(self, download_id: str) -> list[dict]:
         records: list[dict] = []
         seen: set[tuple] = set()
+        wanted = download_id.casefold()
         variants = dict.fromkeys((download_id, download_id.upper(), download_id.lower()))
         for candidate in variants:
             result = self.http.request(
@@ -52,6 +53,11 @@ class ArrClient:
                 query={"page": 1, "pageSize": 1000, "downloadId": candidate, "sortKey": "date", "sortDirection": "ascending"},
             )
             for record in result.get("records", result if isinstance(result, list) else []):
+                # Do not trust *Arr to apply the downloadId query. Some responses
+                # contain history for other releases of the same item, which must
+                # never be allowed to define this torrent's file ownership.
+                if str(record.get("downloadId") or "").casefold() != wanted:
+                    continue
                 identity = (record.get("id"), record.get("eventType"), record.get("date"), record.get("episodeId"), record.get("movieId"))
                 if identity not in seen:
                     seen.add(identity)
