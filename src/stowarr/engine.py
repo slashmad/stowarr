@@ -8,6 +8,7 @@ import secrets
 import shutil
 import threading
 import time
+import unicodedata
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -47,10 +48,18 @@ RELEASE_FOLDER_MARKERS = re.compile(
 )
 
 
+def normalized_title_text(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", value.casefold())
+        if not unicodedata.combining(character)
+    )
+
+
 def title_tokens(value: str) -> set[str]:
     return {
         token
-        for token in re.findall(r"[a-z0-9]+", value.casefold())
+        for token in re.findall(r"[a-z0-9]+", normalized_title_text(value))
         if len(token) >= 3 and token not in TITLE_STOPWORDS and not token.isdigit()
     }
 
@@ -68,11 +77,14 @@ def strong_release_matches_item(item: dict, candidate_name: str) -> bool:
     expected = {
         token
         for token in re.findall(
-            r"[a-z0-9]+", str(item.get("title") or "").casefold()
+            r"[a-z0-9]+",
+            normalized_title_text(str(item.get("title") or "")),
         )
         if len(token) >= 2 and token not in TITLE_STOPWORDS
     }
-    actual = set(re.findall(r"[a-z0-9]+", candidate_name.casefold()))
+    actual = set(re.findall(
+        r"[a-z0-9]+", normalized_title_text(candidate_name)
+    ))
     if not expected or not expected.issubset(actual):
         return False
     expected_year = int(item.get("year") or 0)
@@ -86,8 +98,12 @@ def strong_release_matches_item(item: dict, candidate_name: str) -> bool:
 
 def safe_restore_video_candidate(item_title: str, path: Path) -> bool:
     """Require file-level feature evidence before restoring missing Radarr media."""
-    file_tokens = set(re.findall(r"[a-z0-9]+", path.stem.casefold()))
-    parent_tokens = set(re.findall(r"[a-z0-9]+", path.parent.name.casefold()))
+    file_tokens = set(re.findall(
+        r"[a-z0-9]+", normalized_title_text(path.stem)
+    ))
+    parent_tokens = set(re.findall(
+        r"[a-z0-9]+", normalized_title_text(path.parent.name)
+    ))
     if NON_FEATURE_VIDEO_MARKERS & (file_tokens | parent_tokens):
         return False
     return strong_release_matches_item({"title": item_title}, path.name)

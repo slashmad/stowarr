@@ -62,6 +62,28 @@ class EngineTest(unittest.TestCase):
             strong_release_matches_item(item, "Crime.101.2025.2160p")
         )
 
+    def test_title_matching_normalizes_diacritics(self):
+        item = {"title": "Mōrgen Valley", "year": 2024}
+
+        self.assertTrue(
+            title_matches(
+                item["title"],
+                "Morgen.Valley.2024.S01E01.2160p",
+            )
+        )
+        self.assertTrue(
+            strong_release_matches_item(
+                item,
+                "Morgen.Valley.2024.S01.2160p",
+            )
+        )
+        self.assertFalse(
+            strong_release_matches_item(
+                item,
+                "Morning.Valley.2024.S01.2160p",
+            )
+        )
+
     def test_strong_release_match_excludes_unrelated_matrix_candidates(self):
         release = (
             "The.Matrix.1999.NORDiC.REMUX.2160p.DV.HDR.UHD-BluRay."
