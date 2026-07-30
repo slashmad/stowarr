@@ -8,6 +8,7 @@ import secrets
 import shutil
 import threading
 import time
+import unicodedata
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -36,6 +37,19 @@ NON_FEATURE_VIDEO_MARKERS = {
     "bonus", "bts", "deleted", "extra", "extras", "featurette", "featurettes",
     "interview", "sample", "samples", "teaser", "trailer", "trailers",
 }
+LATIN_TITLE_TRANSLITERATION = str.maketrans({
+    "æ": "ae",
+    "đ": "d",
+    "ð": "d",
+    "ħ": "h",
+    "ı": "i",
+    "ł": "l",
+    "ŋ": "n",
+    "œ": "oe",
+    "ø": "o",
+    "þ": "th",
+    "ŧ": "t",
+})
 SAFE_RECONCILE_AUDIT_STATUSES = {
     "root-mismatch", "missing-library-file", "hardlink-missing",
 }
@@ -47,19 +61,33 @@ RELEASE_FOLDER_MARKERS = re.compile(
 )
 
 
+def normalized_title_text(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(
+        character
+        for character in decomposed.translate(LATIN_TITLE_TRANSLITERATION)
+        if not unicodedata.combining(character)
+    )
+
+
 def title_tokens(value: str) -> set[str]:
     return {
         token
-        for token in re.findall(r"[a-z0-9]+", value.casefold())
+        for token in re.findall(r"[a-z0-9]+", normalized_title_text(value))
         if len(token) >= 3 and token not in TITLE_STOPWORDS and not token.isdigit()
     }
 
 
 def title_matches(item_title: str, *candidate_names: str) -> bool:
     expected = title_tokens(item_title)
+    normalized_candidates = normalized_title_text(" ".join(candidate_names))
     if not expected:
-        return True
-    actual = title_tokens(" ".join(candidate_names))
+        fallback = "".join(re.findall(
+            r"[a-z0-9]+", normalized_title_text(item_title)
+        ))
+        actual_tokens = set(re.findall(r"[a-z0-9]+", normalized_candidates))
+        return bool(fallback and fallback in actual_tokens)
+    actual = title_tokens(normalized_candidates)
     return bool(expected & actual)
 
 
@@ -68,11 +96,14 @@ def strong_release_matches_item(item: dict, candidate_name: str) -> bool:
     expected = {
         token
         for token in re.findall(
-            r"[a-z0-9]+", str(item.get("title") or "").casefold()
+            r"[a-z0-9]+",
+            normalized_title_text(str(item.get("title") or "")),
         )
         if len(token) >= 2 and token not in TITLE_STOPWORDS
     }
-    actual = set(re.findall(r"[a-z0-9]+", candidate_name.casefold()))
+    actual = set(re.findall(
+        r"[a-z0-9]+", normalized_title_text(candidate_name)
+    ))
     if not expected or not expected.issubset(actual):
         return False
     expected_year = int(item.get("year") or 0)
@@ -86,8 +117,12 @@ def strong_release_matches_item(item: dict, candidate_name: str) -> bool:
 
 def safe_restore_video_candidate(item_title: str, path: Path) -> bool:
     """Require file-level feature evidence before restoring missing Radarr media."""
-    file_tokens = set(re.findall(r"[a-z0-9]+", path.stem.casefold()))
-    parent_tokens = set(re.findall(r"[a-z0-9]+", path.parent.name.casefold()))
+    file_tokens = set(re.findall(
+        r"[a-z0-9]+", normalized_title_text(path.stem)
+    ))
+    parent_tokens = set(re.findall(
+        r"[a-z0-9]+", normalized_title_text(path.parent.name)
+    ))
     if NON_FEATURE_VIDEO_MARKERS & (file_tokens | parent_tokens):
         return False
     return strong_release_matches_item({"title": item_title}, path.name)
