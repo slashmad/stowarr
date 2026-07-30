@@ -926,8 +926,8 @@ function enhanceMoveRecovery(plan){
 async function inspectMove(hash,targetPool){
   const requestedHash=String(hash||'').trim();
   const requestedTarget=String(targetPool||'').trim();
-  const generation=++state.movePlanGeneration;
   navigate('move');
+  const generation=++state.movePlanGeneration;
   state.movePlan=null;
   $('#move-hash').value=requestedHash;
   $('#move-target').value=requestedTarget;
