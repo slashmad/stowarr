@@ -19,6 +19,7 @@ from stowarr.engine import (
     is_archive,
     release_folder_warning,
     safe_restore_video_candidate,
+    safe_sync_candidate,
     sha256,
     strong_release_matches_item,
     title_matches,
@@ -2739,6 +2740,9 @@ class EngineTest(unittest.TestCase):
                 "path": "/p3/anime/Dr. STONE", "seriesType": "anime",
             }],
         )}
+        manager._sonarr_sync_media_status = lambda torrent, item: (
+            "in-sync", "Every mapped episode hardlink agrees", [], 1
+        )
 
         audit = manager.sync_audit("sonarr")
 
@@ -2749,6 +2753,225 @@ class EngineTest(unittest.TestCase):
             {row["expected_root"] for row in audit["rows"]},
             {"/p3/anime"},
         )
+
+    def test_sonarr_sync_audit_checks_each_split_release_hardlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            download_root = root / "download"
+            series_root = root / "series"
+            specials_release = download_root / "Archer.S00"
+            season_release = download_root / "Archer.S01"
+            library_root = series_root / "Archer (2009)"
+            specials_video = specials_release / "Archer.S00E01.mkv"
+            season_video = season_release / "Archer.S01E01.mkv"
+            specials_library = library_root / "Season 00" / specials_video.name
+            season_library = library_root / "Season 01" / season_video.name
+            for path, content in (
+                (specials_video, b"linked-special"),
+                (season_video, b"copied-season"),
+            ):
+                path.parent.mkdir(parents=True)
+                path.write_bytes(content)
+            specials_library.parent.mkdir(parents=True)
+            os.link(specials_video, specials_library)
+            season_library.parent.mkdir(parents=True)
+            season_library.write_bytes(season_video.read_bytes())
+
+            pool = Pool(
+                "p1", root, (download_root,), root / "movies", series_root,
+                "radarr-p1", "sonarr-p1", "radarr-p1", "sonarr-p1",
+            )
+            torrents = [
+                {
+                    "hash": "SPECIALS", "name": "Archer.2009.S00",
+                    "category": "sonarr-p1", "save_path": str(specials_release),
+                },
+                {
+                    "hash": "SEASON1", "name": "Archer.2009.S01",
+                    "category": "sonarr-p1", "save_path": str(season_release),
+                },
+            ]
+            item = {
+                "id": 42, "title": "Archer",
+                "path": str(library_root), "seriesType": "standard",
+            }
+            library_by_hash = {
+                "SPECIALS": specials_library,
+                "SEASON1": season_library,
+            }
+            download_by_hash = {
+                "SPECIALS": specials_video,
+                "SEASON1": season_video,
+            }
+            manager = Stowarr.__new__(Stowarr)
+            manager.config = SimpleNamespace(
+                pools=(pool,),
+                pool_for_path=lambda path: pool,
+                pool_for_category=lambda category: (pool, "sonarr"),
+            )
+            manager.qbit = SimpleNamespace(
+                torrents=lambda: torrents,
+                categories=lambda: {
+                    "sonarr-p1": {"savePath": str(download_root)},
+                },
+                files=lambda torrent_hash: [{
+                    "name": download_by_hash[torrent_hash].name,
+                    "size": download_by_hash[torrent_hash].stat().st_size,
+                    "priority": 1,
+                }],
+            )
+
+            def mapping(torrent_hash):
+                library = library_by_hash[torrent_hash]
+                return {
+                    "app": "sonarr",
+                    "item": item,
+                    "history": [],
+                    "episodes": [{"id": 1}],
+                    "files": [{
+                        "id": 10,
+                        "path": str(library),
+                        "relativePath": str(library.relative_to(library_root)),
+                        "size": library.stat().st_size,
+                        "episodeIds": [1],
+                    }],
+                    "allFiles": [],
+                    "mappingComplete": True,
+                }
+
+            manager.arr = {"sonarr": SimpleNamespace(
+                root_folders=lambda: [{"path": str(series_root)}],
+                history_for_downloads=lambda hashes: {
+                    "specials": 42, "season1": 42,
+                },
+                all_items=lambda: [item],
+                download_mapping=mapping,
+            )}
+
+            audit = manager.sync_audit("sonarr")
+            by_hash = {row["hash"]: row for row in audit["rows"]}
+
+            self.assertEqual(by_hash["SPECIALS"]["status"], "in-sync")
+            self.assertFalse(by_hash["SPECIALS"]["safe_plan_candidate"])
+            self.assertEqual(by_hash["SEASON1"]["status"], "hardlink-missing")
+            self.assertTrue(by_hash["SEASON1"]["safe_plan_candidate"])
+            self.assertIn("not hash-verified", by_hash["SEASON1"]["reason"])
+            self.assertEqual(audit["in_sync"], 1)
+            self.assertEqual(audit["issues"], 1)
+
+    def test_sonarr_sync_audit_fails_closed_for_ambiguous_episode_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "download" / "Same.Size"
+            library_root = root / "series" / "Same Size"
+            library = library_root / "Season 01" / "Same.Size.S01E01.mkv"
+            candidates = [
+                release / "Same.Size.S01E01.mkv",
+                release / "Same.Size.S01E02.mkv",
+            ]
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b"same-size")
+            for candidate in candidates:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_bytes(b"same-size")
+            pool = Pool(
+                "p1", root, (root / "download",), root / "movies",
+                root / "series", "radarr-p1", "sonarr-p1",
+                "radarr-p1", "sonarr-p1",
+            )
+            torrent = {
+                "hash": "AMBIGUOUS", "name": "Same.Size.S01",
+                "category": "sonarr-p1", "save_path": str(release),
+            }
+            item = {"id": 7, "title": "Same Size", "path": str(library_root)}
+            manager = Stowarr.__new__(Stowarr)
+            manager.config = SimpleNamespace(
+                pools=(pool,),
+                pool_for_path=lambda path: pool,
+                pool_for_category=lambda category: (pool, "sonarr"),
+            )
+            manager.qbit = SimpleNamespace(
+                torrents=lambda: [torrent],
+                categories=lambda: {
+                    "sonarr-p1": {"savePath": str(root / "download")},
+                },
+                files=lambda torrent_hash: [{
+                    "name": candidate.name,
+                    "size": candidate.stat().st_size,
+                    "priority": 1,
+                } for candidate in candidates],
+            )
+            manager.arr = {"sonarr": SimpleNamespace(
+                root_folders=lambda: [{"path": str(root / "series")}],
+                history_for_downloads=lambda hashes: {"ambiguous": 7},
+                all_items=lambda: [item],
+                download_mapping=lambda torrent_hash: {
+                    "item": item,
+                    "files": [{
+                        "id": 70, "path": str(library),
+                        "relativePath": str(library.relative_to(library_root)),
+                        "size": library.stat().st_size,
+                        "episodeIds": [1],
+                    }],
+                    "mappingComplete": True,
+                },
+            )}
+
+            row = manager.sync_audit("sonarr")["rows"][0]
+
+            self.assertEqual(row["status"], "media-file-ambiguous")
+            self.assertFalse(row["safe_plan_candidate"])
+            self.assertEqual(
+                row["issues"][0]["code"],
+                "QBITTORRENT_MEDIA_CANDIDATE_AMBIGUOUS",
+            )
+
+    def test_sonarr_sync_audit_keeps_missing_episode_repair_manual(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "download" / "Missing"
+            torrent_file = release / "Missing.S01E01.mkv"
+            torrent_file.parent.mkdir(parents=True)
+            torrent_file.write_bytes(b"episode")
+            item = {
+                "id": 7,
+                "title": "Missing",
+                "path": str(root / "series" / "Missing"),
+            }
+            manager = Stowarr.__new__(Stowarr)
+            manager.qbit = SimpleNamespace(files=lambda torrent_hash: [{
+                "name": torrent_file.name,
+                "size": torrent_file.stat().st_size,
+                "priority": 1,
+            }])
+            manager.arr = {"sonarr": SimpleNamespace(
+                download_mapping=lambda torrent_hash: {
+                    "item": item,
+                    "files": [{
+                        "id": 70,
+                        "path": str(
+                            root / "series" / "Missing" / "Season 01"
+                            / torrent_file.name
+                        ),
+                        "relativePath": f"Season 01/{torrent_file.name}",
+                        "size": torrent_file.stat().st_size,
+                        "episodeIds": [1],
+                    }],
+                    "mappingComplete": True,
+                },
+            )}
+
+            status, _, issues, _ = manager._sonarr_sync_media_status(
+                {
+                    "hash": "MISSING",
+                    "save_path": str(release),
+                },
+                item,
+            )
+
+            self.assertEqual(status, "media-file-unmatched")
+            self.assertFalse(safe_sync_candidate({"status": status}))
+            self.assertEqual(issues[0]["code"], "ARR_MANAGED_MEDIA_MISSING")
 
     def test_sync_category_repair_revalidates_route_and_history(self):
         pool = Pool(

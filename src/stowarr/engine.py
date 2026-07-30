@@ -3016,6 +3016,176 @@ class Stowarr:
             ),
         )
 
+    def _sonarr_sync_media_status(
+        self, torrent: dict, item: dict
+    ) -> tuple[str, str, list[dict], int | None]:
+        mapping = self.arr["sonarr"].download_mapping(torrent["hash"])
+        if (
+            not mapping
+            or not mapping.get("mappingComplete")
+            or int((mapping.get("item") or {}).get("id", 0)) != int(item["id"])
+        ):
+            reason = (
+                "Sonarr does not provide a complete episode-to-file mapping "
+                "for this exact download"
+            )
+            return "media-file-unmatched", reason, [{
+                "code": "SONARR_DOWNLOAD_MAPPING_INCOMPLETE",
+                "summary": reason,
+                "action": (
+                    "Refresh or rescan the series in Sonarr, verify that this exact "
+                    "download is associated with every imported episode, then rerun "
+                    "the audit."
+                ),
+            }], None
+
+        managed_files = list(mapping.get("files") or [])
+        torrent_records = self.qbit.files(torrent["hash"])
+        selected_videos = [
+            (path, size)
+            for path, size in self._torrent_paths(torrent, torrent_records)
+            if path.suffix.casefold() in VIDEO_EXTENSIONS
+        ]
+        has_archives = any(
+            int(record.get("priority", 1)) > 0
+            and is_archive(Path(str(record.get("name") or "")))
+            for record in torrent_records
+        )
+        if not managed_files:
+            reason = (
+                "Sonarr does not report any managed episode file for this download"
+            )
+            return "media-file-unmatched", reason, [{
+                "code": "ARR_MANAGED_MEDIA_MISSING",
+                "summary": reason,
+                "action": (
+                    "Refresh or rescan the series in Sonarr and verify or manually "
+                    "import the missing episodes. Automatic Sonarr media restoration "
+                    "is not supported."
+                ),
+            }], 0
+
+        used: set[Path] = set()
+        linked = 0
+        separate = 0
+        missing = 0
+        ambiguous = 0
+        unmatched = 0
+        for record in managed_files:
+            recorded_path = str(record.get("path") or "")
+            relative = str(record.get("relativePath") or "")
+            library_path = Path(
+                recorded_path or str(Path(str(item.get("path") or "")) / relative)
+            )
+            recorded_size = int(record.get("size") or 0)
+            library_size = (
+                library_path.stat().st_size if library_path.is_file() else recorded_size
+            )
+            if not library_path.is_file():
+                missing += 1
+                continue
+            candidates = [
+                path for path, size in selected_videos
+                if path not in used and size == library_size and path.is_file()
+            ]
+            if not candidates:
+                unmatched += 1
+                continue
+            if len(candidates) > 1:
+                ambiguous += 1
+                continue
+            candidate = candidates[0]
+            used.add(candidate)
+            library_stat = library_path.stat()
+            torrent_stat = candidate.stat()
+            if (
+                library_stat.st_dev,
+                library_stat.st_ino,
+            ) == (
+                torrent_stat.st_dev,
+                torrent_stat.st_ino,
+            ):
+                linked += 1
+            else:
+                separate += 1
+
+        mapped_count = linked + separate
+        if missing:
+            reason = (
+                f"{missing} Sonarr-managed episode file"
+                f'{"s are" if missing != 1 else " is"} missing on disk'
+            )
+            return "media-file-unmatched", reason, [{
+                "code": "ARR_MANAGED_MEDIA_MISSING",
+                "summary": reason,
+                "action": (
+                    "Force recheck qBittorrent, refresh/rescan the series in Sonarr, "
+                    "and verify or manually import the missing episodes. Automatic "
+                    "Sonarr media restoration is not supported."
+                ),
+            }], mapped_count
+        if ambiguous:
+            reason = (
+                f"{ambiguous} Sonarr episode file"
+                f'{"s have" if ambiguous != 1 else " has"} multiple same-size '
+                "qBittorrent video candidates"
+            )
+            return "media-file-ambiguous", reason, [{
+                "code": "QBITTORRENT_MEDIA_CANDIDATE_AMBIGUOUS",
+                "summary": reason,
+                "action": (
+                    "Inspect the selected torrent files and Sonarr episode mapping. "
+                    "Stowarr will not choose between same-size candidates automatically."
+                ),
+            }], mapped_count
+        if unmatched:
+            if has_archives and not selected_videos:
+                return (
+                    "packed-media",
+                    (
+                        "Sonarr manages visible media derived from a packed "
+                        "qBittorrent download; hardlink identity is not applicable"
+                    ),
+                    [],
+                    mapped_count,
+                )
+            reason = (
+                f"{unmatched} Sonarr episode file"
+                f'{"s have" if unmatched != 1 else " has"} no same-size selected '
+                "qBittorrent video candidate"
+            )
+            return "media-file-unmatched", reason, [{
+                "code": "QBITTORRENT_MEDIA_CANDIDATE_MISSING",
+                "summary": reason,
+                "action": (
+                    "Force recheck qBittorrent and verify the exact Sonarr download "
+                    "association before attempting hardlink repair."
+                ),
+            }], mapped_count
+        if separate:
+            reason = (
+                f"{separate} Sonarr episode file"
+                f'{"s are" if separate != 1 else " is"} separate from the exact '
+                "qBittorrent file; content is not hash-verified yet"
+            )
+            return "hardlink-missing", reason, [{
+                "code": "LIBRARY_HARDLINK_MISSING",
+                "summary": reason,
+                "action": (
+                    "Build a Reconcile plan. Stowarr will hash-verify every exact "
+                    "candidate before replacing a library copy with a hardlink."
+                ),
+            }], mapped_count
+        return (
+            "in-sync",
+            (
+                "Hash, category, save path, Sonarr root and every mapped "
+                "episode hardlink agree"
+            ),
+            [],
+            mapped_count,
+        )
+
     def sync_audit(self, app: str) -> dict:
         if app not in self.arr:
             raise ValueError(f"Unsupported application: {app}")
@@ -3308,7 +3478,10 @@ class Stowarr:
                             ),
                         })
             else:
-                status, reason = "in-sync", "Hash, category, save path and *Arr root agree"
+                status, reason, media_issues, media_candidate_count = (
+                    self._sonarr_sync_media_status(torrent, item)
+                )
+                issues.extend(media_issues)
             rows.append({
                 "hash": torrent["hash"],
                 "torrent_name": torrent.get("name", ""),
