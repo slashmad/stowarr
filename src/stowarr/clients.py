@@ -241,6 +241,20 @@ class ArrClient:
         endpoint = "movie" if self.kind == "radarr" else "series"
         return self.http.request("GET", f"/api/v3/{endpoint}")
 
+    def managed_files(self, item: dict) -> list[dict]:
+        """Return the files currently owned by an exact *Arr library item."""
+        if self.kind == "sonarr":
+            return self.http.request(
+                "GET", "/api/v3/episodefile", query={"seriesId": item["id"]}
+            )
+        movie_file = item.get("movieFile") or {}
+        if not movie_file:
+            return []
+        path = movie_file.get("path")
+        if not path and movie_file.get("relativePath"):
+            path = f'{str(item.get("path") or "").rstrip("/")}/{movie_file["relativePath"]}'
+        return [{**movie_file, "path": path}] if path else []
+
     def history_for_downloads(self, download_ids: set[str], page_size: int = 250, max_pages: int = 40) -> dict[str, int]:
         """Resolve qBittorrent hashes to *Arr item ids using paged history."""
         key = "movieId" if self.kind == "radarr" else "seriesId"
@@ -300,6 +314,9 @@ class ArrClient:
             "/api/v3/command",
             body={"name": name, key: item_id},
         )
+        return self._wait_command(command, name, timeout)
+
+    def _wait_command(self, command: dict, name: str, timeout: int = 1800) -> dict:
         command_id = command.get("id")
         if not command_id:
             raise RuntimeError(f"{self.kind.capitalize()} did not return a command id for {name}")
@@ -313,6 +330,50 @@ class ArrClient:
                 raise RuntimeError(f"{self.kind.capitalize()} {name} failed: {current.get('message') or status}")
             time.sleep(2)
         raise RuntimeError(f"{self.kind.capitalize()} {name} exceeded {timeout} seconds")
+
+    def manual_import_preview(
+        self, path: str, download_id: str, series_id: int
+    ) -> list[dict]:
+        """Ask Sonarr to parse an exact download without importing it."""
+        if self.kind != "sonarr":
+            raise RuntimeError("Manual episode import is available only for Sonarr")
+        preview = self.http.request(
+            "GET",
+            "/api/v3/manualimport",
+            query={
+                "folder": path,
+                "downloadId": download_id,
+                "seriesId": series_id,
+                "filterExistingFiles": "true",
+            },
+        )
+        if preview:
+            return preview
+        # Sonarr returns no candidates when the download is no longer present in
+        # its live queue. Exact history still proves the series association, so
+        # retry the read-only parser with the same explicit series and path.
+        return self.http.request(
+            "GET",
+            "/api/v3/manualimport",
+            query={
+                "folder": path,
+                "seriesId": series_id,
+                "filterExistingFiles": "true",
+            },
+        )
+
+    def manual_import(self, files: list[dict], timeout: int = 1800) -> dict:
+        """Run a previously reviewed Sonarr manual-import selection as Copy."""
+        if self.kind != "sonarr":
+            raise RuntimeError("Manual episode import is available only for Sonarr")
+        command = self._mutate(
+            "import episode files",
+            self.http.request,
+            "POST",
+            "/api/v3/command",
+            body={"name": "ManualImport", "files": files, "importMode": "Copy"},
+        )
+        return self._wait_command(command, "ManualImport", timeout)
 
 
 class QBittorrentClient:

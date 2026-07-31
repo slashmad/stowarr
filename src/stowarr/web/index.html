@@ -35,6 +35,7 @@
         <button class="nav-item" data-page="overview" type="button"><svg class="icon"><use href="#icon-home"/></svg>Overview</button>
         <button class="nav-item" data-page="reconcile" type="button"><svg class="icon"><use href="#icon-reconcile"/></svg>Reconcile</button>
         <button class="nav-item" data-page="move" type="button"><svg class="icon"><use href="#icon-move"/></svg>Move</button>
+        <button class="nav-item" data-page="cleanup" type="button"><svg class="icon"><use href="#icon-search"/></svg>Cleanup</button>
         <button class="nav-item" data-page="queue" type="button"><svg class="icon"><use href="#icon-queue"/></svg>Queue <b id="queue-count"></b></button>
         <button class="nav-item" data-page="history" type="button"><svg class="icon"><use href="#icon-history"/></svg>History <b id="history-count"></b></button>
         <div class="nav-heading">System</div>
@@ -113,6 +114,17 @@
         </article>
         <div id="move-loading" class="loading hidden"><span></span>Building qBittorrent and library move plan…</div>
         <div id="move-result"></div>
+      </section>
+
+      <section id="cleanup" class="page">
+        <div class="page-title"><div><h1>Cleanup</h1><p>Inventory library folders against qBittorrent and *Arr ownership</p></div><span class="pill dry">Read only</span></div>
+        <article class="panel">
+          <div class="panel-head"><div><h2>Library folder inventory</h2><p>Ownership is proven by current *Arr paths and qBittorrent manifest paths or hardlink identity; names are never used as proof</p></div><button id="run-cleanup" class="primary compact" type="button">Scan library folders</button></div>
+          <div id="cleanup-summary" class="sync-summary"></div>
+          <div id="cleanup-loading" class="loading hidden"><span></span>Reading qBittorrent, *Arr, and configured library roots…</div>
+          <div id="cleanup-warning"></div>
+        </article>
+        <div id="cleanup-results"><article class="panel"><div class="empty">Run the inventory to list title folders and their contents. Cleanup will not remove or change anything.</div></article></div>
       </section>
 
       <section id="queue" class="page">

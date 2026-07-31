@@ -43,6 +43,23 @@ summary:focus-visible {
   box-shadow: var(--focus-ring);
 }
 
+.cleanup-folder { border-top: 1px solid var(--line); }
+.cleanup-folder > summary { display: flex; justify-content: space-between; gap: 18px; padding: 15px 20px; cursor: pointer; }
+.cleanup-folder > summary span { display: flex; align-items: center; gap: 11px; color: var(--muted); }
+.cleanup-folder > summary strong { color: var(--text); font-weight: 500; }
+.cleanup-folder.review > summary { border-left: 3px solid var(--amber); }
+.cleanup-folder-meta { display: grid; gap: 7px; padding: 13px 20px; background: #1d1f22; border-top: 1px solid var(--line); }
+.cleanup-folder-meta code { overflow-wrap: anywhere; color: #b7c2cb; }
+.cleanup-folder-meta small { color: var(--muted); }
+.badge.unowned, .badge.ambiguous { background: #843e3c; color: #ffd3d1; }
+.badge.qbit-only, .badge.qbittorrent-only { background: #805715; color: #ffd997; }
+.badge.arr-only, .badge.arr-managed, .badge.arr-content-only { background: #275f8e; color: #d4ecff; }
+.badge.both, .badge.qbittorrent, .badge.managed-content { background: #286b3a; color: #c9ffd5; }
+
+@media(max-width:720px) {
+  .cleanup-folder > summary { align-items: flex-start; flex-direction: column; }
+}
+
 .icon-library {
   position: absolute;
   width: 0;

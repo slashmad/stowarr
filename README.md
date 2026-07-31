@@ -27,18 +27,21 @@ file-content verification before changing anything.
 
 ## What it does
 
-Stowarr separates inspection, repair, and relocation into three workflows:
+Stowarr separates inspection, repair, relocation, and cleanup review into four workflows:
 
 | Workflow | Purpose | Changes qBittorrent save path |
 | --- | --- | --- |
 | **Sync** | Audit hashes, categories, save paths, pools, and *Arr library paths | No |
 | **Reconcile** | Repair a verified library path or hardlink on qBittorrent's current pool | No |
 | **Move** | Relocate torrent data through qBittorrent and rebuild the verified library on another pool | Yes |
+| **Cleanup** | Inventory title folders and contents against exact qBittorrent and *Arr ownership | No |
 
 Radarr movies are resolved through `downloadId → movieId → movieFile`. Sonarr
 downloads are resolved through `downloadId → seriesId/episodeId → episodeFile`.
-Incomplete or ambiguous mappings are blocked instead of being expanded to
-unrelated files.
+When Sonarr's managed episode mapping is missing, Stowarr can use Sonarr's
+read-only Manual Import preview to build an exact file-to-episode plan. Every
+selected video must have one unambiguous, rejection-free assignment; otherwise
+the import remains blocked.
 
 The WebUI also provides:
 
@@ -52,6 +55,13 @@ The WebUI also provides:
 - routing diagnostics for qBittorrent categories, *Arr download clients, tags,
   and root folders.
 
+Cleanup is a separate read-only inventory of every immediate title folder
+below the configured Radarr and Sonarr library roots. It classifies current
+*Arr item paths, managed media paths, selected qBittorrent manifest paths and
+their filesystem hardlink identities. Empty folders, qBittorrent-only folders,
+unowned folders, and unmanaged video files are highlighted for review. Names
+are never treated as ownership evidence, and Cleanup does not delete files.
+
 ## Safety by design
 
 - Fresh installations start in dry-run mode.
@@ -62,6 +72,9 @@ The WebUI also provides:
 - Reconcile never pauses or relocates torrent data.
 - Move owns the pause, qBittorrent relocation, recheck, and resume sequence.
 - Existing files with different content are never overwritten automatically.
+- Old-library metadata with a different current target is removed only when it
+  is explicitly selected in the reviewed plan, is non-video, is outside the
+  live qBittorrent manifest, and *Arr has verified the destination library.
 - Unknown hardlinks, ambiguous matches, and paths outside configured pools are
   blocked.
 - Cross-seed group migration is not automatic.
@@ -441,6 +454,8 @@ torrent manifest.
 | Torrent seeded directly from a library | Classify as Library-seeded | Preserve its path until an explicit, verified migration is requested |
 | Torrent sidecar | Hardlink from qBittorrent data | Existing targets must be identical |
 | Library or plugin sidecar | Optional verified copy | Source and temporary destination hashes must agree |
+| Missing Sonarr episode mapping | Sonarr Manual Import in Copy mode | Exact preview for every selected video, qBittorrent recheck, complete episode mapping, and device/inode hardlink identity |
+| Stale old-library metadata | Explicit unlink after verification | Non-video, inside the old root, outside qBittorrent ownership, existing target, and completed *Arr rescan |
 | Packed media already on the authoritative pool | Keep imported media | Validate qBittorrent and *Arr paths |
 | Packed media on another pool | Native verified re-extraction | Archive recheck, integrity test, isolated extraction, SHA-256 match, and completed *Arr rescan |
 | Competing sidecars | Block automatic overwrite | Explicit conflict resolution required |
@@ -525,9 +540,9 @@ with provenance and SBOM attestations.
 ## Versioning
 
 Stowarr follows Semantic Versioning. Prereleases use tags such as
-`v1.0.0-beta.4`, while the WebUI and API expose the corresponding product
-version `1.0.0-beta.4`. Python package metadata uses the PEP 440 equivalent
-`1.0.0b4`. Tagged builds are published to GHCR alongside commit-SHA images;
+`v1.0.0-beta.5`, while the WebUI and API expose the corresponding product
+version `1.0.0-beta.5`. Python package metadata uses the PEP 440 equivalent
+`1.0.0b5`. Tagged builds are published to GHCR alongside commit-SHA images;
 `latest` continues to track `main`.
 
 ## Project status
