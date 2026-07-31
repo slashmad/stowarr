@@ -188,14 +188,8 @@ def handler(manager: Stowarr):
                     self.send_json(200, {"events": manager.store.operation_events(operation_id)})
                 except (KeyError, ValueError) as error:
                     self.send_json(404, {"error": str(error)})
-            elif not manager.connections_ready and path.startswith(("/api/plan/", "/api/move/", "/api/qbittorrent/", "/api/routing/", "/api/sync/", "/api/cleanup/")):
+            elif not manager.connections_ready and path.startswith(("/api/plan/", "/api/move/", "/api/qbittorrent/", "/api/routing/", "/api/sync/")):
                 self.send_json(503, {"error": "Configure qBittorrent, Radarr, and Sonarr in Settings first"})
-            elif path == "/api/cleanup/inventory":
-                try:
-                    self.send_json(200, manager.cleanup_inventory())
-                except Exception as error:
-                    self.log_operation_error("cleanup inventory", error)
-                    self.send_json(409, {"error": str(error)})
             elif path.startswith("/api/plan/"):
                 self.send_json(200, manager.plan(path.rsplit("/", 1)[-1]).json())
             elif path.startswith("/api/move/plan/"):

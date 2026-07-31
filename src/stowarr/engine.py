@@ -52,7 +52,6 @@ LATIN_TITLE_TRANSLITERATION = str.maketrans({
 })
 SAFE_RECONCILE_AUDIT_STATUSES = {
     "root-mismatch", "missing-library-file", "hardlink-missing",
-    "sonarr-import-ready",
 }
 SYNC_HEALTHY_STATUSES = {"in-sync", "packed-media"}
 RELEASE_FOLDER_MARKERS = re.compile(
@@ -226,7 +225,6 @@ RECONCILE_UNCHANGED_PAIR_STATUSES = frozenset({
 })
 RECONCILE_ACTIONABLE_AUXILIARY_STATUSES = frozenset({
     "torrent-sidecar", "missing-target", "target-exists-same-size",
-    "stale-linked", "stale-target-conflict",
 })
 
 
@@ -247,7 +245,6 @@ class Plan:
     error_details: dict | None = None
     auxiliary_files: list[AuxiliaryFile] | None = None
     managed_files: list[dict] | None = None
-    sonarr_import_files: list[dict] | None = None
 
     def json(self) -> dict:
         return {
@@ -255,7 +252,6 @@ class Plan:
             "pairs": [asdict(pair) for pair in self.pairs],
             "auxiliary_files": [asdict(item) for item in (self.auxiliary_files or [])],
             "managed_files": self.managed_files or [],
-            "sonarr_import_files": self.sonarr_import_files or [],
         }
 
 
@@ -1129,7 +1125,7 @@ class Stowarr:
         pending_root_change = bool(
             current_item and target_item and current_item != target_item
         )
-        return bool(plan.get("sonarr_import_files")) or pending_root_change or any(
+        return pending_root_change or any(
             pair.get("status") not in RECONCILE_UNCHANGED_PAIR_STATUSES
             for pair in plan.get("pairs", [])
         )
@@ -1315,145 +1311,6 @@ class Stowarr:
             ):
                 result.append((path, int(item["size"])))
         return result
-
-    def _sonarr_import_candidates(
-        self,
-        torrent_hash: str,
-        torrent: dict,
-        torrent_files: list[dict],
-        item: dict,
-    ) -> tuple[list[dict], str | None, dict]:
-        """Build a fail-closed Sonarr Manual Import selection from its preview."""
-        videos = self._torrent_paths(torrent, torrent_files)
-        evidence = {
-            "selected_video_count": len(videos),
-            "selected_video_paths": [str(path) for path, _ in videos],
-        }
-        if not videos:
-            return [], "The selected torrent contains no direct episode videos", evidence
-        if any(
-            int(record.get("priority", 1)) > 0
-            and is_archive(Path(str(record.get("name") or "")))
-            for record in torrent_files
-        ):
-            return [], "Sonarr-assisted restoration does not import archive content", evidence
-        preview_method = getattr(self.arr["sonarr"], "manual_import_preview", None)
-        if not callable(preview_method):
-            return [], "This Sonarr client cannot preview manual imports", evidence
-        content_path = str(torrent.get("content_path") or "")
-        if not content_path:
-            content_path = str(videos[0][0] if len(videos) == 1 else torrent["save_path"])
-        preview = preview_method(content_path, torrent_hash, int(item["id"]))
-        by_path: dict[str, list[dict]] = {}
-        for candidate in preview:
-            by_path.setdefault(str(candidate.get("path") or ""), []).append(candidate)
-        imports: list[dict] = []
-        used_episodes: set[int] = set()
-        problems: list[dict] = []
-        for path, size in videos:
-            matches = by_path.get(str(path), [])
-            if len(matches) != 1:
-                problems.append({
-                    "path": str(path),
-                    "reason": f"Sonarr returned {len(matches)} preview candidates",
-                })
-                continue
-            candidate = matches[0]
-            series = candidate.get("series") or {}
-            episodes = candidate.get("episodes") or []
-            episode_ids = sorted({
-                int(episode["id"]) for episode in episodes if episode.get("id")
-            })
-            rejections = candidate.get("rejections") or []
-            candidate_size = int(candidate.get("size") or 0)
-            if int(series.get("id") or 0) != int(item["id"]):
-                problems.append({"path": str(path), "reason": "Series does not match"})
-            elif candidate_size != size:
-                problems.append({"path": str(path), "reason": "File size changed"})
-            elif not episode_ids:
-                problems.append({"path": str(path), "reason": "No episodes were identified"})
-            elif not candidate.get("quality"):
-                problems.append({"path": str(path), "reason": "Quality was not identified"})
-            elif rejections:
-                problems.append({
-                    "path": str(path),
-                    "reason": "Sonarr rejected the import candidate",
-                    "rejections": [
-                        str(entry.get("reason") or entry.get("message") or entry)
-                        for entry in rejections
-                    ],
-                })
-            elif used_episodes.intersection(episode_ids):
-                problems.append({
-                    "path": str(path),
-                    "reason": "An episode is assigned to more than one file",
-                })
-            else:
-                used_episodes.update(episode_ids)
-                imports.append({
-                    "path": str(path),
-                    "folderName": candidate.get("folderName"),
-                    "seriesId": int(item["id"]),
-                    "episodeIds": episode_ids,
-                    "quality": candidate.get("quality"),
-                    "languages": candidate.get("languages") or [],
-                    "releaseGroup": candidate.get("releaseGroup") or "",
-                    "indexerFlags": int(candidate.get("indexerFlags") or 0),
-                    "releaseType": candidate.get("releaseType") or "unknown",
-                    "downloadId": torrent_hash,
-                    "size": size,
-                })
-        evidence.update({
-            "preview_count": len(preview),
-            "import_count": len(imports),
-            "problems": problems,
-        })
-        if problems or len(imports) != len(videos):
-            return [], "Sonarr did not provide one safe episode assignment for every selected video", evidence
-        return imports, None, evidence
-
-    @staticmethod
-    def _verify_sonarr_imports(
-        imports: list[dict], mapping: dict | None, series_id: int
-    ) -> None:
-        if (
-            not mapping
-            or not mapping.get("mappingComplete")
-            or int((mapping.get("item") or {}).get("id") or 0) != series_id
-        ):
-            raise RuntimeError(
-                "Sonarr did not report a complete episode mapping after import"
-            )
-        available = list(mapping.get("files") or [])
-        used_ids: set[int] = set()
-        for expected in imports:
-            episode_ids = {int(value) for value in expected["episodeIds"]}
-            candidates = [
-                record for record in available
-                if int(record.get("id") or 0) not in used_ids
-                and {int(value) for value in record.get("episodeIds") or []}
-                == episode_ids
-                and int(record.get("size") or 0) == int(expected["size"])
-            ]
-            if len(candidates) != 1:
-                raise RuntimeError(
-                    "Sonarr did not confirm one imported file for the planned episodes"
-                )
-            record = candidates[0]
-            source = Path(expected["path"])
-            target = Path(str(record.get("path") or ""))
-            if not source.is_file() or not target.is_file():
-                raise RuntimeError("A Sonarr import source or destination is missing")
-            source_stat, target_stat = source.stat(), target.stat()
-            if (
-                source_stat.st_size != int(expected["size"])
-                or (source_stat.st_dev, source_stat.st_ino)
-                != (target_stat.st_dev, target_stat.st_ino)
-            ):
-                raise RuntimeError(
-                    "Sonarr imported an episode as a separate copy instead of a hardlink"
-                )
-            used_ids.add(int(record["id"]))
 
     @staticmethod
     def _torrent_sidecars(torrent: dict, files: list[dict], target_item: Path) -> list[AuxiliaryFile]:
@@ -2820,77 +2677,16 @@ class Stowarr:
                     },
                 )
         if app == "sonarr" and not mapping.get("mappingComplete"):
-            try:
-                target_item = self._target_item_path(item, pool, app)
-            except RuntimeError as error:
-                return Plan(
-                    torrent_hash, torrent["name"], app, pool.name, item["id"],
-                    item.get("title"), item.get("path"), None, [], "blocked",
-                    str(error), "SONARR_ROOT_ROUTE_UNAVAILABLE",
-                )
-            current_item = Path(str(item.get("path") or ""))
-            if current_item != target_item:
-                return Plan(
-                    torrent_hash, torrent["name"], app, pool.name, item["id"],
-                    item.get("title"), item.get("path"), str(target_item), [],
-                    "blocked",
-                    "Sonarr cannot restore a partial download while the series root is on another pool",
-                    "SONARR_IMPORT_REQUIRES_CURRENT_SERIES_POOL",
-                    {
-                        "series_id": item["id"],
-                        "action": (
-                            "Move the qBittorrent release back to the series' current pool, "
-                            "then build the Reconcile plan again."
-                        ),
-                    },
-                )
-            video_names = [
-                path.name for path, _ in self._torrent_paths(torrent, torrent_records)
-            ]
-            if not title_matches(item.get("title", ""), torrent["name"], *video_names):
-                return Plan(
-                    torrent_hash, torrent["name"], app, pool.name, item["id"],
-                    item.get("title"), item.get("path"), str(target_item), [],
-                    "blocked",
-                    "The Sonarr series title does not match this download or its video filenames",
-                    "ARR_DOWNLOAD_TITLE_MISMATCH",
-                    {
-                        "series_id": item["id"],
-                        "action": "Verify the exact download association in Sonarr, then try again.",
-                    },
-                )
-            imports, import_error, import_evidence = self._sonarr_import_candidates(
-                torrent_hash, torrent, torrent_records, item
-            )
-            if not import_error:
-                return Plan(
-                    torrent_hash=torrent_hash,
-                    torrent_name=torrent["name"],
-                    app=app,
-                    target_pool=pool.name,
-                    item_id=int(item["id"]),
-                    item_title=item.get("title"),
-                    current_item_path=item.get("path"),
-                    target_item_path=str(target_item),
-                    pairs=[],
-                    status="ready",
-                    reason="Sonarr can safely import every selected episode file",
-                    sonarr_import_files=imports,
-                )
             return Plan(
                 torrent_hash, torrent["name"], app, pool.name, item["id"], item.get("title"),
-                item.get("path"), str(target_item), [], "blocked",
-                import_error or "Sonarr history does not provide a complete episode-to-file mapping for this download",
-                "SONARR_IMPORT_PREVIEW_INCOMPLETE",
+                item.get("path"), None, [], "blocked",
+                "Sonarr history does not provide a complete episode-to-file mapping for this download",
+                "SONARR_DOWNLOAD_MAPPING_INCOMPLETE",
                 {
                     "series_id": item["id"],
                     "episode_ids": [episode["id"] for episode in mapping.get("episodes", [])],
                     "episode_file_ids": [record["id"] for record in mapping.get("files", [])],
-                    **import_evidence,
-                    "action": (
-                        "Review the rejected or unidentified files in Sonarr. Stowarr will "
-                        "enable import only when every selected video has one unambiguous episode assignment."
-                    ),
+                    "action": "Refresh or rescan the series in Sonarr, then analyze the torrent again.",
                 },
             )
         folder_warning = release_folder_warning(item, torrent["name"], app)
@@ -3213,19 +3009,15 @@ class Stowarr:
                         source_stat.st_dev,
                         source_stat.st_ino,
                     ):
-                        status = "stale-linked"
+                        status = "linked"
                     elif target_stat.st_size == source_stat.st_size:
                         status = "target-exists-same-size"
                     else:
-                        status = "stale-target-conflict"
+                        status = "target-conflict"
                 auxiliary_files.append(
                     AuxiliaryFile(
                         str(source), str(target), source.stat().st_size, status,
-                        "library",
-                        "delete" if status in {
-                            "stale-linked", "stale-target-conflict"
-                        } else "copy",
-                        sidecar_kind(source),
+                        "library", "copy", sidecar_kind(source),
                     )
                 )
         return Plan(
@@ -3265,6 +3057,7 @@ class Stowarr:
         mapping = self.arr["sonarr"].download_mapping(torrent["hash"])
         if (
             not mapping
+            or not mapping.get("mappingComplete")
             or int((mapping.get("item") or {}).get("id", 0)) != int(item["id"])
         ):
             reason = (
@@ -3279,37 +3072,6 @@ class Stowarr:
                     "download is associated with every imported episode, then rerun "
                     "the audit."
                 ),
-            }], None
-
-        if not mapping.get("mappingComplete"):
-            imports, import_error, evidence = self._sonarr_import_candidates(
-                torrent["hash"], torrent, self.qbit.files(torrent["hash"]), item
-            )
-            if not import_error:
-                reason = (
-                    f"Sonarr can safely import {len(imports)} selected episode "
-                    f"file{'s' if len(imports) != 1 else ''} from qBittorrent"
-                )
-                return "sonarr-import-ready", reason, [{
-                    "code": "SONARR_IMPORT_READY",
-                    "summary": reason,
-                    "action": (
-                        "Open Reconcile to review the exact file-to-episode assignments. "
-                        "Stowarr will use Sonarr Copy import and require hardlink identity."
-                    ),
-                }], len(imports)
-            reason = (
-                "Sonarr does not provide a complete episode-to-file mapping "
-                "and its import preview is not safe for this exact download"
-            )
-            return "media-file-unmatched", reason, [{
-                "code": "SONARR_IMPORT_PREVIEW_INCOMPLETE",
-                "summary": reason,
-                "action": (
-                    "Review the unidentified or rejected files in Sonarr, then rerun "
-                    "the audit. Every selected video needs one episode assignment."
-                ),
-                "evidence": evidence,
             }], None
 
         managed_files = list(mapping.get("files") or [])
@@ -3458,297 +3220,6 @@ class Stowarr:
             [],
             mapped_count,
         )
-
-    @staticmethod
-    def _inventory_path(value: str | Path) -> str:
-        return os.path.normpath(str(value))
-
-    def cleanup_inventory(self) -> dict:
-        """Inventory library folders using exact qBit and *Arr ownership only."""
-        if not self.connections_ready:
-            raise RuntimeError(
-                "Configure qBittorrent, Radarr, and Sonarr before running Cleanup"
-            )
-
-        arr_items_by_path: dict[str, list[dict]] = {}
-        arr_files_by_path: dict[str, list[dict]] = {}
-        warnings: list[dict] = []
-        for app, client in self.arr.items():
-            try:
-                items = client.all_items()
-            except Exception as error:
-                warnings.append({"source": app, "error": str(error)})
-                continue
-            for item in items:
-                item_path = str(item.get("path") or "")
-                if not item_path:
-                    continue
-                owner = {
-                    "app": app,
-                    "id": item.get("id"),
-                    "title": item.get("title") or "",
-                    "path": item_path,
-                }
-                arr_items_by_path.setdefault(
-                    self._inventory_path(item_path), []
-                ).append(owner)
-                try:
-                    managed_files = client.managed_files(item)
-                except Exception as error:
-                    warnings.append({
-                        "source": app,
-                        "item_id": item.get("id"),
-                        "error": str(error),
-                    })
-                    continue
-                for managed_file in managed_files:
-                    file_path = str(managed_file.get("path") or "")
-                    if file_path:
-                        arr_files_by_path.setdefault(
-                            self._inventory_path(file_path), []
-                        ).append(owner)
-
-        qbit_files_by_path: dict[str, list[dict]] = {}
-        qbit_files_by_identity: dict[tuple[int, int], list[dict]] = {}
-        torrents = self.qbit.torrents()
-        for torrent in torrents:
-            torrent_hash = str(torrent.get("hash") or "").casefold()
-            save_path = str(torrent.get("save_path") or "")
-            if not torrent_hash or not save_path:
-                continue
-            try:
-                records = self.qbit.files(torrent_hash)
-            except Exception as error:
-                warnings.append({
-                    "source": "qbittorrent", "hash": torrent_hash,
-                    "error": str(error),
-                })
-                continue
-            owner = {
-                "hash": torrent_hash,
-                "name": torrent.get("name") or "",
-                "save_path": save_path,
-            }
-            for record in records:
-                if int(record.get("priority", 1)) <= 0 or not record.get("name"):
-                    continue
-                file_path = self._inventory_path(
-                    Path(save_path) / str(record["name"])
-                )
-                qbit_files_by_path.setdefault(file_path, []).append(owner)
-                try:
-                    file_stat = Path(file_path).stat()
-                except OSError as error:
-                    warnings.append({
-                        "source": "qbittorrent",
-                        "hash": torrent_hash,
-                        "path": file_path,
-                        "error": str(error),
-                    })
-                    continue
-                qbit_files_by_identity.setdefault(
-                    (file_stat.st_dev, file_stat.st_ino), []
-                ).append(owner)
-
-        roots: list[tuple[Pool, str, Path]] = []
-        for pool in self.config.pools:
-            for app in self.arr:
-                roots.extend(
-                    (pool, app, root)
-                    for root in self._pool_library_roots(app, pool)
-                )
-        roots.sort(key=lambda value: len(value[2].parts), reverse=True)
-        library_root_paths = {
-            self._inventory_path(root) for _, _, root in roots
-        }
-
-        seen_folders: set[str] = set()
-        root_rows = []
-        all_folders = []
-        for pool, app, root in roots:
-            root_result = {
-                "pool": pool.name,
-                "app": app,
-                "path": str(root),
-                "state": "available" if root.is_dir() else "missing",
-                "folders": [],
-            }
-            if not root.is_dir():
-                warnings.append({
-                    "source": "filesystem", "path": str(root),
-                    "error": "Configured library root is missing or is not a directory",
-                })
-                root_rows.append(root_result)
-                continue
-            try:
-                children = sorted(
-                    (
-                        Path(entry.path) for entry in os.scandir(root)
-                        if entry.is_dir(follow_symlinks=False)
-                    ),
-                    key=lambda path: path.name.casefold(),
-                )
-            except OSError as error:
-                root_result["state"] = "unreadable"
-                root_result["error"] = str(error)
-                warnings.append({
-                    "source": "filesystem", "path": str(root),
-                    "error": str(error),
-                })
-                root_rows.append(root_result)
-                continue
-            for folder in children:
-                folder_key = self._inventory_path(folder)
-                if folder_key in library_root_paths:
-                    continue
-                if folder_key in seen_folders:
-                    continue
-                seen_folders.add(folder_key)
-                item_owners = arr_items_by_path.get(folder_key, [])
-                contents = []
-                counts = {
-                    "files": 0, "directories": 0, "bytes": 0,
-                    "arr_managed": 0, "qbittorrent": 0, "both": 0,
-                    "unowned": 0, "unmanaged_video": 0,
-                }
-                for current, directory_names, file_names in os.walk(
-                    folder,
-                    followlinks=False,
-                    onerror=lambda error: warnings.append({
-                        "source": "filesystem",
-                        "path": str(error.filename or folder),
-                        "error": str(error),
-                    }),
-                ):
-                    current_path = Path(current)
-                    symlink_directories = [
-                        name for name in directory_names
-                        if (current_path / name).is_symlink()
-                    ]
-                    directory_names[:] = [
-                        name for name in directory_names
-                        if name not in symlink_directories
-                    ]
-                    counts["directories"] += len(directory_names)
-                    entries = [
-                        (
-                            name,
-                            "symlink" if (current_path / name).is_symlink()
-                            else "file",
-                        )
-                        for name in file_names
-                    ]
-                    entries.extend((name, "symlink") for name in symlink_directories)
-                    if not directory_names and not entries and current_path != folder:
-                        contents.append({
-                            "path": str(current_path.relative_to(folder)),
-                            "kind": "empty-directory", "size": 0,
-                            "ownership": "unowned", "arr": [], "torrents": [],
-                        })
-                    for name, kind in entries:
-                        path = current_path / name
-                        path_key = self._inventory_path(path)
-                        arr_owners = arr_files_by_path.get(path_key, [])
-                        qbit_owners = list(qbit_files_by_path.get(path_key, []))
-                        if kind == "file":
-                            try:
-                                file_stat = path.stat()
-                            except OSError:
-                                file_stat = None
-                            if file_stat:
-                                for owner in qbit_files_by_identity.get(
-                                    (file_stat.st_dev, file_stat.st_ino), []
-                                ):
-                                    if owner not in qbit_owners:
-                                        qbit_owners.append(owner)
-                        ownership = (
-                            "both" if arr_owners and qbit_owners
-                            else "arr-managed" if arr_owners
-                            else "qbittorrent" if qbit_owners
-                            else "unowned"
-                        )
-                        try:
-                            size = path.lstat().st_size
-                        except OSError:
-                            size = 0
-                        counts["files"] += 1
-                        counts["bytes"] += size
-                        if arr_owners:
-                            counts["arr_managed"] += 1
-                        if qbit_owners:
-                            counts["qbittorrent"] += 1
-                        if arr_owners and qbit_owners:
-                            counts["both"] += 1
-                        if ownership == "unowned":
-                            counts["unowned"] += 1
-                            if path.suffix.casefold() in VIDEO_EXTENSIONS:
-                                counts["unmanaged_video"] += 1
-                        contents.append({
-                            "path": str(path.relative_to(folder)),
-                            "kind": kind,
-                            "size": size,
-                            "ownership": ownership,
-                            "arr": arr_owners,
-                            "torrents": qbit_owners,
-                        })
-                qbit_owners = {
-                    (owner["hash"], owner["name"], owner["save_path"])
-                    for entry in contents for owner in entry["torrents"]
-                }
-                if len(item_owners) > 1:
-                    status = "ambiguous"
-                elif item_owners and qbit_owners:
-                    status = "both"
-                elif item_owners:
-                    status = "arr-only"
-                elif counts["arr_managed"] and qbit_owners:
-                    status = "managed-content"
-                elif counts["arr_managed"]:
-                    status = "arr-content-only"
-                elif qbit_owners:
-                    status = "qbittorrent-only"
-                else:
-                    status = "unowned"
-                row = {
-                    "pool": pool.name,
-                    "app": app,
-                    "root": str(root),
-                    "path": str(folder),
-                    "name": folder.name,
-                    "status": status,
-                    "review_recommended": bool(
-                        status in {"ambiguous", "qbittorrent-only", "unowned"}
-                        or counts["unmanaged_video"]
-                    ),
-                    "arr_items": item_owners,
-                    "torrents": [
-                        {"hash": value[0], "name": value[1], "save_path": value[2]}
-                        for value in sorted(qbit_owners)
-                    ],
-                    "counts": counts,
-                    "contents": contents,
-                }
-                root_result["folders"].append(row)
-                all_folders.append(row)
-            root_rows.append(root_result)
-
-        status_counts: dict[str, int] = {}
-        for folder in all_folders:
-            status_counts[folder["status"]] = status_counts.get(folder["status"], 0) + 1
-        return {
-            "mode": "read-only",
-            "ownership": "exact-path",
-            "complete": not warnings,
-            "warnings": warnings,
-            "summary": {
-                "folders": len(all_folders),
-                "review_recommended": sum(
-                    bool(folder["review_recommended"]) for folder in all_folders
-                ),
-                "statuses": status_counts,
-            },
-            "roots": root_rows,
-        }
 
     def sync_audit(self, app: str) -> dict:
         if app not in self.arr:
@@ -4209,32 +3680,6 @@ class Stowarr:
                             "error_code": plan.get("error_code"),
                         })
                     else:
-                        cleanup_files = sorted({
-                            item["source"]
-                            for item in plan.get("auxiliary_files", [])
-                            if item.get("operation") == "delete"
-                        })
-                        if cleanup_files:
-                            manual.append({
-                                "hash": row["hash"],
-                                "torrent_name": row["torrent_name"],
-                                "status": row["status"],
-                                "reason": (
-                                    f"{len(cleanup_files)} stale metadata cleanup "
-                                    "actions require exact manual review"
-                                ),
-                                "error_code": "STALE_METADATA_REVIEW_REQUIRED",
-                            })
-                            if progress:
-                                progress({
-                                    "stage": "reconciles", "current": index,
-                                    "total": reconcile_total,
-                                    "message": (
-                                        f"Built {index} of {reconcile_total} fresh "
-                                        f"Reconcile plans · {row['torrent_name']}"
-                                    ),
-                                })
-                            continue
                         auxiliary_files = sorted({
                             item["source"]
                             for item in plan.get("auxiliary_files", [])
@@ -4974,12 +4419,10 @@ class Stowarr:
 
         created: list[Path] = []
         copied_auxiliary: list[tuple[Path, Path]] = []
-        stale_auxiliary: list[Path] = []
         try:
-            sonarr_imports = list(plan.sonarr_import_files or [])
             restores_missing_library = any(
                 pair.status == "missing-library" for pair in plan.pairs
-            ) or bool(sonarr_imports)
+            )
             if restores_missing_library:
                 if progress_callback:
                     progress_callback(
@@ -5043,10 +4486,6 @@ class Stowarr:
                     if pair.status == "missing-library"
                 }
                 required_sources.update({
-                    str(item["path"]): int(item["size"])
-                    for item in sonarr_imports
-                })
-                required_sources.update({
                     item.source: item.size
                     for item in plan.auxiliary_files or []
                     if (
@@ -5062,32 +4501,6 @@ class Stowarr:
                     raise RuntimeError(
                         "One or more selected qBittorrent files changed during "
                         "missing-media verification"
-                    )
-            if sonarr_imports:
-                if progress_callback:
-                    progress_callback(
-                        "RECONCILE_SONARR_IMPORTING",
-                        0,
-                        total_files=len(sonarr_imports),
-                        message="Sonarr is importing the reviewed episode assignments",
-                    )
-                command_files = [
-                    {key: value for key, value in item.items() if key != "size"}
-                    for item in sonarr_imports
-                ]
-                self.arr["sonarr"].manual_import(command_files)
-                imported_mapping = self.arr["sonarr"].download_mapping(torrent_hash)
-                self._verify_sonarr_imports(
-                    sonarr_imports, imported_mapping, int(plan.item_id or 0)
-                )
-                mapping_hint = imported_mapping
-                if progress_callback:
-                    progress_callback(
-                        "RECONCILE_SONARR_IMPORTING",
-                        100,
-                        completed_files=len(sonarr_imports),
-                        total_files=len(sonarr_imports),
-                        message="Sonarr import and hardlink identity verified",
                     )
             pair_total = max(len(plan.pairs), 1)
             for pair_index, pair in enumerate(plan.pairs):
@@ -5229,63 +4642,9 @@ class Stowarr:
                                       message="Created verified library file")
             self.store.update(operation_id, state_name("LINKED", "MOVE_LIBRARY_LINKED"), plan.json())
             if selected_auxiliary:
-                cleanup_selected = any(
-                    item.source in selected_auxiliary and item.operation == "delete"
-                    for item in plan.auxiliary_files or []
-                )
-                live_manifest: set[str] = set()
-                if cleanup_selected:
-                    live_torrent = self.qbit.torrent(torrent_hash)
-                    if not live_torrent:
-                        raise RuntimeError(
-                            "The qBittorrent torrent disappeared before cleanup"
-                        )
-                    live_manifest = {
-                        str(Path(live_torrent["save_path"]) / record["name"])
-                        for record in self.qbit.files(torrent_hash)
-                        if int(record.get("priority", 1)) > 0
-                    }
                 for item in plan.auxiliary_files or []:
                     source, target = Path(item.source), Path(item.target)
                     if item.source not in selected_auxiliary:
-                        continue
-                    if item.operation == "delete":
-                        old_root = Path(plan.current_item_path or "")
-                        target_root = Path(plan.target_item_path or "")
-                        try:
-                            source.relative_to(old_root)
-                            target.relative_to(target_root)
-                        except ValueError as error:
-                            raise RuntimeError(
-                                "Stale metadata cleanup escaped a planned library root"
-                            ) from error
-                        if (
-                            item.origin != "library"
-                            or source.suffix.casefold() in VIDEO_EXTENSIONS
-                            or not source.is_file()
-                            or not target.is_file()
-                            or str(source) in live_manifest
-                        ):
-                            raise RuntimeError(
-                                f"Stale library metadata changed before cleanup: {source}"
-                            )
-                        source_stat, target_stat = source.stat(), target.stat()
-                        same_file = (
-                            source_stat.st_dev, source_stat.st_ino
-                        ) == (
-                            target_stat.st_dev, target_stat.st_ino
-                        )
-                        if item.status == "stale-linked" and not same_file:
-                            raise RuntimeError(
-                                f"Stale linked metadata changed before cleanup: {source}"
-                            )
-                        if item.status == "stale-target-conflict" and (
-                            same_file or source_stat.st_size == target_stat.st_size
-                        ):
-                            raise RuntimeError(
-                                f"Stale conflicting metadata changed before cleanup: {source}"
-                            )
-                        stale_auxiliary.append(source)
                         continue
                     if item.origin == "qbittorrent":
                         if target.exists():
@@ -5351,10 +4710,6 @@ class Stowarr:
                     refreshed = resolver(expected_paths)
             refreshed_files = {record.get("id"): Path(record.get("path", "")) for record in (refreshed or {}).get("files", [])}
             refreshed_paths = set(refreshed_files.values())
-            if sonarr_imports:
-                self._verify_sonarr_imports(
-                    sonarr_imports, refreshed, int(plan.item_id or 0)
-                )
             for record in plan.managed_files or []:
                 expected = Path(plan.target_item_path or "") / record["relativePath"]
                 confirmed = (
@@ -5371,9 +4726,6 @@ class Stowarr:
                 if source != target and source.exists():
                     self._filesystem().unlink(source)
             for source, _ in copied_auxiliary:
-                if source.exists():
-                    self._filesystem().unlink(source)
-            for source in stale_auxiliary:
                 if source.exists():
                     self._filesystem().unlink(source)
             old_root = Path(plan.current_item_path) if plan.current_item_path else None
