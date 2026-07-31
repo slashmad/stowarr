@@ -25,6 +25,81 @@ class FakeHttp:
 
 
 class ArrClientTest(unittest.TestCase):
+    def test_sonarr_managed_files_reads_current_episode_files(self):
+        class EpisodeFileHttp:
+            def request(self, method, path, query=None, **kwargs):
+                self.requested = (method, path, query)
+                return [{"id": 70, "path": "/series/Masked/episode.mkv"}]
+
+        client = ArrClient(Service("http://unused", api_key="unused"), "sonarr")
+        client.http = EpisodeFileHttp()
+
+        result = client.managed_files({"id": 7})
+
+        self.assertEqual(result[0]["id"], 70)
+        self.assertEqual(
+            client.http.requested,
+            ("GET", "/api/v3/episodefile", {"seriesId": 7}),
+        )
+
+    def test_radarr_managed_files_builds_path_from_relative_path(self):
+        client = ArrClient(Service("http://unused", api_key="unused"), "radarr")
+
+        result = client.managed_files({
+            "id": 4,
+            "path": "/movies/Masked",
+            "movieFile": {"id": 40, "relativePath": "Masked.mkv"},
+        })
+
+        self.assertEqual(result[0]["path"], "/movies/Masked/Masked.mkv")
+
+    def test_sonarr_manual_import_preview_falls_back_to_exact_series_path(self):
+        class ManualImportHttp:
+            def __init__(self):
+                self.queries = []
+
+            def request(self, method, path, query=None, **kwargs):
+                self.queries.append(query)
+                if query.get("downloadId"):
+                    return []
+                return [{"path": "/downloads/Series.S01E01.mkv"}]
+
+        client = ArrClient(Service("http://unused", api_key="unused"), "sonarr")
+        client.http = ManualImportHttp()
+
+        result = client.manual_import_preview("/downloads/Series", "HASH", 7)
+
+        self.assertEqual(result[0]["path"], "/downloads/Series.S01E01.mkv")
+        self.assertEqual(client.http.queries[0]["downloadId"], "HASH")
+        self.assertNotIn("downloadId", client.http.queries[1])
+        self.assertEqual(client.http.queries[1]["seriesId"], 7)
+
+    @patch("stowarr.clients.time.sleep")
+    def test_sonarr_manual_import_uses_copy_mode_and_waits(self, sleep):
+        class ManualImportHttp:
+            def request(self, method, path, **kwargs):
+                if method == "POST":
+                    self.body = kwargs["body"]
+                    return {"id": 23}
+                return {"id": 23, "status": "completed"}
+
+        client = ArrClient(
+            Service("http://unused", api_key="unused"),
+            "sonarr",
+            ALLOW_MUTATIONS,
+        )
+        client.http = ManualImportHttp()
+        files = [{"path": "/downloads/Series.S01E01.mkv", "episodeIds": [70]}]
+
+        result = client.manual_import(files)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            client.http.body,
+            {"name": "ManualImport", "files": files, "importMode": "Copy"},
+        )
+        sleep.assert_not_called()
+
     @patch("stowarr.clients.time.sleep")
     def test_rescan_waits_for_completed_arr_command(self, sleep):
         class CommandHttp:

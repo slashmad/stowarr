@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 
-__version__ = "1.0.0-beta.4"
+__version__ = "1.0.0-beta.5"
 
 
 def normalize_commit(value: str | None) -> str:
