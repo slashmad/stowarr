@@ -580,3 +580,11 @@ Copyright 2026 [slashmad](https://github.com/slashmad).
 Stowarr is licensed under the [Apache License 2.0](LICENSE). Redistributions
 must preserve the license, copyright, and attribution notices required by that
 license, including the attribution in [NOTICE](NOTICE).
+
+## Support
+
+If Stowarr is useful to you, you can support its development here.
+
+[![GitHub Sponsors](https://img.shields.io/badge/GitHub-Sponsors-EA4AAA?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/slashmad)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-buy%20me%20a%20beer-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/slashmad)
+[![Liberapay](https://img.shields.io/badge/Liberapay-donate-F6C915?logo=liberapay&logoColor=black)](https://liberapay.com/slashmad/)
