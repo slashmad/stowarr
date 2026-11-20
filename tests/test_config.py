@@ -44,3 +44,15 @@ class ConfigTest(unittest.TestCase):
             with patch.dict(os.environ, {"STOWARR_AUTH_METHOD": "unsafe"}, clear=True):
                 with self.assertRaisesRegex(ValueError, "forms or external"):
                     load_config(path)
+
+    def test_web_listener_port_is_optional_and_must_differ_from_api_port(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"pools": {}}))
+            with patch.dict(os.environ, {"STOWARR_PORT": "8788"}, clear=True):
+                self.assertIsNone(load_config(path).web_port)
+                with patch.dict(os.environ, {"STOWARR_WEB_PORT": "8080"}):
+                    self.assertEqual(load_config(path).web_port, 8080)
+                with patch.dict(os.environ, {"STOWARR_WEB_PORT": "8788"}):
+                    with self.assertRaisesRegex(ValueError, "distinct"):
+                        load_config(path)

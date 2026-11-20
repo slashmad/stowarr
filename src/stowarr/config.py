@@ -48,6 +48,7 @@ class Config:
     api_only: bool
     auth_method: str
     external_user_header: str
+    web_port: int | None = None
 
     def pool_for_path(self, path: str | Path) -> Pool | None:
         candidate = Path(path)
@@ -94,6 +95,11 @@ def load_config(path: str | Path | None = None) -> Config:
     auth_method = os.getenv("STOWARR_AUTH_METHOD", raw.get("auth_method", "forms")).strip().casefold()
     if auth_method not in {"forms", "external"}:
         raise ValueError("STOWARR_AUTH_METHOD must be forms or external")
+    port = int(os.getenv("STOWARR_PORT", raw.get("port", 8787)))
+    web_port_value = os.getenv("STOWARR_WEB_PORT", str(raw.get("web_port") or ""))
+    web_port = int(web_port_value) if web_port_value else None
+    if web_port is not None and (not 1 <= web_port <= 65535 or web_port == port):
+        raise ValueError("STOWARR_WEB_PORT must be a valid port distinct from STOWARR_PORT")
     return Config(
         pools=pools,
         qbittorrent=_service(raw, "qbittorrent"),
@@ -103,9 +109,10 @@ def load_config(path: str | Path | None = None) -> Config:
         apply=os.getenv("STOWARR_APPLY", str(raw.get("apply", False))).lower() == "true",
         # The container listener is configurable and intentionally defaults to all interfaces.
         listen=os.getenv("STOWARR_LISTEN", raw.get("listen", "0.0.0.0")),  # nosec
-        port=int(os.getenv("STOWARR_PORT", raw.get("port", 8787))),
+        port=port,
         api_token=os.getenv("STOWARR_API_TOKEN", raw.get("api_token", "")),
         api_only=os.getenv("STOWARR_API_ONLY", str(raw.get("api_only", False))).lower() == "true",
         auth_method=auth_method,
         external_user_header=os.getenv("STOWARR_EXTERNAL_USER_HEADER", "X-Forwarded-User").strip(),
+        web_port=web_port,
     )

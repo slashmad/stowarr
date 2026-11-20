@@ -104,18 +104,15 @@ and explicitly acknowledges recovery.
 - the same absolute media paths visible to Stowarr, qBittorrent, and *Arr
 - filesystem support for hardlinks when direct torrent media should be linked
   into a library
-- one `stowarr-api` replica for each state database and media set
+- one Stowarr container per state database and media set
 
 Stowarr supports multiple Sonarr root families below each pool, such as both
 `series` and `anime`.
 
 ## Quick start
 
-Public multi-architecture images are available for `linux/amd64` and
-`linux/arm64`:
-
-- `ghcr.io/slashmad/stowarr-api:latest`
-- `ghcr.io/slashmad/stowarr-web:latest`
+Stowarr v2 uses one container image for the WebUI and API,
+`ghcr.io/slashmad/stowarr:latest`, for `linux/amd64` and `linux/arm64`.
 
 ```bash
 git clone https://github.com/slashmad/stowarr.git
@@ -180,7 +177,7 @@ key when the corresponding environment values are empty. Retrieve generated
 credentials from the API log:
 
 ```bash
-docker compose logs stowarr-api
+docker compose logs stowarr
 ```
 
 The cleartext password and generated API key are printed only when created.
@@ -189,7 +186,7 @@ password from the API container; omitting `--password` generates a new random
 value:
 
 ```bash
-docker compose exec stowarr-api stowarr reset-password
+docker compose exec stowarr stowarr reset-password
 ```
 
 Open `http://127.0.0.1:8787`, sign in, and configure service connections under
@@ -244,7 +241,7 @@ STOWARR_MEDIA_MOUNT_MODE=rw
 ```
 
 ```bash
-docker compose up -d --force-recreate stowarr-api
+docker compose up -d --force-recreate stowarr
 ```
 
 Write mode does not bypass confirmations or safety checks. It can also be
@@ -364,34 +361,44 @@ the running Stowarr version, and a link to the official
 refreshed periodically and after connection settings are saved; credentials are
 never returned with the status response.
 
-**Settings → Stowarr updates → Check for updates** queries the two public
-GHCR `:latest` images on demand. Stowarr reports a newer build when both
-images publish the same Git revision and that revision is ahead of the running
-API. With Compose, run `docker compose pull` followed by `docker compose up -d`
-when you are ready to update both images together.
+**Settings → Stowarr updates → Check for updates** checks the unified GHCR
+`:latest` image. Stowarr reports an update when its Git revision is ahead of
+the installed build. With Compose, run `docker compose pull` followed by
+`docker compose up -d` to install it.
 
-## Service isolation
+## Migrating from beta.6
 
-The stack contains two services:
+Wait for active operations to finish and keep the existing config, `.env`,
+and `stowarr-state` volume. Run `docker compose down` from the old Compose
+project without the `--volumes` option. Replace the Compose file with the v2
+version, keep the same project name, then start the unified service:
 
-- `stowarr-web` serves static assets and proxies `/api`. It has no media or
-  state mounts. Browser requests require an authenticated administrator
-  session stored in an `HttpOnly`, `SameSite=Strict` cookie and a CSRF header.
-- `stowarr-api` owns service credentials, SQLite state, media access, and all
-  filesystem operations.
+```bash
+docker compose pull
+docker compose up -d
+```
 
-The WebUI is bound to `127.0.0.1:8787` and uses its own admin authentication.
-The direct API listener is bound to `127.0.0.1:8788` and independently requires
-the API token. It accepts the *Arr-compatible `X-Api-Key` header as well as a
-Bearer token. Do not expose either listener to another network without TLS.
+The UI address and direct API port carry over. On the default Compose network
+the new service also responds to the old aliases `stowarr-web:8080` and
+`stowarr-api:8788`. The two earlier images remain available with the
+`v1.0.0-beta.6` tag.
+
+## WebUI and API authentication
+
+One Stowarr process serves both listeners and has one operation queue and
+SQLite database. The WebUI is bound to `127.0.0.1:8787`. It uses an
+`HttpOnly`, `SameSite=Strict` session cookie, and browser writes require the
+CSRF header. The direct API listener is bound to `127.0.0.1:8788` and accepts
+the *Arr-compatible `X-Api-Key` or a Bearer token. Use TLS when exposing a
+listener beyond loopback.
 
 Forms authentication is the secure default. `STOWARR_AUTH_METHOD=external`
 trusts the username supplied by `STOWARR_EXTERNAL_USER_HEADER` (default
 `X-Forwarded-User`) and is intended only for Authelia, Authentik, or another
 authentication proxy. In external mode, the Stowarr WebUI port must not be
 reachable by clients through any path that bypasses that proxy. The proxy must
-replace, rather than merely preserve, the trusted username header supplied by
-the client.
+set the trusted username itself. TLS proxies should also set
+`X-Forwarded-Proto` to the external scheme so Stowarr can set Secure cookies.
 
 Settings shows active WebUI sessions and a persistent, bounded security event
 log. Session tokens are stored only as hashes in the same SQLite state database
@@ -536,7 +543,7 @@ It covers Python tests, Ruff, MyPy, Bandit, JavaScript, HTML, CSS, shell
 scripts, GitHub Actions, Dockerfiles, Compose and JSON syntax, dependency
 advisories, and secret scanning where applicable.
 
-Build local images:
+Build the package locally:
 
 ```bash
 docker compose build --pull
@@ -549,16 +556,14 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
 Pull requests run analysis, tests, Compose validation, container builds, and
-secret scanning. Merges to `main` publish both multi-architecture GHCR images
+secret scanning. Merges to `main` publish the multi-architecture GHCR image
 with provenance and SBOM attestations.
 
 ## Versioning
 
-Stowarr follows Semantic Versioning. Prereleases use tags such as
-`v1.0.0-beta.6`, while the WebUI and API expose the corresponding product
-version `1.0.0-beta.6`. Python package metadata uses the PEP 440 equivalent
-`1.0.0b6`. Tagged builds are published to GHCR alongside commit-SHA images;
-`latest` continues to track `main`.
+Stowarr follows Semantic Versioning. The WebUI, API and Python package use
+version `2.0.0`, corresponding to Git tag `v2.0.0`. Tagged builds go to GHCR
+alongside commit-SHA images. The `latest` tag tracks `main`.
 
 ## Project status
 

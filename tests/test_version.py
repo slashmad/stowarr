@@ -21,15 +21,8 @@ class BuildVersionTest(unittest.TestCase):
 
     @patch("stowarr.updates.JsonClient")
     @patch("stowarr.updates._published_revision")
-    def test_update_check_waits_for_matching_images_and_requires_a_newer_revision(
-        self, published, json_client,
-    ):
+    def test_update_check_requires_a_newer_revision(self, published, json_client):
         installed, latest = "a" * 40, "b" * 40
-        published.side_effect = [latest, installed]
-        self.assertEqual(check_updates(installed)["status"], "publishing")
-        json_client.assert_not_called()
-
-        published.side_effect = None
         published.return_value = latest
         self.assertEqual(check_updates("unknown")["status"], "unknown")
         self.assertEqual(check_updates(latest)["status"], "current")
@@ -50,7 +43,7 @@ class BuildVersionTest(unittest.TestCase):
         self.assertEqual(check_updates(installed)["status"], "different")
 
     @patch("stowarr.updates.JsonClient")
-    def test_update_check_reads_linux_platform_images_and_skips_attestations(self, json_client):
+    def test_update_check_reads_the_unified_linux_image_and_skips_attestations(self, json_client):
         registry = json_client.return_value
         registry.headers = {}
         latest = "b" * 40
@@ -64,11 +57,11 @@ class BuildVersionTest(unittest.TestCase):
             ]},
             {"config": {"digest": config_digest}},
             {"config": {"Labels": {"org.opencontainers.image.revision": latest}}},
-        ] * 2
+        ]
 
         with patch("stowarr.updates.platform.machine", return_value="aarch64"):
             self.assertEqual(check_updates(latest)["status"], "current")
 
-        self.assertEqual(registry.request.call_count, 8)
-        registry.request.assert_any_call("GET", f"/v2/slashmad/stowarr-api/manifests/{manifest_digest}")
-        registry.request.assert_any_call("GET", f"/v2/slashmad/stowarr-web/blobs/{config_digest}")
+        self.assertEqual(registry.request.call_count, 4)
+        registry.request.assert_any_call("GET", f"/v2/slashmad/stowarr/manifests/{manifest_digest}")
+        registry.request.assert_any_call("GET", f"/v2/slashmad/stowarr/blobs/{config_digest}")

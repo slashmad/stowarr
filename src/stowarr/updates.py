@@ -21,8 +21,8 @@ def _digest(value: str) -> str:
     return value
 
 
-def _published_revision(image: str, architecture: str) -> str:
-    package = f"slashmad/{image}"
+def _published_revision(architecture: str) -> str:
+    package = "slashmad/stowarr"
     registry = JsonClient("https://ghcr.io", timeout=5)
     token = registry.request("GET", "/token", query={
         "service": "ghcr.io", "scope": f"repository:{package}:pull",
@@ -50,24 +50,24 @@ def _published_revision(image: str, architecture: str) -> str:
 
 
 def check_updates(installed: str = __commit__) -> dict[str, str]:
-    """Check the public API and Web images without changing the installation."""
+    """Check the public Stowarr image without changing the installation."""
     installed = normalize_commit(installed)
     machine = platform.machine().lower()
     architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine, machine)
-    api_revision = _published_revision("stowarr-api", architecture)
-    web_revision = _published_revision("stowarr-web", architecture)
-    result = {"installed_version": __version__, "installed_commit": installed}
-    if api_revision != web_revision:
-        return {**result, "status": "publishing"}
-    result["published_commit"] = api_revision
-    if installed != "unknown" and api_revision.startswith(installed):
+    published = _published_revision(architecture)
+    result = {
+        "installed_version": __version__,
+        "installed_commit": installed,
+        "published_commit": published,
+    }
+    if installed != "unknown" and published.startswith(installed):
         return {**result, "status": "current"}
     if len(installed) != 40:
         return {**result, "status": "unknown"}
     github = JsonClient("https://api.github.com", timeout=5)
     try:
         comparison = github.request(
-            "GET", f"/repos/slashmad/stowarr/compare/{installed}...{api_revision}",
+            "GET", f"/repos/slashmad/stowarr/compare/{installed}...{published}",
             query={"per_page": 1},
         )
     except HTTPError as error:
