@@ -37,6 +37,6 @@ npm run audit:dependencies
 
 .venv/bin/python -m json.tool config/config.example.json >/dev/null
 docker compose config --quiet
-docker compose build
+docker compose build --pull
 docker run --rm --add-host stowarr-api:127.0.0.1 \
   ghcr.io/slashmad/stowarr-web:latest nginx -t

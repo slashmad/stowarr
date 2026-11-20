@@ -9,6 +9,7 @@ import shutil
 import threading
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -1343,7 +1344,7 @@ class Stowarr:
         content_path = str(torrent.get("content_path") or "")
         if not content_path:
             content_path = str(videos[0][0] if len(videos) == 1 else torrent["save_path"])
-        preview = preview_method(content_path, torrent_hash, int(item["id"]))
+        preview = preview_method(content_path, torrent_hash)
         by_path: dict[str, list[dict]] = {}
         for candidate in preview:
             by_path.setdefault(str(candidate.get("path") or ""), []).append(candidate)
@@ -1414,12 +1415,13 @@ class Stowarr:
 
     @staticmethod
     def _verify_sonarr_imports(
-        imports: list[dict], mapping: dict | None, series_id: int
+        imports: list[dict], mapping: dict | None, series_id: int, target_root: Path,
     ) -> None:
         if (
             not mapping
             or not mapping.get("mappingComplete")
             or int((mapping.get("item") or {}).get("id") or 0) != series_id
+            or Path(str((mapping.get("item") or {}).get("path") or "")) != target_root
         ):
             raise RuntimeError(
                 "Sonarr did not report a complete episode mapping after import"
@@ -1442,6 +1444,8 @@ class Stowarr:
             record = candidates[0]
             source = Path(expected["path"])
             target = Path(str(record.get("path") or ""))
+            if not target.resolve().is_relative_to(target_root.resolve()):
+                raise RuntimeError("Sonarr reported an imported file outside the planned series folder")
             if not source.is_file() or not target.is_file():
                 raise RuntimeError("A Sonarr import source or destination is missing")
             source_stat, target_stat = source.stat(), target.stat()
@@ -1504,6 +1508,26 @@ class Stowarr:
     @staticmethod
     def _library_files(mapping: dict) -> list[tuple[Path, int]]:
         return [(Path(record["path"]), int(record["size"])) for record in mapping.get("files", [])]
+
+    @staticmethod
+    def _sonarr_hardlink_candidates(
+        library_files: list[tuple[Path, int]], torrent_files: list[tuple[Path, int]],
+    ) -> dict[Path, list[Path]]:
+        """Resolve exact links before using file size to suggest a repair."""
+        by_inode: dict[tuple[int, int, int], list[Path]] = {}
+        for path, size in torrent_files:
+            if path.is_file():
+                stat = path.stat()
+                if stat.st_size == size:
+                    by_inode.setdefault((stat.st_dev, stat.st_ino, size), []).append(path)
+        candidates = {}
+        for path, size in library_files:
+            if path.is_file():
+                stat = path.stat()
+                matches = by_inode.get((stat.st_dev, stat.st_ino, size))
+                if matches:
+                    candidates[path] = matches
+        return candidates
 
     def _pool_library_roots(
         self, app: str, pool: Pool, strict: bool = False,
@@ -2070,6 +2094,16 @@ class Stowarr:
                     members = self.archive_extractor.members(entry)
                     archive_entries.append({"path": str(entry), "members": len(members)})
                     archive_members.extend((entry, member) for member in members)
+                required_sizes = Counter(int(record["size"]) for record in extraction_files)
+                archive_video_sizes = Counter(
+                    member.size for _, member in archive_members
+                    if Path(member.relative_path).suffix.casefold() in VIDEO_EXTENSIONS
+                )
+                unmatched_count = sum((required_sizes - archive_video_sizes).values())
+                if unmatched_count:
+                    status = "blocked"
+                    reason = f"The selected archives cannot supply {unmatched_count} managed media file(s) of the required sizes"
+                    error_code = "ARCHIVE_MEDIA_COVERAGE_INCOMPLETE"
             except Exception as error:
                 status, reason = "blocked", f"Archive manifest inspection failed: {error}"
         required_space = size + extraction_space
@@ -2472,6 +2506,7 @@ class Stowarr:
         }
 
         extracted: list[dict] = []
+        reconcile_started = False
         temporary_category = f"{plan.app}-stowarr-moving-{torrent_hash[:12].casefold()}"
         last_progress: tuple[str, int, str, str] | None = None
         def report(state: str, percent: float, **values) -> None:
@@ -2558,6 +2593,7 @@ class Stowarr:
                 for item in (post_plan.auxiliary_files or [])
                 if item.origin == "qbittorrent" or actions.get(item.source) == "move"
             }
+            reconcile_started = True
             result = self.reconcile(torrent_hash, selected_auxiliary, operation_id=operation_id,
                                     verified_derived_paths=verified_derived, progress_callback=report,
                                     mapping_hint=mapping_hint, app_hint=plan.app,
@@ -2602,11 +2638,17 @@ class Stowarr:
                               "reconcile_operation_id": result["operation_id"]})
             return {"operation_id": operation_id, "state": "COMPLETE", "plan": plan.json(), "reconcile": result}
         except Exception as error:
-            for item in extracted:
-                if item.get("created"):
-                    target = Path(item["target"])
-                    if target.exists() and sha256(target) == item["sha256"]:
-                        self._filesystem().unlink(target)
+            # Reconcile can remove old library files after publication. Once it
+            # starts, the verified destination is needed for manual recovery.
+            if not reconcile_started:
+                for item in extracted:
+                    if item.get("created"):
+                        source, target = Path(item["source"]), Path(item["target"])
+                        if (
+                            source.is_file() and target.is_file()
+                            and sha256(source) == item["sha256"] == sha256(target)
+                        ):
+                            self._filesystem().unlink(target)
             previous = next((item for item in self.store.recent() if item["id"] == operation_id), None)
             self.store.update(operation_id, "FAILED", {
                 **detail,
@@ -3093,19 +3135,26 @@ class Stowarr:
             )
         pairs: list[FilePair] = []
         used: set[Path] = set()
+        hardlinks = self._sonarr_hardlink_candidates(library_files, torrent_files) if app == "sonarr" else {}
+        reserved = {path for paths in hardlinks.values() for path in paths}
         for source, size in library_files:
             if missing_library_pair and source == Path(missing_library_pair.source_library):
                 pairs.append(missing_library_pair)
                 used.add(Path(missing_library_pair.torrent_file))
                 continue
-            candidates = [(path, item_size) for path, item_size in torrent_files if item_size == size and path not in used]
+            candidates = hardlinks.get(source) or [
+                path for path, item_size in torrent_files
+                if item_size == size and path not in reserved
+            ]
+            candidates = [path for path in candidates if path not in used]
             relative = source.relative_to(Path(item["path"]))
             target = target_item / relative
+            if str(target) in verified_derived_paths and target.is_file() and target.stat().st_size == size:
+                pairs.append(FilePair(str(source), str(target), "", size, "verified-derived", "archive-reextract"))
+                continue
             if not candidates and has_archives:
                 if source == target and source.exists():
                     state = "already-on-target"
-                elif str(target) in verified_derived_paths and target.exists() and target.stat().st_size == size:
-                    state = "verified-derived"
                 elif source.exists() and target.exists() and source.stat().st_size == target.stat().st_size and sha256(source) == sha256(target):
                     state = "verified-derived"
                 elif not source.exists():
@@ -3121,7 +3170,7 @@ class Stowarr:
             if len(candidates) != 1:
                 pairs.append(FilePair(str(source), "", "", size, "ambiguous", "unresolved"))
                 continue
-            torrent_file, _ = candidates[0]
+            torrent_file = candidates[0]
             used.add(torrent_file)
             if target.exists() and torrent_file.exists():
                 target_stat, torrent_stat = target.stat(), torrent_file.stat()
@@ -3338,12 +3387,7 @@ class Stowarr:
                 ),
             }], 0
 
-        used: set[Path] = set()
-        linked = 0
-        separate = 0
-        missing = 0
-        ambiguous = 0
-        unmatched = 0
+        library_files = []
         for record in managed_files:
             recorded_path = str(record.get("path") or "")
             relative = str(record.get("relativePath") or "")
@@ -3354,30 +3398,34 @@ class Stowarr:
             library_size = (
                 library_path.stat().st_size if library_path.is_file() else recorded_size
             )
+            library_files.append((library_path, library_size))
+
+        hardlinks = self._sonarr_hardlink_candidates(library_files, selected_videos)
+        reserved = {path for paths in hardlinks.values() for path in paths}
+        used: set[Path] = set()
+        linked = 0
+        separate = 0
+        missing = 0
+        ambiguous = 0
+        unmatched = 0
+        for library_path, library_size in library_files:
             if not library_path.is_file():
                 missing += 1
                 continue
-            candidates = [
+            exact_links = hardlinks.get(library_path, [])
+            candidates = exact_links or [
                 path for path, size in selected_videos
-                if path not in used and size == library_size and path.is_file()
+                if path not in reserved and size == library_size and path.is_file()
             ]
+            candidates = [path for path in candidates if path not in used]
             if not candidates:
                 unmatched += 1
                 continue
             if len(candidates) > 1:
                 ambiguous += 1
                 continue
-            candidate = candidates[0]
-            used.add(candidate)
-            library_stat = library_path.stat()
-            torrent_stat = candidate.stat()
-            if (
-                library_stat.st_dev,
-                library_stat.st_ino,
-            ) == (
-                torrent_stat.st_dev,
-                torrent_stat.st_ino,
-            ):
+            used.add(candidates[0])
+            if exact_links:
                 linked += 1
             else:
                 separate += 1
@@ -3420,7 +3468,7 @@ class Stowarr:
                         "qBittorrent download; hardlink identity is not applicable"
                     ),
                     [],
-                    mapped_count,
+                    len(managed_files),
                 )
             reason = (
                 f"{unmatched} Sonarr episode file"
@@ -4977,6 +5025,9 @@ class Stowarr:
         stale_auxiliary: list[Path] = []
         try:
             sonarr_imports = list(plan.sonarr_import_files or [])
+            import_episode_ids = {
+                int(episode_id) for item in sonarr_imports for episode_id in item["episodeIds"]
+            }
             restores_missing_library = any(
                 pair.status == "missing-library" for pair in plan.pairs
             ) or bool(sonarr_imports)
@@ -5076,9 +5127,12 @@ class Stowarr:
                     for item in sonarr_imports
                 ]
                 self.arr["sonarr"].manual_import(command_files)
-                imported_mapping = self.arr["sonarr"].download_mapping(torrent_hash)
+                imported_mapping = self.arr["sonarr"].sonarr_episode_mapping(
+                    int(plan.item_id or 0), import_episode_ids
+                )
                 self._verify_sonarr_imports(
-                    sonarr_imports, imported_mapping, int(plan.item_id or 0)
+                    sonarr_imports, imported_mapping, int(plan.item_id or 0),
+                    Path(plan.target_item_path or ""),
                 )
                 mapping_hint = imported_mapping
                 if progress_callback:
@@ -5320,7 +5374,9 @@ class Stowarr:
                     copied_auxiliary.append((source, target))
                 self.store.update(operation_id, state_name("AUXILIARY_COPIED", "MOVE_LIBRARY_AUXILIARY"), plan.json())
             pool = next(pool for pool in self.config.pools if pool.name == plan.target_pool)
-            mapping = self.arr[plan.app].download_mapping(torrent_hash) or mapping_hint
+            mapping = mapping_hint if sonarr_imports else (
+                self.arr[plan.app].download_mapping(torrent_hash) or mapping_hint
+            )
             if not mapping:
                 raise RuntimeError("The *Arr download mapping disappeared during reconciliation")
             item = mapping["item"]
@@ -5344,7 +5400,10 @@ class Stowarr:
                 str(Path(plan.target_item_path or "") / record["relativePath"])
                 for record in plan.managed_files or []
             ]
-            refreshed = self.arr[plan.app].download_mapping(torrent_hash)
+            refreshed = (
+                self.arr["sonarr"].sonarr_episode_mapping(int(plan.item_id or 0), import_episode_ids)
+                if sonarr_imports else self.arr[plan.app].download_mapping(torrent_hash)
+            )
             if not refreshed and expected_paths:
                 resolver = getattr(self.arr[plan.app], "library_mapping", None)
                 if resolver:
@@ -5353,7 +5412,8 @@ class Stowarr:
             refreshed_paths = set(refreshed_files.values())
             if sonarr_imports:
                 self._verify_sonarr_imports(
-                    sonarr_imports, refreshed, int(plan.item_id or 0)
+                    sonarr_imports, refreshed, int(plan.item_id or 0),
+                    Path(plan.target_item_path or ""),
                 )
             for record in plan.managed_files or []:
                 expected = Path(plan.target_item_path or "") / record["relativePath"]

@@ -116,8 +116,20 @@ class ArrClient:
             if record.get("episodeId"):
                 episode_ids.add(int(record["episodeId"]))
             data = record.get("data") or {}
-            for value in data.get("episodeIds", []):
-                episode_ids.add(int(value))
+            extra_episode_ids = data.get("episodeIds")
+            if isinstance(extra_episode_ids, list):
+                episode_ids.update(int(value) for value in extra_episode_ids)
+        return {**self._sonarr_episode_mapping(item, episode_ids), "history": records}
+
+    def sonarr_episode_mapping(self, series_id: int, episode_ids: set[int]) -> dict:
+        """Read current file identities for the exact episodes in a reviewed import."""
+        if self.kind != "sonarr":
+            raise RuntimeError("Episode file mappings are available only for Sonarr")
+        item = self.http.request("GET", f"/api/v3/series/{series_id}")
+        return self._sonarr_episode_mapping(item, episode_ids)
+
+    def _sonarr_episode_mapping(self, item: dict, episode_ids: set[int]) -> dict:
+        item_id = int(item["id"])
         episodes = self.http.request("GET", "/api/v3/episode", query={"seriesId": item_id})
         selected_episodes = [episode for episode in episodes if int(episode["id"]) in episode_ids]
         episode_file_ids = {
@@ -149,7 +161,6 @@ class ArrClient:
         return {
             "app": self.kind,
             "item": item,
-            "history": records,
             "episodes": selected_episodes,
             "files": files,
             "allFiles": all_files,
@@ -331,9 +342,7 @@ class ArrClient:
             time.sleep(2)
         raise RuntimeError(f"{self.kind.capitalize()} {name} exceeded {timeout} seconds")
 
-    def manual_import_preview(
-        self, path: str, download_id: str, series_id: int
-    ) -> list[dict]:
+    def manual_import_preview(self, path: str, download_id: str) -> list[dict]:
         """Ask Sonarr to parse an exact download without importing it."""
         if self.kind != "sonarr":
             raise RuntimeError("Manual episode import is available only for Sonarr")
@@ -343,21 +352,19 @@ class ArrClient:
             query={
                 "folder": path,
                 "downloadId": download_id,
-                "seriesId": series_id,
                 "filterExistingFiles": "true",
             },
         )
         if preview:
             return preview
-        # Sonarr returns no candidates when the download is no longer present in
-        # its live queue. Exact history still proves the series association, so
-        # retry the read-only parser with the same explicit series and path.
+        # Supplying seriesId selects the series library, not the download.
+        # For releases absent from the queue, parse the exact download path.
+        # The caller verifies the returned paths and series against its plan.
         return self.http.request(
             "GET",
             "/api/v3/manualimport",
             query={
                 "folder": path,
-                "seriesId": series_id,
                 "filterExistingFiles": "true",
             },
         )
@@ -366,12 +373,15 @@ class ArrClient:
         """Run a previously reviewed Sonarr manual-import selection as Copy."""
         if self.kind != "sonarr":
             raise RuntimeError("Manual episode import is available only for Sonarr")
+        # Sonarr may clean up a tracked download after the command, even in
+        # Copy mode. Explicit file and episode assignments suffice for import.
+        assignments = [{key: value for key, value in item.items() if key != "downloadId"} for item in files]
         command = self._mutate(
             "import episode files",
             self.http.request,
             "POST",
             "/api/v3/command",
-            body={"name": "ManualImport", "files": files, "importMode": "Copy"},
+            body={"name": "ManualImport", "files": assignments, "importMode": "Copy"},
         )
         return self._wait_command(command, "ManualImport", timeout)
 
@@ -386,7 +396,14 @@ class QBittorrentClient:
         self.http = JsonClient(service.url, headers)
         self.mutation_guard = mutation_guard
         if not service.api_key:
-            self.http.request("POST", "/api/v2/auth/login", form={"username": service.username, "password": service.password})
+            result = self.http.request_text(
+                "POST", "/api/v2/auth/login",
+                form={"username": service.username, "password": service.password},
+            )
+            # Older Web APIs return "Ok." or "Fails." even with HTTP 200.
+            # Current releases return an empty success body and HTTP errors.
+            if result not in {"", "Ok."}:
+                raise RuntimeError("qBittorrent login failed; check the configured username and password")
 
     def _mutate(
         self, action: str, operation: Callable[..., Any], *args: Any, **kwargs: Any

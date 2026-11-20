@@ -80,6 +80,11 @@ summary:focus-visible {
 .sidebar {
   width: 220px;
   border-right-color: #2d3034;
+  overflow-y: auto;
+}
+
+.sidebar > * {
+  flex-shrink: 0;
 }
 
 .brand {
@@ -194,6 +199,59 @@ nav {
   height: 15px;
   fill: currentColor;
   stroke: none;
+}
+
+.sidebar-support {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.sidebar-support a {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 32px;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--muted-strong);
+  font-size: 11px;
+  text-decoration: none;
+}
+
+.sidebar-support a:hover {
+  background: var(--panel);
+  color: var(--text);
+}
+
+.sidebar-support a:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.sidebar-support .icon {
+  width: 14px;
+  height: 14px;
+  color: #e58bab;
+}
+
+.update-heading {
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.update-result:has(p:not(:empty)) {
+  padding: 14px 20px;
+}
+
+.update-result p {
+  margin: 0;
+}
+
+.update-result a {
+  color: var(--blue);
 }
 
 .sidebar-backdrop {

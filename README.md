@@ -364,6 +364,12 @@ the running Stowarr version, and a link to the official
 refreshed periodically and after connection settings are saved; credentials are
 never returned with the status response.
 
+**Settings → Stowarr updates → Check for updates** queries the two public
+GHCR `:latest` images on demand. Stowarr reports a newer build when both
+images publish the same Git revision and that revision is ahead of the running
+API. With Compose, run `docker compose pull` followed by `docker compose up -d`
+when you are ready to update both images together.
+
 ## Service isolation
 
 The stack contains two services:
@@ -466,11 +472,13 @@ For packed releases, the torrent infohash and qBittorrent recheck validate the
 archive set. Extracted media is a derived artifact and requires its own
 verification chain; it cannot be hardlinked to archive data.
 
-The extraction foundation uses the current Linux 7-Zip command-line tool behind
-a restricted staging interface. It recognizes common RAR/RAR5, multipart RAR,
-ZIP, 7z, TAR, and ISO layouts. It discovers independent archive sets, publishes
-only uniquely verified *Arr-managed media, and rolls back newly published files
-if a later transaction step fails.
+The extraction foundation uses Linux 7-Zip behind a restricted staging
+interface. The API image includes Debian's separate RAR/RAR5 codec package.
+For a native install, use a 7-Zip build with those decoders. Stowarr recognizes
+common RAR/RAR5, multipart RAR, ZIP, 7z, TAR, and ISO layouts. Stowarr checks
+the archive manifests before relocating the torrent and publishes only media
+that matches the current *Arr files by SHA-256. Once library reconciliation
+starts, verified new files remain available if a later step fails.
 
 ### Unpackerr coexistence
 
@@ -482,12 +490,16 @@ leave `_unpackerred` output behind, and invalidate Stowarr's verification plan.
 
 For a deployment where Stowarr manages all configured Radarr and Sonarr pools:
 
-- disable or remove Unpackerr's `[[radarr]]` and `[[sonarr]]` integrations;
-- disable or remove every Unpackerr `[[folder]]` entry whose `path` is a
-  Stowarr `download_root`;
-- restart Unpackerr after changing its configuration; and
-- keep the same media paths mounted read/write only where another, explicitly
-  separate Unpackerr workload still requires them.
+- In Unpackerr v1, remove the matching Radarr and Sonarr instances and folder
+  watches in the Web UI settings or from their named config sections
+  (`[radarr.name]`, `[sonarr.name]`, `[folder.name]`). Remove the corresponding
+  container environment variables if they own those settings.
+- On older installations, remove the corresponding `[[radarr]]`,
+  `[[sonarr]]` and `[[folder]]` entries.
+- In either version, remove recursive watches above a Stowarr download root
+  when they pick up its subfolders.
+- Restart Unpackerr after editing the config or container environment and
+  verify the two applications watch different paths.
 
 Unpackerr may remain enabled for applications or paths outside Stowarr, but the
 two tools must have mutually exclusive scopes. A delay, `parallel = 1`, or
@@ -497,6 +509,9 @@ Stowarr recognizes existing `_unpackerred` output as a derived artifact. It
 removes that output only after the extracted media hash matches the published
 library file and the complete Move transaction has passed verification. Do not
 manually delete old derived output while a Move is running.
+
+[Unpackerr's v1 upgrade guide](https://unpackerr.zip/docs/install/upgrading/)
+describes how named settings and environment-managed values are handled.
 
 ## Development
 
@@ -524,7 +539,7 @@ advisories, and secret scanning where applicable.
 Build local images:
 
 ```bash
-docker compose build
+docker compose build --pull
 ```
 
 Run the test suite:
@@ -540,9 +555,9 @@ with provenance and SBOM attestations.
 ## Versioning
 
 Stowarr follows Semantic Versioning. Prereleases use tags such as
-`v1.0.0-beta.5`, while the WebUI and API expose the corresponding product
-version `1.0.0-beta.5`. Python package metadata uses the PEP 440 equivalent
-`1.0.0b5`. Tagged builds are published to GHCR alongside commit-SHA images;
+`v1.0.0-beta.6`, while the WebUI and API expose the corresponding product
+version `1.0.0-beta.6`. Python package metadata uses the PEP 440 equivalent
+`1.0.0b6`. Tagged builds are published to GHCR alongside commit-SHA images;
 `latest` continues to track `main`.
 
 ## Project status

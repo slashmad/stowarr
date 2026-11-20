@@ -141,21 +141,23 @@ class ArchiveExtractor:
         if process.stderr is None:
             process.kill()
             raise RuntimeError("Archive extractor did not expose a progress stream")
-        selector = selectors.DefaultSelector()
-        selector.register(process.stderr, selectors.EVENT_READ)
-        while process.poll() is None:
-            if time.monotonic() - started > self.timeout:
-                process.kill()
-                raise RuntimeError(f"Archive operation exceeded {self.timeout} seconds")
-            events = selector.select(timeout=0.25)
-            if events:
-                chunk = os.read(process.stderr.fileno(), 4096)
-                output = (output + chunk)[-2000:]
-                matches = re.findall(rb"(\d{1,3})%", chunk)
-                if matches and progress:
-                    progress(min(100, int(matches[-1])))
-        selector.close()
-        output = (output + process.stderr.read())[-2000:]
+        with process.stderr as errors, selectors.DefaultSelector() as selector:
+            try:
+                selector.register(errors, selectors.EVENT_READ)
+                while process.poll() is None:
+                    if time.monotonic() - started > self.timeout:
+                        raise RuntimeError(f"Archive operation exceeded {self.timeout} seconds")
+                    if selector.select(timeout=0.25):
+                        chunk = os.read(errors.fileno(), 4096)
+                        output = (output + chunk)[-2000:]
+                        matches = re.findall(rb"(\d{1,3})%", chunk)
+                        if matches and progress:
+                            progress(min(100, int(matches[-1])))
+                output = (output + errors.read())[-2000:]
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
         if process.returncode:
             detail = output.decode(errors="replace").strip() or "unknown extractor error"
             raise RuntimeError(f"Archive operation failed: {detail}")

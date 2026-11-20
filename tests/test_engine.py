@@ -1,14 +1,16 @@
 import hashlib
 import os
+import shutil
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from zipfile import ZipFile
 
-from stowarr import __commit__
-from stowarr.archive import ArchiveMember, ExtractedFile
+from stowarr import __commit__, __version__
+from stowarr.archive import ArchiveExtractor, ArchiveMember, ExtractedFile
 from stowarr.config import Config, Pool, Service
 from stowarr.engine import (
     AuxiliaryFile,
@@ -218,18 +220,18 @@ class EngineTest(unittest.TestCase):
             }]
             mapping = {
                 "mappingComplete": True,
-                "item": {"id": 7},
+                "item": {"id": 7, "path": str(root)},
                 "files": [{
                     "id": 700, "path": str(linked),
                     "size": linked.stat().st_size, "episodeIds": [70],
                 }],
             }
 
-            Stowarr._verify_sonarr_imports(imports, mapping, 7)
+            Stowarr._verify_sonarr_imports(imports, mapping, 7, root)
 
             mapping["files"][0]["path"] = str(copied)
             with self.assertRaisesRegex(RuntimeError, "separate copy"):
-                Stowarr._verify_sonarr_imports(imports, mapping, 7)
+                Stowarr._verify_sonarr_imports(imports, mapping, 7, root)
 
     def test_reconcile_runs_reviewed_sonarr_import_and_verifies_hardlink(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -267,7 +269,8 @@ class EngineTest(unittest.TestCase):
 
             client = SimpleNamespace(
                 manual_import=Mock(side_effect=manual_import),
-                download_mapping=lambda torrent_hash: current_mapping[0],
+                download_mapping=lambda torrent_hash: incomplete,
+                sonarr_episode_mapping=Mock(side_effect=lambda series_id, ids: current_mapping[0]),
                 sync_pool=Mock(),
                 rescan=Mock(),
             )
@@ -319,6 +322,8 @@ class EngineTest(unittest.TestCase):
             self.assertEqual(result["state"], "COMPLETE")
             manager.qbit.recheck.assert_called_once_with("IMPORT")
             client.manual_import.assert_called_once()
+            self.assertEqual(client.sonarr_episode_mapping.call_args.args, (7, {70}))
+            self.assertEqual(client.sonarr_episode_mapping.call_count, 2)
             client.rescan.assert_called_once_with(7)
             self.assertEqual(
                 (source.stat().st_dev, source.stat().st_ino),
@@ -753,7 +758,7 @@ class EngineTest(unittest.TestCase):
 
         result = manager.service_status()
 
-        self.assertEqual(result["version"], "1.0.0-beta.5")
+        self.assertEqual(result["version"], __version__)
         self.assertEqual(result["commit"], __commit__)
         self.assertEqual(result["services"]["stowarr_api"]["commit"], __commit__)
         self.assertTrue(result["apply"])
@@ -1255,6 +1260,128 @@ class EngineTest(unittest.TestCase):
 
             self.assertEqual((new_item / "Movie.mkv").read_bytes(), b"verified-media")
             self.assertTrue(published[0]["created"])
+
+    def test_packed_move_keeps_the_verified_destination_when_final_cleanup_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "old" / "Season 01" / "episode.mkv"
+            target = root / "new" / "Season 01" / "episode.mkv"
+            for path in (source, target):
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b"verified episode")
+            torrent_hash = "a" * 40
+            managed = {"id": 10, "path": str(source), "targetPath": str(target)}
+            move_plan = MovePlan(
+                torrent_hash, "Fictional Series", "sonarr", "p3", "p1",
+                str(root / "downloads"), str(root / "destination"),
+                "sonarr-p1", 7, "Fictional Series", [managed], 100, 1000, "ready",
+                extraction_required=True,
+            )
+            manager = Stowarr.__new__(Stowarr)
+            manager.config = SimpleNamespace(apply=True)
+            manager.qbit = Mock()
+            manager._wait_for_torrent = Mock()
+            manager._wait_for_recheck = Mock()
+            manager._wait_for_visible_torrent_files = Mock()
+            manager._verify_archive_sets = Mock()
+            manager._extract_managed_media = Mock(return_value=[{
+                "source": str(source), "target": str(target),
+                "created": True, "sha256": sha256(source),
+            }])
+            manager.move_plan = Mock(return_value=move_plan)
+            manager.arr = {"sonarr": Mock()}
+            manager.arr["sonarr"].download_mapping.return_value = {"item": {"id": 7}}
+            manager.plan = Mock(return_value=SimpleNamespace(auxiliary_files=[]))
+            manager.store = Mock()
+            manager.store.active.return_value = None
+            manager.store.recent.return_value = []
+
+            def complete_reconcile(*args, **kwargs):
+                source.unlink()
+                return {"state": "COMPLETE"}
+
+            manager.reconcile = Mock(side_effect=complete_reconcile)
+            manager._cleanup_verified_unpackerr_derivatives = Mock(
+                side_effect=RuntimeError("Derivative cleanup failed")
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Derivative cleanup failed"):
+                manager._run_move(torrent_hash, "p1")
+
+            self.assertFalse(source.exists())
+            self.assertEqual(target.read_bytes(), b"verified episode")
+            self.assertEqual(manager.store.update.call_args.args[1], "FAILED")
+
+    @unittest.skipUnless(shutil.which("7z"), "7z is required for the archive round trip")
+    def test_sonarr_packed_move_checks_and_extracts_two_season_folders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pools = []
+            for name in ("p3", "p1"):
+                prefix = root / name
+                prefix.mkdir()
+                pools.append(Pool(
+                    name, prefix, (prefix / "download",), prefix / "movies", prefix / "series",
+                    f"radarr-{name}", f"sonarr-{name}", f"radarr-{name}", f"sonarr-{name}",
+                ))
+            source, destination = pools
+            download = source.download_roots[0]
+            item_folder = source.sonarr_root / "Fictional"
+            managed_files = []
+            torrent_files = []
+            for number, content in enumerate((b"season-one", b"season-two"), start=1):
+                season = f"Season {number:02}"
+                relative = Path(season) / "episode.mkv"
+                old_file = item_folder / relative
+                old_file.parent.mkdir(parents=True)
+                old_file.write_bytes(content)
+                archive = download / season / "release.zip"
+                archive.parent.mkdir(parents=True)
+                with ZipFile(archive, "w") as bundle:
+                    bundle.writestr(f"Episode 01/{relative.name}", content)
+                managed_files.append({
+                    "id": number, "path": str(old_file), "relativePath": str(relative),
+                    "size": len(content), "episodeIds": [number],
+                })
+                torrent_files.append({
+                    "name": str(archive.relative_to(download)), "size": archive.stat().st_size,
+                    "priority": 1,
+                })
+            item = {"id": 7, "title": "Fictional", "path": str(item_folder)}
+            mapping = {
+                "item": item, "files": managed_files,
+                "allFiles": managed_files, "mappingComplete": True,
+            }
+            torrent = {
+                "name": "Fictional", "category": "sonarr-p3", "save_path": str(download),
+                "content_path": str(download), "progress": 1, "total_size": 1000,
+            }
+            manager = Stowarr.__new__(Stowarr)
+            manager.config = SimpleNamespace(
+                pools=pools,
+                pool_for_path=lambda path: source if source.contains(Path(path)) else destination,
+                pool_for_category=lambda category: (source, "sonarr"),
+            )
+            manager.qbit = SimpleNamespace(
+                torrent=lambda torrent_hash: torrent, files=lambda torrent_hash: torrent_files,
+            )
+            manager.arr = {"sonarr": SimpleNamespace(download_mapping=lambda torrent_hash: mapping)}
+            manager.archive_extractor = ArchiveExtractor()
+
+            plan = manager.move_plan("a" * 40, "p1")
+
+            self.assertEqual(plan.status, "ready", plan.reason)
+            self.assertEqual(len(plan.archive_entries), 2)
+            extracted = manager._extract_managed_media("a" * 40, plan)
+            self.assertEqual(len(extracted), 2)
+            self.assertEqual(
+                [(destination.sonarr_root / "Fictional" / file["relativePath"]).read_bytes()
+                 for file in managed_files],
+                [b"season-one", b"season-two"],
+            )
+            torrent_files.pop()
+            blocked = manager.move_plan("a" * 40, "p1")
+            self.assertEqual(blocked.error_code, "ARCHIVE_MEDIA_COVERAGE_INCOMPLETE")
 
     def test_move_preserves_relative_save_path_between_pool_download_roots(self):
         current = Pool(
@@ -3323,8 +3450,8 @@ class EngineTest(unittest.TestCase):
             library_root = root / "series" / "Same Size"
             library = library_root / "Season 01" / "Same.Size.S01E01.mkv"
             candidates = [
-                release / "Same.Size.S01E01.mkv",
-                release / "Same.Size.S01E02.mkv",
+                release / "Season 01" / "Same.Size.S01E01.mkv",
+                release / "Season 02" / "Same.Size.S02E01.mkv",
             ]
             library.parent.mkdir(parents=True)
             library.write_bytes(b"same-size")
@@ -3353,7 +3480,7 @@ class EngineTest(unittest.TestCase):
                     "sonarr-p1": {"savePath": str(root / "download")},
                 },
                 files=lambda torrent_hash: [{
-                    "name": candidate.name,
+                    "name": str(candidate.relative_to(release)),
                     "size": candidate.stat().st_size,
                     "priority": 1,
                 } for candidate in candidates],
@@ -3382,6 +3509,13 @@ class EngineTest(unittest.TestCase):
                 row["issues"][0]["code"],
                 "QBITTORRENT_MEDIA_CANDIDATE_AMBIGUOUS",
             )
+
+            library.unlink()
+            os.link(candidates[0], library)
+
+            row = manager.sync_audit("sonarr")["rows"][0]
+            self.assertEqual(row["status"], "in-sync")
+            self.assertEqual(row["media_candidate_count"], 1)
 
     def test_sonarr_sync_audit_keeps_missing_episode_repair_manual(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -23,6 +23,35 @@ function renderBuildVersion(source){
   node.title=commit==='unknown'?'Build commit was not embedded in this image':`Git commit ${commit}`;
 }
 async function api(path,options={}){const method=(options.method||'GET').toUpperCase();const headers=new Headers(options.headers||{});if(method!=='GET'&&method!=='HEAD')headers.set('X-Stowarr-CSRF','1');const response=await fetch(path,{...options,headers,credentials:'same-origin'});if(response.status===401&&path!=='/api/auth/login'){state.authenticated=false;showLogin()}if(!response.ok)throw new Error((await response.json().catch(()=>({}))).error||`HTTP ${response.status}`);return response.json()}
+async function checkUpdates(event){
+  const button=event.currentTarget;
+  const status=$('#update-status');
+  const details=$('#update-details');
+  button.disabled=true;
+  details.hidden=true;
+  status.textContent='Checking the public container images…';
+  try {
+    const result=await api('/api/settings/updates');
+    const published=result.published_commit?.slice(0,12);
+    const messages={
+      current:`Your API matches the latest published build (${published}).`,
+      'update-available':`A newer Stowarr build is available (${published}). Update both images together.`,
+      different:`The public build (${published}) differs from your installation. Review it before updating.`,
+      unknown:`The public build is ${published}. This installation has no comparable build revision.`,
+      publishing:'The public API and Web images have different revisions. Check again when both images are in sync.',
+    };
+    status.textContent=messages[result.status]||'The update check did not return a known result.';
+    if(/^[0-9a-f]{40}$/.test(result.published_commit||'')){
+      details.href=`https://github.com/slashmad/stowarr/commit/${result.published_commit}`;
+      details.hidden=false;
+    }
+  } catch(error) {
+    status.textContent=error.message;
+  } finally {
+    button.disabled=false;
+  }
+}
+$('#check-updates').addEventListener('click',checkUpdates);
 async function streamApi(path,options={},onProgress=()=>{}){
   const method=(options.method||'GET').toUpperCase();
   const headers=new Headers(options.headers||{});
