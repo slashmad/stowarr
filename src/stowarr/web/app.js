@@ -29,16 +29,15 @@ async function checkUpdates(event){
   const details=$('#update-details');
   button.disabled=true;
   details.hidden=true;
-  status.textContent='Checking the public container images…';
+  status.textContent='Checking the public container image…';
   try {
     const result=await api('/api/settings/updates');
     const published=result.published_commit?.slice(0,12);
     const messages={
-      current:`Your API matches the latest published build (${published}).`,
-      'update-available':`A newer Stowarr build is available (${published}). Update both images together.`,
+      current:`Your installation matches the latest published build (${published}).`,
+      'update-available':`A newer Stowarr build is available (${published}).`,
       different:`The public build (${published}) differs from your installation. Review it before updating.`,
       unknown:`The public build is ${published}. This installation has no comparable build revision.`,
-      publishing:'The public API and Web images have different revisions. Check again when both images are in sync.',
     };
     status.textContent=messages[result.status]||'The update check did not return a known result.';
     if(/^[0-9a-f]{40}$/.test(result.published_commit||'')){

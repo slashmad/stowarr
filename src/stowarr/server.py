@@ -3,9 +3,11 @@ from __future__ import annotations
 import hmac
 import json
 import traceback
+from contextlib import ExitStack
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
+from threading import Thread
 from urllib.parse import parse_qs, urlparse
 
 from . import __commit__, __version__
@@ -14,7 +16,7 @@ from .queue import OperationQueueWorker
 from .updates import check_updates
 
 
-def handler(manager: Stowarr):
+def handler(manager: Stowarr, *, web_listener: bool | None = None):
     class Handler(BaseHTTPRequestHandler):
         WEB_TYPES = {
             ".html": "text/html; charset=utf-8",
@@ -70,10 +72,13 @@ def handler(manager: Stowarr):
             return cookie["stowarr_session"].value if "stowarr_session" in cookie else ""
 
         def web_request(self) -> bool:
+            if web_listener is not None:
+                return web_listener
             return self.headers.get("X-Stowarr-Web-Proxy") == "1"
 
         def client_identity(self) -> str:
-            return self.headers.get("X-Real-IP") or self.client_address[0]
+            proxy_address = self.headers.get("X-Real-IP") if web_listener is None else None
+            return proxy_address or self.client_address[0]
 
         def authorized(self) -> bool:
             if self.web_request():
@@ -103,6 +108,10 @@ def handler(manager: Stowarr):
 
         def read_json(self) -> dict:
             length = int(self.headers.get("Content-Length", "0"))
+            if length < 0 or self.headers.get("Transfer-Encoding"):
+                raise ValueError("JSON requests require a valid Content-Length")
+            if web_listener and length > 1024**2:
+                raise ValueError("WebUI JSON requests are limited to 1 MiB")
             value = json.loads(self.rfile.read(length)) if length else {}
             if not isinstance(value, dict):
                 raise ValueError("JSON body must be an object")
@@ -111,7 +120,8 @@ def handler(manager: Stowarr):
         def do_GET(self):
             parsed = urlparse(self.path)
             path = parsed.path
-            if manager.config.api_only and not path.startswith("/api/"):
+            api_only = manager.config.api_only if web_listener is None else not web_listener
+            if api_only and not path.startswith("/api/"):
                 self.send_json(404, {"error": "API service"})
                 return
             public = {"/api/health", "/api/auth/status"}
@@ -171,7 +181,7 @@ def handler(manager: Stowarr):
                 try:
                     self.send_json(200, check_updates())
                 except (OSError, ValueError, KeyError, TypeError):
-                    self.send_json(503, {"error": "Could not check the public Stowarr images. Try again later."})
+                    self.send_json(503, {"error": "Could not check the public Stowarr image. Try again later."})
             elif path == "/api/settings/discovery":
                 try:
                     self.send_json(200, manager.connection_discovery())
@@ -618,17 +628,34 @@ def print_startup_credentials(manager: Stowarr) -> None:
 
 
 def serve(manager: Stowarr) -> None:
-    server = ThreadingHTTPServer((manager.config.listen, manager.config.port), handler(manager))
-    queue_worker = OperationQueueWorker(manager)
-    queue_worker.start()
-    print_startup_credentials(manager)
-    print(f"stowarr listening on {manager.config.listen}:{manager.config.port}; apply={manager.config.apply}", flush=True)
-    try:
-        server.serve_forever()
-    finally:
-        if not queue_worker.stop():
-            print(
-                "stowarr queue worker is still finishing an active operation during shutdown",
-                flush=True,
-            )
-        server.server_close()
+    config = manager.config
+    with ExitStack() as servers:
+        api = servers.enter_context(ThreadingHTTPServer(
+            (config.listen, config.port),
+            handler(manager, web_listener=False if config.web_port is not None else None),
+        ))
+        web = None
+        if config.web_port is not None:
+            web = servers.enter_context(ThreadingHTTPServer(
+                (config.listen, config.web_port), handler(manager, web_listener=True),
+            ))
+        queue_worker = OperationQueueWorker(manager)
+        queue_worker.start()
+        web_thread = None
+        try:
+            print_startup_credentials(manager)
+            if web is not None:
+                web_thread = Thread(target=web.serve_forever, name="stowarr-web", daemon=True)
+                web_thread.start()
+                print(f"stowarr WebUI listening on {config.listen}:{config.web_port}", flush=True)
+            print(f"stowarr listening on {config.listen}:{config.port}; apply={config.apply}", flush=True)
+            api.serve_forever()
+        finally:
+            if web is not None and web_thread is not None and web_thread.is_alive():
+                web.shutdown()
+                web_thread.join()
+            if not queue_worker.stop():
+                print(
+                    "stowarr queue worker is still finishing an active operation during shutdown",
+                    flush=True,
+                )

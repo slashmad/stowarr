@@ -55,7 +55,7 @@ jobs:
       - name: Actionlint
         run: .tools/bin/actionlint -shellcheck=.tools/bin/shellcheck
       - name: Hadolint
-        run: .tools/bin/hadolint Dockerfile Dockerfile.web
+        run: .tools/bin/hadolint Dockerfile
 
   test:
     runs-on: ubuntu-latest
@@ -78,9 +78,9 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - name: Validate Compose
         run: docker compose config --quiet
-      - name: Build images
+      - name: Build Stowarr image
         run: docker compose build --pull
-      - name: Validate nginx runtime configuration
+      - name: Verify the installed API and WebUI package
         run: >-
-          docker run --rm --add-host stowarr-api:127.0.0.1
-          ghcr.io/slashmad/stowarr-web:latest nginx -t
+          docker run --rm --entrypoint python "$(docker compose config --images)"
+          -c 'from importlib.resources import files; import stowarr.server; assert files("stowarr").joinpath("web", "index.html").is_file()'

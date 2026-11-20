@@ -33,10 +33,10 @@ npm run audit:dependencies
 
 .tools/bin/shellcheck docker/entrypoint.sh scripts/*.sh
 .tools/bin/actionlint -shellcheck=.tools/bin/shellcheck
-.tools/bin/hadolint Dockerfile Dockerfile.web
+.tools/bin/hadolint Dockerfile
 
 .venv/bin/python -m json.tool config/config.example.json >/dev/null
 docker compose config --quiet
 docker compose build --pull
-docker run --rm --add-host stowarr-api:127.0.0.1 \
-  ghcr.io/slashmad/stowarr-web:latest nginx -t
+docker run --rm --entrypoint python "$(docker compose config --images)" \
+  -c 'from importlib.resources import files; import stowarr.server; assert files("stowarr").joinpath("web", "index.html").is_file()'

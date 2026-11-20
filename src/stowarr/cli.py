@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 
 from .config import load_config
 from .engine import Stowarr
 from .server import serve
+
+
+def _exit_on_sigterm(_signum, _frame) -> None:
+    raise SystemExit(0)
 
 
 def main() -> None:
@@ -23,6 +28,7 @@ def main() -> None:
     args = parser.parse_args()
     manager = Stowarr(load_config(args.config))
     if args.command == "serve":
+        signal.signal(signal.SIGTERM, _exit_on_sigterm)
         serve(manager)
     elif args.command == "plan":
         print(json.dumps(manager.plan(args.torrent_hash).json(), indent=2))

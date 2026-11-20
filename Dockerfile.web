@@ -1,7 +1,0 @@
-FROM nginx:1.30.7-alpine
-ARG STOWARR_COMMIT=unknown
-LABEL org.opencontainers.image.revision="${STOWARR_COMMIT}"
-COPY LICENSE NOTICE /usr/share/licenses/stowarr/
-COPY src/stowarr/web /usr/share/nginx/html/assets
-COPY src/stowarr/web/index.html /usr/share/nginx/html/index.html
-COPY docker/nginx.conf.template /etc/nginx/templates/default.conf.template
