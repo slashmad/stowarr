@@ -53,26 +53,27 @@ class ArrClientTest(unittest.TestCase):
 
         self.assertEqual(result[0]["path"], "/movies/Masked/Masked.mkv")
 
-    def test_sonarr_manual_import_preview_falls_back_to_exact_series_path(self):
+    def test_sonarr_manual_import_preview_keeps_both_reads_on_the_download_path(self):
         class ManualImportHttp:
             def __init__(self):
                 self.queries = []
 
             def request(self, method, path, query=None, **kwargs):
                 self.queries.append(query)
+                if "seriesId" in query:
+                    return [{"path": "/library/Series/Season 01/Series.S01E01.mkv"}]
                 if query.get("downloadId"):
                     return []
-                return [{"path": "/downloads/Series.S01E01.mkv"}]
+                return [{"path": "/downloads/Series/Season 01/Series.S01E01.mkv"}]
 
         client = ArrClient(Service("http://unused", api_key="unused"), "sonarr")
         client.http = ManualImportHttp()
 
-        result = client.manual_import_preview("/downloads/Series", "HASH", 7)
+        result = client.manual_import_preview("/downloads/Series", "HASH")
 
-        self.assertEqual(result[0]["path"], "/downloads/Series.S01E01.mkv")
-        self.assertEqual(client.http.queries[0]["downloadId"], "HASH")
-        self.assertNotIn("downloadId", client.http.queries[1])
-        self.assertEqual(client.http.queries[1]["seriesId"], 7)
+        self.assertEqual(result[0]["path"], "/downloads/Series/Season 01/Series.S01E01.mkv")
+        folder_query = {"folder": "/downloads/Series", "filterExistingFiles": "true"}
+        self.assertEqual(client.http.queries, [{**folder_query, "downloadId": "HASH"}, folder_query])
 
     @patch("stowarr.clients.time.sleep")
     def test_sonarr_manual_import_uses_copy_mode_and_waits(self, sleep):
@@ -91,7 +92,7 @@ class ArrClientTest(unittest.TestCase):
         client.http = ManualImportHttp()
         files = [{"path": "/downloads/Series.S01E01.mkv", "episodeIds": [70]}]
 
-        result = client.manual_import(files)
+        result = client.manual_import([{**files[0], "downloadId": "HASH"}])
 
         self.assertEqual(result["status"], "completed")
         self.assertEqual(
@@ -364,16 +365,22 @@ class QBittorrentClientTest(unittest.TestCase):
         QBittorrentClient(Service("http://qbit", api_key="key", username="user", password="password"))
 
         json_client.assert_called_once_with("http://qbit", {"Authorization": "Bearer key"})
-        json_client.return_value.request.assert_not_called()
+        json_client.return_value.request_text.assert_not_called()
 
     @patch("stowarr.clients.JsonClient")
     def test_username_password_login_is_used_without_api_key(self, json_client):
-        QBittorrentClient(Service("http://qbit", username="user", password="password"))
+        service = Service("http://qbit", username="user", password="password")
+        for success_body in ("", "Ok."):
+            with self.subTest(success_body=success_body):
+                json_client.return_value.request_text.return_value = success_body
+                QBittorrentClient(service)
+                json_client.return_value.request_text.assert_called_with(
+                    "POST", "/api/v2/auth/login", form={"username": "user", "password": "password"}
+                )
 
-        json_client.assert_called_once_with("http://qbit", None)
-        json_client.return_value.request.assert_called_once_with(
-            "POST", "/api/v2/auth/login", form={"username": "user", "password": "password"}
-        )
+        json_client.return_value.request_text.return_value = "Fails."
+        with self.assertRaisesRegex(RuntimeError, "qBittorrent login failed"):
+            QBittorrentClient(service)
 
     @patch("stowarr.clients.JsonClient")
     def test_temporary_category_is_created_with_destination_path(self, json_client):

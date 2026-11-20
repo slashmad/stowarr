@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 from . import __commit__, __version__
 from .engine import Stowarr
 from .queue import OperationQueueWorker
+from .updates import check_updates
 
 
 def handler(manager: Stowarr):
@@ -166,6 +167,11 @@ def handler(manager: Stowarr):
                 self.send_json(200, manager.service_status())
             elif path == "/api/settings/runtime":
                 self.send_json(200, manager.runtime_settings())
+            elif path == "/api/settings/updates":
+                try:
+                    self.send_json(200, check_updates())
+                except (OSError, ValueError, KeyError, TypeError):
+                    self.send_json(503, {"error": "Could not check the public Stowarr images. Try again later."})
             elif path == "/api/settings/discovery":
                 try:
                     self.send_json(200, manager.connection_discovery())

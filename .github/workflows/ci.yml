@@ -12,23 +12,23 @@ jobs:
   secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   analysis:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
         with:
-          python-version: "3.12"
-      - uses: actions/setup-node@v4
+          python-version: "3.15"
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: "24"
+          node-version: "26"
           cache: npm
       - name: Install Python analysis tools
         run: python -m pip install '.[dev]'
@@ -59,19 +59,27 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.12", "3.15"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - name: Run tests
         run: PYTHONPATH=src python -m unittest discover -s tests -v
       - name: Compile Python sources
         run: python -m py_compile src/stowarr/*.py
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
       - name: Validate Compose
         run: docker compose config --quiet
       - name: Build images
-        run: docker compose build
+        run: docker compose build --pull
       - name: Validate nginx runtime configuration
         run: >-
           docker run --rm --add-host stowarr-api:127.0.0.1

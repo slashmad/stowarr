@@ -8,7 +8,7 @@ trap 'rm -rf "$temporary_directory"' EXIT HUP INT TERM
 
 shellcheck_version=0.11.0
 actionlint_version=1.7.12
-hadolint_version=2.14.0
+hadolint_version=2.15.1
 
 case "$(uname -m)" in
   x86_64|amd64)
@@ -17,7 +17,7 @@ case "$(uname -m)" in
     actionlint_arch=amd64
     actionlint_sha=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
     hadolint_arch=x86_64
-    hadolint_sha=6bf226944684f56c84dd014e8b979d27425c0148f61b3bd99bcc6f39e9dc5a47
+    hadolint_sha=c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507
     ;;
   aarch64|arm64)
     shellcheck_arch=aarch64
@@ -25,7 +25,7 @@ case "$(uname -m)" in
     actionlint_arch=arm64
     actionlint_sha=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
     hadolint_arch=arm64
-    hadolint_sha=331f1d3511b84a4f1e3d18d52fec284723e4019552f4f47b19322a53ce9a40ed
+    hadolint_sha=f6198ef8090f404dbb771abfee086eb8c48ac177f30da7fd3510aca35b344b5d
     ;;
   *)
     echo "Unsupported analysis-tool architecture: $(uname -m)" >&2

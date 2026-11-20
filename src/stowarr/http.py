@@ -7,9 +7,10 @@ from http.cookiejar import CookieJar
 
 
 class JsonClient:
-    def __init__(self, base_url: str, headers: dict[str, str] | None = None):
+    def __init__(self, base_url: str, headers: dict[str, str] | None = None, *, timeout: int = 60):
         self.base_url = base_url.rstrip("/")
         self.headers = headers or {}
+        self.timeout = timeout
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
 
     def request(self, method: str, path: str, *, query: dict | None = None, form: dict | None = None, body=None):
@@ -41,5 +42,5 @@ class JsonClient:
             data = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with self.opener.open(request, timeout=60) as response:
+        with self.opener.open(request, timeout=self.timeout) as response:
             return response.read()
