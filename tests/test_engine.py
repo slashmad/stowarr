@@ -1709,6 +1709,9 @@ class EngineTest(unittest.TestCase):
             ["The Matrix"],
         )
         self.assertEqual(audit["rows"][0]["title_candidate_count"], 1)
+        for action in (plan.error_details["issues"][0]["action"], audit["rows"][0]["action"]):
+            self.assertIn("check its History for this exact release", action)
+            self.assertIn("Use Radarr Add New only if the movie is missing", action)
 
     def test_missing_radarr_title_requires_add_new_before_manual_import(self):
         pool = Pool(

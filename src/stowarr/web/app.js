@@ -22,7 +22,20 @@ function renderBuildVersion(source){
   node.textContent=`Version ${version} · ${shortCommit}`;
   node.title=commit==='unknown'?'Build commit was not embedded in this image':`Git commit ${commit}`;
 }
-async function api(path,options={}){const method=(options.method||'GET').toUpperCase();const headers=new Headers(options.headers||{});if(method!=='GET'&&method!=='HEAD')headers.set('X-Stowarr-CSRF','1');const response=await fetch(path,{...options,headers,credentials:'same-origin'});if(response.status===401&&path!=='/api/auth/login'){state.authenticated=false;showLogin()}if(!response.ok)throw new Error((await response.json().catch(()=>({}))).error||`HTTP ${response.status}`);return response.json()}
+async function api(path,options={}){
+  const method=(options.method||'GET').toUpperCase();
+  const headers=new Headers(options.headers||{});
+  if(method!=='GET'&&method!=='HEAD')headers.set('X-Stowarr-CSRF','1');
+  const response=await fetch(path,{...options,headers,credentials:'same-origin'});
+  if(response.status===401&&path!=='/api/auth/login'){state.authenticated=false;showLogin()}
+  if(!response.ok){
+    const body=await response.json().catch(()=>({}));
+    const error=new Error(body.error||`HTTP ${response.status}`);
+    error.status=response.status;
+    throw error;
+  }
+  return response.json();
+}
 async function checkUpdates(event){
   const button=event.currentTarget;
   const status=$('#update-status');
@@ -142,19 +155,50 @@ function failSafeWorkflow(error){
   state.safeWorkflow.terminal=true;
   renderSafeWorkflow();
 }
+function renderSafeQueueResult(result){
+  const target=$('#safe-workflow-queue-result');
+  target.classList.toggle('hidden',!result);
+  $('#safe-workflow-open-queue').classList.toggle('hidden',!result);
+  if(!result){
+    target.innerHTML='';
+    return;
+  }
+  const groups=new Map();
+  for(const {candidate,stage,reason} of result.failures){
+    const key=JSON.stringify([stage,reason]);
+    if(!groups.has(key))groups.set(key,{stage,reason,candidates:[]});
+    groups.get(key).candidates.push(candidate);
+  }
+  const torrentRow=(candidate,publicId)=>{
+    const title=candidate.item_title||candidate.torrent_name;
+    const release=title===candidate.torrent_name?'':`<small>${esc(candidate.torrent_name)}</small>`;
+    return `<li><strong>${esc(title)}</strong>${publicId?` <code>${esc(publicId)}</code>`:''}${release}</li>`;
+  };
+  const blocked=[...groups.values()].map(({stage,reason,candidates})=>`<section class="safe-queue-issue"><h3>${esc(stage)} <span>${candidates.length}</span></h3><p>${esc(reason)}</p><details ${candidates.length===1?'open':''}><summary>Affected ${candidates.length===1?'torrent':'torrents'}</summary><ul>${candidates.map(candidate=>torrentRow(candidate)).join('')}</ul></details></section>`).join('');
+  const queued=result.queued.length?`<details class="safe-queue-accepted"><summary>View ${result.queued.length} accepted ${result.queued.length===1?'job':'jobs'}</summary><ul>${result.queued.map(({candidate,publicId})=>torrentRow(candidate,publicId)).join('')}</ul></details>`:'';
+  const unconfirmed=result.unconfirmed?'<p>Check Queue before trying again. A job with an unconfirmed response may already have been added.</p>':'';
+  target.innerHTML=`${unconfirmed}${blocked}${queued}`;
+}
 function renderSafeWorkflow(){
   const workflow=state.safeWorkflow;
   if(!workflow)return;
   $('#safe-workflow-title').textContent=workflow.title;
   $('#safe-workflow-summary').textContent=workflow.summary;
-  const fractions=workflow.steps.map(step=>step.status==='complete'?1:step.status==='remaining'?0:step.total?Math.min(1,step.current/step.total):0);
-  const overall=Math.round(100*fractions.reduce((sum,value)=>sum+value,0)/Math.max(1,fractions.length));
-  $('#safe-workflow-overall').innerHTML=`<div class="operation-step-title"><strong>${workflow.terminal?(workflow.error?'Stopped':'All steps complete'):'Workflow progress'}</strong><b>${overall}% overall</b></div><div class="operation-progress"><i style="width:${overall}%"></i></div>`;
-  $('#safe-workflow-steps').innerHTML=workflow.steps.map((step,index)=>{
-    const fraction=step.status==='complete'?1:step.total?Math.min(1,step.current/step.total):0;
-    const count=step.status==='remaining'?'Waiting':step.status==='failed'?'Stopped':step.total>1?`${Math.min(step.current,step.total)} / ${step.total}`:step.status==='complete'?'Complete':'Working';
-    return `<li class="${esc(step.status)}"><span class="safe-step-index">${step.status==='complete'?'✓':index+1}</span><div><div class="operation-step-title"><strong>${esc(step.title)}</strong><b>${esc(count)}</b></div><div class="operation-progress"><i style="width:${Math.round(fraction*100)}%"></i></div><small>${esc(step.message)}</small></div></li>`;
-  }).join('');
+  const progress=$('#safe-workflow-overall');
+  const steps=$('#safe-workflow-steps');
+  progress.classList.toggle('hidden',Boolean(workflow.queueResult));
+  steps.classList.toggle('hidden',Boolean(workflow.queueResult));
+  if(!workflow.queueResult){
+    const fractions=workflow.steps.map(step=>step.status==='complete'?1:step.status==='remaining'?0:step.total?Math.min(1,step.current/step.total):0);
+    const overall=Math.round(100*fractions.reduce((sum,value)=>sum+value,0)/Math.max(1,fractions.length));
+    progress.innerHTML=`<div class="operation-step-title"><strong>${workflow.terminal?(workflow.error?'Stopped':'All steps complete'):'Workflow progress'}</strong><b>${overall}% overall</b></div><div class="operation-progress"><i style="width:${overall}%"></i></div>`;
+    steps.innerHTML=workflow.steps.map((step,index)=>{
+      const fraction=step.status==='complete'?1:step.total?Math.min(1,step.current/step.total):0;
+      const count=step.status==='remaining'?'Waiting':step.status==='failed'?'Stopped':step.total>1?`${Math.min(step.current,step.total)} / ${step.total}`:step.status==='complete'?'Complete':'Working';
+      return `<li class="${esc(step.status)}"><span class="safe-step-index">${step.status==='complete'?'✓':index+1}</span><div><div class="operation-step-title"><strong>${esc(step.title)}</strong><b>${esc(count)}</b></div><div class="operation-progress"><i style="width:${Math.round(fraction*100)}%"></i></div><small>${esc(step.message)}</small></div></li>`;
+    }).join('');
+  }
+  renderSafeQueueResult(workflow.queueResult);
   $('#safe-workflow-error').textContent=workflow.error;
   $('#safe-workflow-error').classList.toggle('hidden',!workflow.error);
   const confirmation=$('#safe-workflow-confirmation');
@@ -182,10 +226,10 @@ function renderSafeWorkflowMinimized(){
   launcher.classList.toggle('hidden',!visible);
   if(!visible)return;
   const failed=Boolean(workflow.error);
-  const complete=workflow.terminal&&!workflow.confirmation&&!failed;
+  const complete=workflow.terminal&&!workflow.confirmation&&!failed&&!workflow.queueResult?.failures.length;
   const active=workflow.steps.find(step=>step.status==='active');
-  const title=failed?'Safe workflow needs attention':workflow.confirmation?'Safe workflow awaits confirmation':complete?'Safe workflow complete':'Safe workflow in progress…';
-  const summary=workflow.confirmation?.title||active?.message||workflow.summary;
+  const title=workflow.queueResult?workflow.title:failed?'Safe workflow needs attention':workflow.confirmation?'Safe workflow awaits confirmation':complete?'Safe workflow complete':'Safe workflow in progress…';
+  const summary=workflow.queueResult?workflow.summary:workflow.confirmation?.title||active?.message||workflow.summary;
   $('#safe-workflow-minimized-title').textContent=title;
   $('#safe-workflow-minimized-summary').textContent=summary;
   $('#safe-workflow-minimized-dot').className=`dot ${failed?'failed':complete?'ok':'warn'}`;
@@ -559,10 +603,18 @@ function renderCleanupInventory(){
   $('#cleanup-results').innerHTML=roots||'<article class="panel"><div class="empty">No configured library roots were found</div></article>';
 }
 async function runCleanupInventory(){const button=$('#run-cleanup');button.disabled=true;button.textContent='Scanning…';$('#cleanup-loading').classList.remove('hidden');$('#cleanup-warning').innerHTML='';try{state.cleanupInventory=await api('/api/cleanup/inventory');renderCleanupInventory();toast(`Cleanup inventory found ${state.cleanupInventory.summary.folders} folders`)}catch(e){$('#cleanup-warning').innerHTML=`<div class="alert"><div class="alert-head">Inventory failed</div><p>${esc(e.message)}</p></div>`}finally{$('#cleanup-loading').classList.add('hidden');button.disabled=false;button.textContent='Scan library folders'}}
-function renderConfig(){const c=state.config;$('#mode-pill').textContent=c.apply?'Write mode':'Dry run';$('#mode-pill').className=`pill ${c.apply?'live':'dry'}`;$('#side-mode').textContent=c.apply?'Write mode':'Dry run';$('#side-dot').className=`dot ${c.apply?'ok':'warn'}`;renderBuildVersion(c);$('#stat-pools').textContent=c.pools.length;$('#routing-head').innerHTML=`<tr><th>Service</th>${c.pools.map(p=>`<th colspan="2" class="pool-heading">${esc(p.name)}</th>`).join('')}</tr><tr class="subhead"><th></th>${c.pools.map(()=>'<th>Category</th><th>Root folders</th>').join('')}</tr>`;const roots=(p,app)=>app==='sonarr'?(p.sonarr_roots||[p.sonarr_root]):[p.radarr_root];const services=[['Radarr','radarr_category','radarr'],['Sonarr','sonarr_category','sonarr']];$('#pool-rows').innerHTML=services.map(([name,categoryKey,app])=>`<tr><td class="service-name">${esc(name)}</td>${c.pools.map(p=>`<td><span class="category">${esc(p[categoryKey])}</span></td><td class="path">${roots(p,app).map(esc).join('<br>')}</td>`).join('')}</tr>`).join('');$('#settings-pools').innerHTML=c.pools.map(p=>`<article class="settings-card"><h2>${esc(p.name)}</h2><dl class="settings-grid"><dt>Pool prefix</dt><dd>${esc(p.prefix)}</dd><dt>Download roots</dt><dd>${p.download_roots.map(esc).join('<br>')}</dd><dt>Radarr root / tag</dt><dd>${esc(p.radarr_root)} · ${esc(p.radarr_tag)}</dd><dt>Sonarr roots / tag</dt><dd>${roots(p,'sonarr').map(esc).join('<br>')}<br>${esc(p.sonarr_tag)}</dd><dt>Categories</dt><dd>${esc(p.radarr_category)} · ${esc(p.sonarr_category)}</dd></dl></article>`).join('');$('#move-target').innerHTML=c.pools.map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('')}
+const executionModeLabel=apply=>apply?'Write-mode':'Dry-run';
+function renderExecutionMode(apply){
+  const label=executionModeLabel(apply);
+  $('#mode-pill').textContent=label;
+  $('#mode-pill').className=`pill ${apply?'live':'dry'}`;
+  $('#side-mode').textContent=label;
+  $('#side-dot').className=`dot ${apply?'ok':'warn'}`;
+}
+function renderConfig(){const c=state.config;renderExecutionMode(c.apply);renderBuildVersion(c);$('#stat-pools').textContent=c.pools.length;$('#routing-head').innerHTML=`<tr><th>Service</th>${c.pools.map(p=>`<th colspan="2" class="pool-heading">${esc(p.name)}</th>`).join('')}</tr><tr class="subhead"><th></th>${c.pools.map(()=>'<th>Category</th><th>Root folders</th>').join('')}</tr>`;const roots=(p,app)=>app==='sonarr'?(p.sonarr_roots||[p.sonarr_root]):[p.radarr_root];const services=[['Radarr','radarr_category','radarr'],['Sonarr','sonarr_category','sonarr']];$('#pool-rows').innerHTML=services.map(([name,categoryKey,app])=>`<tr><td class="service-name">${esc(name)}</td>${c.pools.map(p=>`<td><span class="category">${esc(p[categoryKey])}</span></td><td class="path">${roots(p,app).map(esc).join('<br>')}</td>`).join('')}</tr>`).join('');$('#settings-pools').innerHTML=c.pools.map(p=>`<article class="settings-card"><h2>${esc(p.name)}</h2><dl class="settings-grid"><dt>Pool prefix</dt><dd>${esc(p.prefix)}</dd><dt>Download roots</dt><dd>${p.download_roots.map(esc).join('<br>')}</dd><dt>Radarr root / tag</dt><dd>${esc(p.radarr_root)} · ${esc(p.radarr_tag)}</dd><dt>Sonarr roots / tag</dt><dd>${roots(p,'sonarr').map(esc).join('<br>')}<br>${esc(p.sonarr_tag)}</dd><dt>Categories</dt><dd>${esc(p.radarr_category)} · ${esc(p.sonarr_category)}</dd></dl></article>`).join('');$('#move-target').innerHTML=c.pools.map(p=>`<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('')}
 function renderServiceStatus(){const status=state.serviceStatus;if(!status)return;const ids={stowarr_api:'api',qbittorrent:'qbit',radarr:'radarr',sonarr:'sonarr'};Object.entries(ids).forEach(([name,id])=>{const service=status.services?.[name]||{};const node=$(`#side-${id}-dot`);const mode=service.status==='connected'?'ok':service.status==='unavailable'?'failed':'warn';node.className=`dot ${mode}`;node.title=service.status==='connected'?`${name==='stowarr_api'?'Stowarr API':name} connected${service.version?` · ${service.version}`:''}${service.commit&&service.commit!=='unknown'?` · ${service.commit.slice(0,12)}`:''}`:service.error||'Not configured'});renderBuildVersion(status)}
 function renderConnections(){const services=state.connections?.services;if(!services)return;const form=$('#connections-form');form.elements['qbittorrent-url'].value=services.qbittorrent.url||'';form.elements['qbittorrent-api-key'].placeholder=services.qbittorrent.api_key_set?'Saved API key · preferred authentication':'API key recommended for qBittorrent 5.2+';form.elements['qbittorrent-username'].value=services.qbittorrent.username||'';form.elements['qbittorrent-password'].placeholder=services.qbittorrent.password_set?'Saved password · login fallback':'Password for login fallback';form.elements['radarr-url'].value=services.radarr.url||'';form.elements['radarr-api-key'].placeholder=services.radarr.api_key_set?'Saved API key · leave blank to keep':'API key required when Radarr is configured';form.elements['sonarr-url'].value=services.sonarr.url||'';form.elements['sonarr-api-key'].placeholder=services.sonarr.api_key_set?'Saved API key · leave blank to keep':'API key required when Sonarr is configured';const configured=state.connections.configured||{};const count=Object.values(configured).filter(Boolean).length;const complete=state.connections.status==='ready';$('#connections-status').textContent=complete?'All connected':count?`${count} of 3 connected`:'Not configured';$('#connections-status').className=`badge ${complete?'complete':count?'partial':'blocked'}`;$('#connection-error').textContent=state.connections.error||'';$('#connection-error').classList.toggle('hidden',!state.connections.error);$('#setup-error').textContent=state.connections.error||'';$('#setup-error').classList.toggle('hidden',!state.connections.error);const states={qbit:Boolean(configured.qbittorrent),radarr:Boolean(configured.radarr),sonarr:Boolean(configured.sonarr)};Object.entries(states).forEach(([name,connected])=>{const node=$(`#${name}-connection-state`);node.textContent=connected?'Connected':'Optional';node.className=`badge ${connected?'complete':'partial'}`;const dot=$(`#${name}-summary-dot`);dot.className=`dot ${connected?'ok':'warn'}`});const methods={qbit:services.qbittorrent.api_key_set?'API key':services.qbittorrent.password_set?'Username/password fallback':'No credentials',radarr:services.radarr.api_key_set?'API key':'No API key',sonarr:services.sonarr.api_key_set?'API key':'No API key'};Object.entries(states).forEach(([name,connected])=>{$(`#${name}-auth-summary`).textContent=connected?`Connected · ${methods[name]}`:`Not configured · ${methods[name]}`})}
-function renderRuntime(){if(!state.runtime)return;$('#runtime-apply').checked=state.runtime.apply;$('#runtime-status').textContent=state.runtime.apply?'Write mode':'Dry run';$('#runtime-status').className=`badge ${state.runtime.apply?'complete':'dry_run'}`;const deployment=state.runtime.deployment;$('#deployment-settings').innerHTML=`<div class="deployment-note"><strong>Docker deployment settings</strong><span>These values define the container boundary and require a Compose recreate to change safely.</span></div>${deployment.running_as_root?'<div class="alert inline-alert">The API process is running as root. Configure PUID and PGID or a non-root container user before enabling writes.</div>':''}<dl><dt>Configured identity</dt><dd>${esc(deployment.configured_puid)}:${esc(deployment.configured_pgid)}</dd><dt>Effective identity</dt><dd>${esc(deployment.process_uid)}:${esc(deployment.process_gid)}</dd><dt>File creation umask</dt><dd>${esc(deployment.umask)}</dd><dt>Media mount mode</dt><dd>${esc(deployment.media_mount_mode)}</dd><dt>API token</dt><dd>${deployment.api_token_set?'Configured':'Not configured'}</dd><dt>API listener</dt><dd>${esc(deployment.listen)}:${esc(deployment.port)}</dd><dt>API-only service</dt><dd>${deployment.api_only?'Enabled':'Disabled'}</dd><dt>Timezone</dt><dd>${esc(deployment.timezone)}</dd>${deployment.pool_mounts.map(pool=>`<dt>${esc(pool.name)} mount</dt><dd>${esc(pool.prefix)} · ${pool.writable?'writable':'read-only'}</dd>`).join('')}</dl>`}
+function renderRuntime(){if(!state.runtime)return;$('#runtime-apply').checked=state.runtime.apply;$('#runtime-status').textContent=executionModeLabel(state.runtime.apply);$('#runtime-status').className=`badge ${state.runtime.apply?'complete':'dry_run'}`;const deployment=state.runtime.deployment;$('#deployment-settings').innerHTML=`<div class="deployment-note"><strong>Docker deployment settings</strong><span>These values define the container boundary and require a Compose recreate to change safely.</span></div>${deployment.running_as_root?'<div class="alert inline-alert">The API process is running as root. Configure PUID and PGID or a non-root container user before enabling writes.</div>':''}<dl><dt>Configured identity</dt><dd>${esc(deployment.configured_puid)}:${esc(deployment.configured_pgid)}</dd><dt>Effective identity</dt><dd>${esc(deployment.process_uid)}:${esc(deployment.process_gid)}</dd><dt>File creation umask</dt><dd>${esc(deployment.umask)}</dd><dt>Media mount mode</dt><dd>${esc(deployment.media_mount_mode)}</dd><dt>API token</dt><dd>${deployment.api_token_set?'Configured':'Not configured'}</dd><dt>API listener</dt><dd>${esc(deployment.listen)}:${esc(deployment.port)}</dd><dt>API-only service</dt><dd>${deployment.api_only?'Enabled':'Disabled'}</dd><dt>Timezone</dt><dd>${esc(deployment.timezone)}</dd>${deployment.pool_mounts.map(pool=>`<dt>${esc(pool.name)} mount</dt><dd>${esc(pool.prefix)} · ${pool.writable?'writable':'read-only'}</dd>`).join('')}</dl>`}
 function renderSecurity(){const method=state.auth?.method||state.runtime?.deployment?.auth_method||'forms';$('#password-panel').classList.toggle('hidden',method!=='forms');$('#security-summary').innerHTML=`<div><small>Authentication method</small><strong>${esc(method==='external'?'External proxy':'Forms')}</strong></div><div><small>Active sessions</small><strong>${state.sessions.length}</strong></div><div><small>API authentication</small><strong>Bearer or X-Api-Key</strong></div>`;$('#revoke-sessions').disabled=method!=='forms'||!state.sessions.length;$('#security-events').innerHTML=state.securityEvents.length?state.securityEvents.map(item=>`<tr><td>${badge(item.event)}</td><td>${esc(item.username||'—')}</td><td>${esc(item.client||'—')}</td><td>${fmtTime(item.created_at)}</td></tr>`).join(''):'<tr><td colspan="4" class="empty">No security events recorded</td></tr>'}
 function renderOperations(){const ops=state.operations;const terminal=op=>['COMPLETE','FAILED','BLOCKED','DRY_RUN'].includes(op.state);const available=new Set(ops.filter(terminal).map(op=>op.id));state.selectedHistory=new Set([...state.selectedHistory].filter(id=>available.has(id)));$('#history-count').textContent=ops.length||'';$('#stat-operations').textContent=ops.length;$('#stat-complete').textContent=ops.filter(x=>x.state==='COMPLETE').length;$('#stat-blocked').textContent=ops.filter(x=>['BLOCKED','FAILED','RECOVERY_REQUIRED'].includes(x.state)).length;$('#recent-list').innerHTML=ops.slice(0,5).map(op=>`<div class="activity">${badge(op.state)}<div><strong>${esc(op.detail?.torrent_name||op.torrent_hash)}</strong><small>${esc(op.public_id)} · ${esc(op.kind||'reconcile')} · ${esc(op.app||'unknown')} · ${fmtTime(op.updated_at)}</small></div><button class="link-button inspect-operation" data-operation-id="${op.id}">Details</button></div>`).join('');$('#operation-rows').innerHTML=ops.length?ops.map(op=>`<tr><td><input class="history-select" type="checkbox" data-operation-id="${op.id}" aria-label="Select job ${esc(op.public_id)}" ${state.selectedHistory.has(op.id)?'checked':''} ${terminal(op)?'':'disabled'}></td><td><code>${esc(op.public_id)}</code></td><td>${badge(op.kind||'reconcile')}</td><td>${esc(op.app||'—')}</td><td>${esc(op.detail?.torrent_name||op.torrent_hash)}</td><td>${badge(op.state)}</td><td>${fmtTime(op.updated_at)}</td><td><button class="link-button inspect-operation" data-operation-id="${op.id}">Details</button></td></tr>`).join(''):`<tr><td colspan="8" class="empty">No operations recorded</td></tr>`;const selected=state.selectedHistory.size;const selectable=available.size;$('#history-selection').textContent=`${selected} selected`;$('#delete-history-selected').disabled=!selected;const selectAll=$('#select-all-history');selectAll.disabled=!selectable;selectAll.checked=Boolean(selectable)&&selected===selectable;selectAll.indeterminate=selected>0&&selected<selectable;$('#clear-history').disabled=!selectable}
 async function deleteHistory(all=false){const ids=all?[]:[...state.selectedHistory];const count=ids.length;if(!all&&!count)return;const confirmed=await confirmAction({title:all?'Clear History?':`Delete ${count} selected History ${count===1?'entry':'entries'}?`,message:'The operation records and their saved execution logs will be permanently removed. Active operations are always kept.',details:[[all?'Scope':'Selected entries',all?'All terminal History entries':String(count)]],confirmLabel:all?'Clear history':'Delete selected',danger:true});if(!confirmed)return;try{const result=await api('/api/operations',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify(all?{all:true}:{operationIds:ids})});state.selectedHistory.clear();state.operationEvents.clear();await refreshOperations();toast(`${result.deleted} History ${result.deleted===1?'entry':'entries'} deleted`)}catch(e){toast(`History was not changed: ${e.message}`)}}
@@ -593,14 +645,22 @@ function renderReconcileBlocker(plan){
   const related=details.related_torrents||[];
   const candidates=details.candidates||[];
   const affected=details.affected_files||[];
-  const issueMarkup=issues.length?`<ol class="reconcile-prerequisites">${issues.map(issue=>{const repeated=issue.summary===plan.reason&&issue.code===plan.error_code;return `<li><div>${repeated?'':`<strong>${esc(issue.summary)}</strong>`}<code>${esc(issue.code)}</code></div><p><b>Manual fix:</b> ${esc(issue.action)}</p></li>`}).join('')}</ol>`:`<div class="alert inline-alert"><p>${esc(plan.reason)}</p></div>`;
+  const blockerTitle=plan.error_code==='ARR_DOWNLOAD_HISTORY_MISSING'
+    ?`No verified ${plan.app==='sonarr'?'Sonarr':'Radarr'} match`
+    :'Reconcile needs manual resolution';
+  const issueMarkup=issues.length?`<ol class="reconcile-prerequisites">${issues.map(issue=>{
+    const repeated=issue.code===plan.error_code&&plan.reason?.startsWith(issue.summary);
+    const heading=repeated?'':`<div><strong>${esc(issue.summary)}</strong><code>${esc(issue.code)}</code></div>`;
+    return `<li>${heading}<p>${esc(issue.action)}</p></li>`;
+  }).join('')}</ol>`:'';
+  const showGuidance=details.action&&!issues.some(issue=>issue.action===details.action);
   const relatedMarkup=related.length?`<div class="table-wrap"><table><thead><tr><th>Competing qBittorrent release</th><th>Hash</th><th>Category</th><th>Save path</th></tr></thead><tbody>${related.map(item=>`<tr><td>${esc(item.name)}</td><td><span class="hash-short" title="${esc(item.hash)}">${esc(String(item.hash||'').slice(0,12))}…</span></td><td><span class="category">${esc(item.category||'none')}</span></td><td class="path">${esc(item.save_path||'—')}</td></tr>`).join('')}</tbody></table></div>`:'';
   const candidateMarkup=candidates.length?`<div class="release-evidence">${candidates.map(item=>`<div><small>Possible ${plan.app==='sonarr'?'Sonarr series':'Radarr movie'} — not automatically trusted</small><strong>${esc(item.title||'Unknown')} ${item.id?`(#${esc(item.id)})`:''}</strong><code>${esc(item.path||'No library path')}</code></div>`).join('')}</div>`:'';
   const affectedMarkup=affected.length?`<div class="table-wrap"><table><thead><tr><th>Blocked media file</th><th>Torrent file</th><th>Reason</th></tr></thead><tbody>${affected.map(item=>`<tr><td class="path">${esc(item.source_library||'—')}</td><td class="path">${esc(item.torrent_file||'No unique file')}</td><td>${badge(item.status)}</td></tr>`).join('')}</tbody></table></div>`:'';
   const eligibleVideos=details.eligible_feature_videos||[];
   const rejectedVideos=details.rejected_non_feature_videos||[];
   const videoEvidenceMarkup=Number.isInteger(details.torrent_video_count)?`<div class="release-evidence"><div><small>Selected direct videos</small><strong>${details.torrent_video_count}</strong><span>${details.contains_archives?'Archive content is also selected':'No archive content detected'}</span></div><div><small>Eligible feature candidates</small><strong>${details.eligible_feature_video_count??'—'}</strong>${eligibleVideos.map(path=>`<code>${esc(path)}</code>`).join('')||'<span>No unambiguous feature candidate</span>'}</div>${rejectedVideos.length?`<div><small>Ignored samples, trailers, extras, or unproven videos</small><strong>${rejectedVideos.length}</strong>${rejectedVideos.map(path=>`<code>${esc(path)}</code>`).join('')}</div>`:''}</div>`:'';
-  return `<article class="panel release-conflict"><div class="panel-head"><div><h2>Reconcile needs manual resolution</h2><p>Stowarr made no changes and will not enable Reconcile until the identity and storage route are safe.</p></div>${badge('blocked')}</div><div class="reconcile-block-summary"><strong>${esc(plan.reason)}</strong>${plan.error_code?`<code>${esc(plan.error_code)}</code>`:''}</div>${videoEvidenceMarkup}${issueMarkup}${candidateMarkup}${relatedMarkup}${affectedMarkup}${details.action?`<div class="recovery-guidance"><div><strong>Before trying again</strong><p>${esc(details.action)}</p></div></div>`:''}</article>`;
+  return `<article class="panel release-conflict"><div class="panel-head"><div><h2>${blockerTitle}</h2><p>Stowarr made no changes.</p></div>${badge('blocked')}</div><div class="reconcile-block-summary"><strong>${esc(plan.reason)}</strong>${plan.error_code?`<code>${esc(plan.error_code)}</code>`:''}</div>${videoEvidenceMarkup}${issueMarkup}${candidateMarkup}${relatedMarkup}${affectedMarkup}${showGuidance?`<div class="recovery-guidance"><div><strong>Before trying again</strong><p>${esc(details.action)}</p></div></div>`:''}</article>`;
 }
 function reconcileActionCopy(plan){
   const isSonarr=plan.app==='sonarr';
@@ -729,7 +789,8 @@ function renderPlan(plan){
   const action=ready?`<div id="verification-result"></div><div class="reconcile-action"><div><strong>${hasWork?(apply?esc(copy.title):'Changes are locked in dry-run mode'):'No repairs are needed'}</strong><p>${hasWork?(apply?esc(copy.message):'Enable Write mode and provide writable media mounts only after reviewing the plan.'):'Every managed media file and discovered secondary file already has the expected hardlink identity.'}</p></div><div class="action-buttons"><button id="verify-plan" class="secondary" ${canVerify?'':'disabled'}>${plan.sonarr_import_files?.length?'Sonarr preview verified':'Verify content hashes'}</button><button id="queue-reconcile" class="secondary" ${enabled?'':'disabled'}>Add to queue</button><button id="apply-plan" class="danger" ${enabled?'':'disabled'}>${hasWork?esc(copy.button):'Nothing to repair'}</button></div></div>`:'';
   const repairTitle=plan.app==='sonarr'?'Managed episode repair':'Primary media repair';
   const repairHelp=plan.app==='sonarr'?'Only episodes proven to belong to this release are shown. Series artwork and other non-video files are handled separately below.':'The movie action is shown first. Optional subtitles and metadata are handled separately below.';
-  const repairPanel=plan.error_code==='SONARR_PARTIAL_SERIES_POOL_CHANGE'?'':`<article class="panel"><div class="panel-head"><div><h2>${repairTitle}</h2><p>${repairHelp}</p></div></div>${pairs}${auxiliary}${action}</article>`;
+  const showRepair=ready||Boolean(plan.pairs?.length||plan.sonarr_import_files?.length||plan.auxiliary_files?.length);
+  const repairPanel=showRepair&&plan.error_code!=='SONARR_PARTIAL_SERIES_POOL_CHANGE'?`<article class="panel"><div class="panel-head"><div><h2>${repairTitle}</h2><p>${repairHelp}</p></div></div>${pairs}${auxiliary}${action}</article>`:'';
   const detailPanel=plan.error_code==='SONARR_PARTIAL_SERIES_POOL_CHANGE'?'':`<article class="panel"><div class="panel-head"><div><h2>Plan details</h2><p>No changes have been made</p></div></div><div class="detail-grid">${details.map(([k,v])=>`<div class="detail"><small>${k}</small><strong>${v}</strong></div>`).join('')}</div></article>`;
   $('#plan-result').innerHTML=`${error}${detailPanel}${repairPanel}`
 }
@@ -1187,6 +1248,10 @@ function offerSafePlanConfirmation(app,plan,prefix=''){
   const candidates=plan.reconcile_candidates||[];
   const manual=plan.manual||[];
   const summary=[prefix,`${plan.safe_count} safe actions found; ${manual.length} remain manual`].filter(Boolean).join(' · ');
+  if(!state.config?.apply&&(repairs.length||candidates.length)){
+    finishSafeWorkflow(`${summary}. Enable Write-mode in Settings, then build a new plan to apply fixes.`);
+    return;
+  }
   if(repairs.length){
     confirmSafeWorkflowPhase({
       summary,
@@ -1286,44 +1351,58 @@ async function queueSafeReconciles(options={}){
   if(!options.confirmed&&!await confirmAction({title:`Queue ${candidates.length} safe Reconcile ${candidates.length===1?'job':'jobs'}?`,message:'Each candidate gets a fresh exact plan and confirmation. Changed or ambiguous candidates are skipped; accepted jobs enter the existing shared Move/Reconcile FIFO queue.',details:candidates.slice(0,10).map(item=>[item.torrent_name,`${item.target_pool} · ${item.auxiliary_count} auxiliary files`]),confirmLabel:'Queue safe reconciles'}))return;
   const button=$('#queue-safe-reconciles');
   button.disabled=true;
-  startSafeWorkflow(`Queue ${candidates.length} safe Reconcile ${candidates.length===1?'job':'jobs'}`,'Every candidate is freshly authorized before it enters the shared FIFO',[
+  startSafeWorkflow('Queueing Reconcile jobs',`Checking ${candidates.length} ${candidates.length===1?'candidate':'candidates'} before queueing.`,[
     {id:'authorize',title:'Revalidate and authorize plans',description:'Issuing a fresh exact single-use confirmation for each candidate.'},
-    {id:'enqueue',title:'Add jobs to shared FIFO',description:'Appending authorized Reconcile jobs after all existing Move and Reconcile work.'},
-    {id:'refresh',title:'Refresh Queue and Sync',description:'Confirming accepted jobs and updating the audit view.'},
+    {id:'enqueue',title:'Submit validated jobs to Queue',description:'Waiting for the API to accept each job.'},
+    {id:'refresh',title:'Refresh Queue and Sync',description:'Updating queue status and audit results.'},
   ]);
+  const workflow=state.safeWorkflow;
   try{
-    let queued=0;
+    const queued=[];
     const failures=[];
     const authorized=[];
     for(const [index,candidate] of candidates.entries()){
       const payload={auxiliaryFiles:candidate.auxiliary_files};
       try{
         const confirmation=await api('/api/confirmations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'reconcile',torrentHash:candidate.hash,payload})});
+        if(confirmation.execution_mode==='dry-run')throw new Error('Dry-run is active. Enable Write-mode in Settings and build a new repair plan.');
         authorized.push({candidate,payload,confirmation});
       }catch(error){
-        failures.push(`${candidate.torrent_name}: ${error.message}`);
+        failures.push({candidate,stage:'Plan validation blocked',reason:error.message});
       }
-      updateSafeWorkflow({stage:'authorize',current:index+1,total:candidates.length,message:`Authorized ${authorized.length}; ${failures.length} skipped · ${candidate.torrent_name}`});
+      updateSafeWorkflow({stage:'authorize',current:index+1,total:candidates.length,message:`${authorized.length} authorized · ${failures.length} blocked`});
     }
+    let unconfirmed=0;
+    if(!authorized.length)updateSafeWorkflow({stage:'enqueue',current:0,total:0,message:'No validated jobs to submit'});
     for(const [index,item] of authorized.entries()){
       try{
-        await api('/api/reconcile-queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHash:item.candidate.hash,...item.payload,confirmationToken:item.confirmation.token})});
-        queued+=1;
+        const response=await api('/api/reconcile-queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({torrentHash:item.candidate.hash,...item.payload,confirmationToken:item.confirmation.token})});
+        if(!response?.public_id)throw new Error('The Queue response did not include a job ID.');
+        queued.push({candidate:item.candidate,publicId:response.public_id});
       }catch(error){
-        failures.push(`${item.candidate.torrent_name}: ${error.message}`);
+        const rejected=error.status>=400&&error.status<500;
+        if(!rejected)unconfirmed+=1;
+        failures.push({candidate:item.candidate,stage:rejected?'Queue submission rejected':'Queue status unconfirmed',reason:error.message});
       }
-      updateSafeWorkflow({stage:'enqueue',current:index+1,total:authorized.length,message:`Queued ${queued} of ${authorized.length} authorized jobs · ${item.candidate.torrent_name}`});
+      updateSafeWorkflow({stage:'enqueue',current:index+1,total:authorized.length,message:`${queued.length} accepted · ${index+1-queued.length-unconfirmed} rejected · ${unconfirmed} unconfirmed`});
     }
     updateSafeWorkflow({stage:'refresh',current:0,total:1,message:'Refreshing the shared Queue and Sync audit'});
-    await refreshQueue(true,true);
-    await runSync({app,throwOnError:true});
-    updateSafeWorkflow({stage:'refresh',current:1,total:1,message:`${queued} jobs confirmed in the shared Queue`});
-    finishSafeWorkflow(failures.length?`${queued} queued; ${failures.length} skipped safely`:`${queued} safe Reconcile ${queued===1?'job':'jobs'} queued`);
-    if(failures.length)toast(`${queued} queued; ${failures.length} skipped after fresh validation`);
-    else toast(`${queued} safe Reconcile ${queued===1?'job':'jobs'} added to the shared queue`);
-  }catch(error){
-    failSafeWorkflow(`${error.message}. Jobs already shown as queued remain in the shared FIFO.`);
-    toast(`Queue workflow stopped: ${error.message}`);
+    const [queueRefresh,syncRefresh]=await Promise.allSettled([refreshQueue(true,true),runSync({app,throwOnError:true})]);
+    const notQueued=failures.length-unconfirmed;
+    workflow.queueResult={queued,failures,unconfirmed};
+    workflow.title=queued.length?`${queued.length} Reconcile ${queued.length===1?'job':'jobs'} queued`:unconfirmed?'No queue additions confirmed':'No Reconcile jobs queued';
+    workflow.summary=failures.length?[
+      `${candidates.length} ${candidates.length===1?'candidate':'candidates'} checked`,
+      notQueued?`${notQueued} not queued`:'',
+      unconfirmed?`${unconfirmed} unconfirmed`:'',
+    ].filter(Boolean).join(' · '):'Track these jobs in Queue.';
+    workflow.error=[
+      queueRefresh.status==='rejected'?`Could not refresh Queue. ${queueRefresh.reason.message}`:'',
+      syncRefresh.status==='rejected'?`Could not refresh Sync. ${syncRefresh.reason.message}`:'',
+    ].filter(Boolean).join(' ');
+    workflow.terminal=true;
+    if(state.safeWorkflow===workflow)renderSafeWorkflow();
+  }finally{
     if(button?.isConnected)button.disabled=false;
   }
 }
@@ -1339,6 +1418,7 @@ async function runSync(options={}){
   try{
     const result=await api(`/api/sync/${app}`);
     state.sync[app]=result;
+    state.syncHiddenStatuses[app].add('in-sync');
     state.syncExpanded.delete(app);
     if(active())renderSync(result);
     return result;
@@ -1363,7 +1443,42 @@ async function inspect(hash){navigate('reconcile');$('#torrent-hash').value=hash
 async function refreshServiceStatus(){if(!state.authenticated)return;try{state.serviceStatus=await api('/api/status');renderServiceStatus()}catch(e){state.serviceStatus={version:state.config?.version,services:{stowarr_api:{status:'unavailable',error:e.message},qbittorrent:{status:'unavailable',error:e.message},radarr:{status:'unavailable',error:e.message},sonarr:{status:'unavailable',error:e.message}}};renderServiceStatus()}}
 async function load(){try{const [config,connections,status,runtime,recovery,operations,queue,reconcileQueue,queueSummary,security,sessions]=await Promise.all([api('/api/config'),api('/api/settings/connections'),api('/api/status'),api('/api/settings/runtime'),api('/api/recovery'),api('/api/operations'),api('/api/queue'),api('/api/reconcile-queue'),api('/api/queue-summary'),api('/api/security/events'),api('/api/auth/sessions')]);state.config=config;state.connections=connections;state.serviceStatus=status;state.runtime=runtime;state.recovery=recovery;state.operations=operations;state.queue=queue;state.reconcileQueue=reconcileQueue;state.queueSummary=queueSummary;state.securityEvents=security.events;state.sessions=sessions.sessions;renderConfig();renderConnections();renderServiceStatus();renderRuntime();renderOperations();renderQueue();renderRecovery();automaticallyTrackRunningQueue();renderSecurity()}catch(e){toast(`Could not load Stowarr: ${e.message}`)}}
 async function revokeSessions(){if(!await confirmAction({title:'Sign out all sessions?',message:'Every active WebUI session, including this one, will be revoked.',confirmLabel:'Sign out all',danger:true}))return;try{await api('/api/auth/sessions/revoke',{method:'POST'});state.authenticated=false;state.config=null;showLogin('All WebUI sessions were signed out.')}catch(e){toast(`Sessions were not revoked: ${e.message}`)}}
-async function saveRuntime(event){event.preventDefault();const apply=$('#runtime-apply').checked;if(!await confirmAction({title:`${apply?'Enable':'Disable'} confirmed write operations?`,message:'Move and Reconcile still require an explicit plan-bound confirmation.',details:[['Execution mode',apply?'Write mode':'Dry run']],confirmLabel:apply?'Enable writes':'Enable dry run',danger:apply}))return;const button=event.currentTarget.querySelector('button');button.disabled=true;button.textContent='Validating mounts…';try{state.runtime=await api('/api/settings/runtime',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apply})});state.config.apply=state.runtime.apply;renderRuntime();renderConfig();toast(`Execution mode: ${apply?'Write mode':'Dry run'}`)}catch(e){$('#runtime-apply').checked=state.runtime.apply;toast(`Execution mode was not changed: ${e.message}`)}finally{button.disabled=false;button.textContent='Save execution mode'}}
+async function saveRuntime(event){
+  event.preventDefault();
+  const button=event.currentTarget.querySelector('button');
+  const checkbox=$('#runtime-apply');
+  const apply=checkbox.checked;
+  const confirmed=await confirmAction({
+    title:`${apply?'Enable':'Disable'} confirmed write operations?`,
+    message:'Move and Reconcile still require an explicit plan-bound confirmation.',
+    details:[['Execution mode',executionModeLabel(apply)]],
+    confirmLabel:apply?'Enable writes':'Enable dry run',
+    danger:apply,
+  });
+  if(!confirmed){
+    checkbox.checked=state.runtime?.apply??false;
+    return;
+  }
+  button.disabled=true;
+  button.textContent='Validating mounts…';
+  try{
+    state.runtime=await api('/api/settings/runtime',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({apply}),
+    });
+    if(state.config)state.config.apply=state.runtime.apply;
+    renderRuntime();
+    renderExecutionMode(state.runtime.apply);
+    toast(`Execution mode: ${executionModeLabel(state.runtime.apply)}`);
+  }catch(error){
+    checkbox.checked=state.runtime?.apply??false;
+    toast(`Execution mode was not changed: ${error.message}`);
+  }finally{
+    button.disabled=false;
+    button.textContent='Save execution mode';
+  }
+}
 async function saveConnections(event){event.preventDefault();const form=event.currentTarget;const button=$('#save-connections');const services={qbittorrent:{url:form.elements['qbittorrent-url'].value.trim(),api_key:form.elements['qbittorrent-api-key'].value.trim(),username:form.elements['qbittorrent-username'].value.trim(),password:form.elements['qbittorrent-password'].value},radarr:{url:form.elements['radarr-url'].value.trim(),api_key:form.elements['radarr-api-key'].value.trim()},sonarr:{url:form.elements['sonarr-url'].value.trim(),api_key:form.elements['sonarr-api-key'].value.trim()}};const selected=Object.entries(services).filter(([,service])=>service.url);if(!selected.length){$('#setup-error').textContent='Enter the URL and credentials for at least one service';$('#setup-error').classList.remove('hidden');return}if(!await confirmAction({title:'Test and save configured services?',message:'Existing credentials are kept for blank secret fields. Only services with a URL are tested.',details:selected.map(([name,service])=>[name==='qbittorrent'?'qBittorrent':name[0].toUpperCase()+name.slice(1),service.url]),confirmLabel:'Test and save'}))return;button.disabled=true;button.textContent='Testing connections…';$('#setup-error').classList.add('hidden');try{const result=await api('/api/settings/connections',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({services})});state.connections=result;renderConnections();form.elements['qbittorrent-api-key'].value='';form.elements['qbittorrent-password'].value='';form.elements['radarr-api-key'].value='';form.elements['sonarr-api-key'].value='';state.qbitCatalog=null;state.routingAudit=null;await refreshServiceStatus();$('#connection-setup').close();toast(`${selected.length} configured service${selected.length===1?'':'s'} tested and saved`)}catch(e){$('#setup-error').textContent=e.message;$('#setup-error').classList.remove('hidden')}finally{button.disabled=false;button.textContent='Test and save configured services'}}
 async function discoverRouting(){const button=$('#discover-routing');button.disabled=true;button.textContent='Discovering…';const target=$('#discovery-result');target.className='loading';target.innerHTML='<span></span>Reading qBittorrent first, then Radarr and Sonarr…';try{const result=await api('/api/settings/discovery');const clients=result.services.flatMap(service=>service.download_clients.map(client=>({...client,app:service.app})));target.className='discovery-grid';target.innerHTML=`<section><header><h3>1 · qBittorrent destinations</h3><span>${result.qbit_categories.length} categories</span></header>${result.qbit_categories.map(item=>`<div class="discovery-row"><strong>${esc(item.category)}</strong><code>${esc(item.save_path||'Default save path')}</code></div>`).join('')||'<div class="empty">No qBittorrent categories found</div>'}</section><section><header><h3>2 · *Arr category senders</h3><span>${clients.length} download clients</span></header>${clients.map(item=>`<div class="discovery-row"><strong>${esc(item.app[0].toUpperCase()+item.app.slice(1))} · ${esc(item.name)}</strong><code>${esc(item.category)}</code><small>Tags: ${item.tags.length?item.tags.map(esc).join(', '):'none'}</small></div>`).join('')||'<div class="empty">No categorized *Arr download clients found</div>'}</section><section><header><h3>3 · Library destinations</h3></header>${result.services.flatMap(service=>service.root_folders.map(path=>`<div class="discovery-row"><strong>${esc(service.app[0].toUpperCase()+service.app.slice(1))}</strong><code>${esc(path)}</code></div>`)).join('')}</section>`}catch(e){target.className='alert inline-alert';target.textContent=e.message}finally{button.disabled=false;button.textContent='Discover routes'}}
 function updateAuxiliarySelection(){const selectAll=$('#select-all-auxiliary');if(!selectAll)return;const files=$$('.aux-file:not(:disabled)');const selected=files.filter(input=>input.checked).length;selectAll.checked=Boolean(files.length)&&selected===files.length;selectAll.indeterminate=selected>0&&selected<files.length;const hasWork=reconcilePrimaryNeedsRepair(state.plan)||selected>0;const apply=Boolean(state.config?.apply);const verify=$('#verify-plan');const queue=$('#queue-reconcile');const execute=$('#apply-plan');if(verify)verify.disabled=!hasWork||Boolean(state.plan?.sonarr_import_files?.length);if(queue)queue.disabled=!apply||!hasWork;if(execute)execute.disabled=!apply||!hasWork}
@@ -1375,6 +1490,7 @@ $('#safe-workflow-dialog').addEventListener('cancel',e=>{e.preventDefault();if(s
 $('#safe-workflow-close').addEventListener('click',()=>{if(state.safeWorkflow?.terminal&&!state.safeWorkflow?.confirmation)closeSafeWorkflow();else hideSafeWorkflow()});
 $('#safe-workflow-cancel').addEventListener('click',closeSafeWorkflow);
 $('#safe-workflow-done').addEventListener('click',continueSafeWorkflow);
+$('#safe-workflow-open-queue').addEventListener('click',()=>{closeSafeWorkflow();navigate('queue')});
 $('#safe-workflow-minimized').addEventListener('click',showSafeWorkflow);
 $('#connections-form').addEventListener('submit',saveConnections);
 document.addEventListener('click',event=>{

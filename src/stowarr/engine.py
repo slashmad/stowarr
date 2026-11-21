@@ -164,6 +164,21 @@ def safe_sync_candidate(row: dict) -> bool:
     )
 
 
+def missing_download_history_action(app: str, pool_name: str) -> str:
+    service = app.capitalize()
+    item = "movie" if app == "radarr" else "series"
+    action = (
+        f"Find the {item} in {service} and check its History for this exact release. "
+        "If the download is still listed in Activity → Queue, open it to see its import status. "
+    )
+    if app == "radarr":
+        action += (
+            "Use Radarr Add New only if the movie is missing. Select the root on "
+            f"{pool_name} and skip the automatic search. "
+        )
+    return action + "Rerun Sync after the download is associated with the correct item."
+
+
 def release_folder_warning(item: dict | None, torrent_name: str, app: str) -> dict | None:
     """Return a non-blocking warning when a Radarr folder names another release."""
     if app != "radarr" or not item or not item.get("path"):
@@ -2756,10 +2771,12 @@ class Stowarr:
                 )
             else:
                 identity_summary = (
-                    f"{app.capitalize()} has no history record that associates this "
-                    "exact qBittorrent hash with a current library item"
+                    f"Stowarr could not verify this qBittorrent hash against a current "
+                    f"{app.capitalize()} item in the available history"
                 )
-            if app == "radarr" and not candidates:
+            if not history_item_missing:
+                identity_action = missing_download_history_action(app, pool.name)
+            elif app == "radarr" and not candidates:
                 identity_action = (
                     "Add the intended movie with Radarr Add New, select the root on "
                     f"{pool.name}, and do not start another download. Then use Radarr "
@@ -2810,10 +2827,7 @@ class Stowarr:
                     "save_path": torrent.get("save_path", ""),
                     "contains_archives": has_archives,
                     "historical_item_id": history_item_id,
-                    "action": (
-                        f"Resolve every prerequisite below in qBittorrent and {app.capitalize()}, "
-                        "then rerun the audit. Stowarr will not reconcile by title alone."
-                    ),
+                    "action": identity_action,
                 },
             )
         item = mapping["item"]
@@ -3856,26 +3870,11 @@ class Stowarr:
                 expected_category = pool.radarr_category if app == "radarr" else pool.sonarr_category
             issues = []
             if not item_id:
-                status, reason = "missing-history", "Hash was not found in recent *Arr history"
+                status, reason = "missing-history", f"This hash was not found in the {service} history scanned by Sync"
                 issues.append({
                     "code": "ARR_DOWNLOAD_HISTORY_MISSING",
-                    "summary": f"{service} does not associate this exact qBittorrent hash with an item.",
-                    "action": (
-                        (
-                            "Add the intended movie with Radarr Add New, select the "
-                            f"root on {pool.name if pool else 'the intended pool'}, "
-                            "and do not start another download. Then use Radarr "
-                            "Manual Import to associate the existing qBittorrent "
-                            "release and rerun the audit."
-                        )
-                        if app == "radarr" and not title_candidate_count
-                        else (
-                            f"Verify the intended item in {service}, use {service} "
-                            "Manual Import to associate the existing qBittorrent "
-                            "release, then refresh/rescan it and rerun the audit. "
-                            "Stowarr will not infer identity from the title alone."
-                        )
-                    ),
+                    "summary": reason,
+                    "action": missing_download_history_action(app, pool.name if pool else "the intended pool"),
                 })
             elif not item:
                 status, reason = "missing-item", "History points to an item that no longer exists"

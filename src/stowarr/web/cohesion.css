@@ -157,6 +157,14 @@ nav {
   font-size: 12px;
 }
 
+.sidebar-service .dot.ok + strong {
+  color: var(--green);
+}
+
+.sidebar-service .dot.warn + strong {
+  color: var(--amber);
+}
+
 .sidebar-service .dot {
   flex: 0 0 auto;
 }
